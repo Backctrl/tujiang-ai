@@ -29,12 +29,14 @@ GitHub Desktop 的 Repository → Show in Explorer 可以确认实际目录。�
 
 ## 阶段 A 本地合成联调
 
-终端一在 backend 运行 `npx tsx scripts/frontend-local.ts`，终端二在根目录运行 `npx vite --host 127.0.0.1 --port 5178`。打开 `/arcane-warrior/stage-a`，输入终端一显示的临时测试凭据。
+终端一在 backend 运行 `npx tsx scripts/frontend-local.ts`，终端二在根目录先设置 `$env:TUJIANG_API_TARGET='http://127.0.0.1:4311'`，再运行 `npx vite --host 127.0.0.1 --port 5178`。打开 `/arcane-warrior`，输入终端一显示的临时测试凭据。
 
 服务使用临时 PGlite 和合成 Worker，不加载 .env；关闭后不作为持久项目库。样例证据 `Capacity: 10 kg. Alternate: 20 kg.` 会产生待确认事实。真实数据库及网关配置见 backend/README.md，真实模型请求需单独授权。
 
-当前真实入口覆盖项目、身份、文字证据、事实逐条审核、初步故事顺序、诊断章节稿编辑与历史恢复，以及诊断预检。原 `/arcane-warrior` 为演示。正式章节制作、市场批准和文件导出尚未实现。
+当前唯一入口为岳凯的 `/arcane-warrior` 工作台，覆盖项目、身份、文字证据、事实逐条审核、初步故事顺序和项目诊断预检。额外Stage A页面和诊断编辑器已删除，旧地址仅跳转。正式章节制作、市场批准和文件导出尚未实现。默认Vite代理连接真实后端3100，合成联调需显式设置上述覆盖变量。
 
 ## 历史验收资料
 
 `frontend-integration-handoff.md`、`frontend-review.md`、`frontend-independent-qa.md`、`frontend-browser-qa.md` 与其截图/合成快照是上一轮隔离候选的验收记录。其中“未提交”等描述是当时状态，不替代本轮 PR 的最终提交与检查结果。合并依据必须包含本轮最终组合验收。
+
+当前接入和验收见 [岳凯前端合并记录](yuekai-integration/README.md)。此前历史验收中的双入口和诊断编辑器说明已被本轮取代。
