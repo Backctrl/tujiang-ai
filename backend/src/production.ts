@@ -2,6 +2,7 @@ import { AppError } from './errors.js';
 import type { ProjectContext } from './production-context.js';
 import type { Material } from './production-materials.js';
 import type { MaterialAsset, MaterialReferenceBlock } from './production-material-usage.js';
+import type { ProjectStartup } from './production-startup.js';
 export const PRODUCTION_CONTRACT_VERSION = 'production.1';
 export interface ProductionObject {
   id: string; kind: 'facts' | 'storyboard' | 'section' | 'market' | 'export'; revision: number;
@@ -11,6 +12,7 @@ export interface ProductionObject {
 export interface Production {
   contractVersion: typeof PRODUCTION_CONTRACT_VERSION; objects: ProductionObject[]; context?: ProjectContext;
   materials?: Material[]; assets?: MaterialAsset[]; references?: MaterialReferenceBlock[];
+  startup?: ProjectStartup;
 }
 export function initializeProduction(project: { production?: Production }): boolean {
   if (project.production) {

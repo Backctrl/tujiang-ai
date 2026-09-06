@@ -14,13 +14,14 @@ async function main() {
   const db = postgres(env.DATABASE_URL, () => console.error('Database idle connection closed; the next operation will reconnect.'));
   const store = new Store(db);
   const objects = new LocalObjects(env.OBJECT_DIR);
-  const app = buildApp(store, objects, { token: env.BACKEND_API_TOKEN, actor: env.BACKEND_ACTOR_ID,
-    productionCatalog });
-  const worker = new Worker(store, new OpenRouter({ apiKey: env.OPENROUTER_API_KEY, model: env.OPENROUTER_MODEL,
+  const modelConfig = { apiKey: env.OPENROUTER_API_KEY, model: env.OPENROUTER_MODEL,
     factModel: env.OPENROUTER_FACT_MODEL, planModel: env.OPENROUTER_PLAN_MODEL, timeoutMs: env.OPENROUTER_TIMEOUT_MS,
     provider: env.OPENROUTER_PROVIDER, maxInputTokens: env.OPENROUTER_MAX_INPUT_TOKENS,
     maxOutputTokens: env.OPENROUTER_MAX_OUTPUT_TOKENS, maxCostUsd: env.OPENROUTER_MAX_COST_USD,
-    acceptEstimatedBudget: env.OPENROUTER_ACCEPT_ESTIMATED_BUDGET === 'true' }));
+    acceptEstimatedBudget: env.OPENROUTER_ACCEPT_ESTIMATED_BUDGET === 'true' };
+  const app = buildApp(store, objects, { token: env.BACKEND_API_TOKEN, actor: env.BACKEND_ACTOR_ID,
+    productionCatalog, startupExecution: { mode: 'openrouter', workerEnabled: true, modelConfig } });
+  const worker = new Worker(store, new OpenRouter(modelConfig));
   await db.query('SELECT id FROM projects LIMIT 1');
   await app.listen({ host: '127.0.0.1', port: env.PORT });
   console.info(`Tujiang backend listening on http://127.0.0.1:${env.PORT}`);

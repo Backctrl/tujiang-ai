@@ -132,8 +132,9 @@ test('context client over HTTP saves partial drafts, explains blocked activation
     assert.deepEqual(p.production?.context?.draft, partial);
     await assert.rejects(client.write(p, 'production/context/activate'), (error: unknown) => {
       assert.ok(error instanceof ApiError); assert.equal(error.code, 'PRODUCTION_CONTEXT_INCOMPLETE');
-      assert.ok(error.fields.includes('productBrief.internalCode'));
-      assert.ok(errorMessage(error).includes('内部代号')); return true;
+      assert.ok(error.fields.includes('productBrief.category'));
+      assert.equal(error.fields.includes('productBrief.internalCode'), false);
+      assert.ok(errorMessage(error).includes('产品品类')); return true;
     });
     p = await client.write(p, 'production/context/draft', { context: compileContextForm(contextForm(complete)).context });
     p = await client.write(p, 'production/context/activate');
