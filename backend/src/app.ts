@@ -7,7 +7,7 @@ import { AppError } from './errors.js';
 import { LocalObjects } from './objects.js';
 import { Store, audit } from './store.js';
 import { initializeProduction, requireProduction, PRODUCTION_CONTRACT_VERSION } from './production.js';
-import { activateContext, contextDraftSchema, productionCatalogSchema, saveContextDraft, type ProductionCatalog } from './production-context.js';
+import { activateContext, bindRulePackVersion, contextDraftSchema, productionCatalogSchema, saveContextDraft, type ProductionCatalog } from './production-context.js';
 
 const projectParams = z.object({ id: z.string().uuid() });
 const factParams = projectParams.extend({ factId: z.string().uuid(), action: z.enum(['confirm', 'reject', 'retract']) });
@@ -57,8 +57,10 @@ export function buildApp(store: Store, objects: LocalObjects, options: { token: 
   app.post('/api/projects/:id/production/context/activate', async request => {
     const { id } = projectParams.parse(request.params);
     const body = writeSchema.strict().parse(request.body);
-    return store.command(id, body, 'production.context.activated', options.actor, p => {
-      activateContext(requireProduction(p!), productionCatalog, options.actor); return p!;
+    return store.command(id, body, 'production.context.activated', options.actor, async (p, tx) => {
+      const activated = activateContext(requireProduction(p!), productionCatalog, options.actor);
+      await bindRulePackVersion(tx, activated);
+      return p!;
     }, { preserveStageAInput: true });
   });
   app.post('/api/projects/:id/production/initialize', async request => {

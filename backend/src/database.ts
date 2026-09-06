@@ -1,4 +1,5 @@
 import pg from 'pg';
+import { bindRulePackVersion, type ProjectContextVersion } from './production-context.js';
 
 export interface Connection {
   query<T extends Record<string, unknown> = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<{ rows: T[] }>;
@@ -45,5 +46,14 @@ export async function migrate(db: Database) {
       project_id uuid NOT NULL REFERENCES projects(id), revision integer NOT NULL,
       state jsonb NOT NULL, PRIMARY KEY(project_id, revision)
     )`);
+    await tx.query(`CREATE TABLE IF NOT EXISTS production_rule_packs (
+      id text NOT NULL, version text NOT NULL, sha256 text NOT NULL CHECK (sha256 ~ '^[a-f0-9]{64}$'),
+      rule_pack jsonb NOT NULL, registered_by text NOT NULL, registered_at timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY(id,version)
+    )`);
+    // Backfill bindings without rewriting approved contexts, revisions or command receipts.
+    const prior = await tx.query<{ versions: ProjectContextVersion[] }>(`SELECT state #> '{production,context,versions}' AS versions
+      FROM projects WHERE jsonb_typeof(state #> '{production,context,versions}')='array'`);
+    for (const project of prior.rows) for (const snapshot of project.versions) await bindRulePackVersion(tx, snapshot);
   });
 }

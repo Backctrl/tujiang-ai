@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
 import { AppError } from './errors.js';
 import type { Production } from './production.js';
+import type { Connection } from './database.js';
 
 const label = z.string().trim().min(1).max(200);
 export const productBriefSchema = z.object({ productName: label, internalCode: label, category: label, stage: label,
@@ -67,7 +68,20 @@ function canonical(value: unknown): string {
   if (value && typeof value === 'object') return `{${Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([k,v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(',')}}`;
   return JSON.stringify(value) ?? 'null';
 }
-export function activateContext(production: Production, catalog: ProductionCatalog, actor: string): void {
+export function hashRulePack(rulePack: RulePack): string {
+  return createHash('sha256').update(canonical(rulePack)).digest('hex');
+}
+/** Called in the same transaction as activation, or while backfilling historical bindings. */
+export async function bindRulePackVersion(tx: Connection, snapshot: Pick<ProjectContextVersion, 'rulePack' | 'rulePackSha256' | 'activatedBy'>): Promise<void> {
+  const rule = rulePackSchema.parse(snapshot.rulePack);
+  if (hashRulePack(rule) !== snapshot.rulePackSha256) throw new AppError('RULE_PACK_SNAPSHOT_INVALID', 409);
+  await tx.query(`INSERT INTO production_rule_packs(id, version, sha256, rule_pack, registered_by)
+    VALUES ($1,$2,$3,$4::jsonb,$5) ON CONFLICT(id,version) DO NOTHING`,
+    [rule.id, rule.version, snapshot.rulePackSha256, JSON.stringify(rule), snapshot.activatedBy]);
+  const { rows } = await tx.query<{ sha256: string }>('SELECT sha256 FROM production_rule_packs WHERE id=$1 AND version=$2', [rule.id, rule.version]);
+  if (rows[0]?.sha256 !== snapshot.rulePackSha256) throw new AppError('RULE_PACK_VERSION_CHANGED', 409, { fields: ['rulePackRef'] });
+}
+export function activateContext(production: Production, catalog: ProductionCatalog, actor: string): ProjectContextVersion {
   const parsed = completeContextSchema.safeParse(production.context?.draft);
   if (!parsed.success) throw new AppError('PRODUCTION_CONTEXT_INCOMPLETE', 409,
     { fields: parsed.error.issues.map(issue => issue.path.join('.') || 'context') });
@@ -82,13 +96,15 @@ export function activateContext(production: Production, catalog: ProductionCatal
     ...(!rulePack.allowedFormats.includes(context.canvasProfile.format) ? ['canvasProfile.format'] : []),
   ];
   if (canvasFields.length) throw new AppError('CANVAS_OUTSIDE_RULE_PACK', 409, { fields: canvasFields });
-  const rulePackSha256 = createHash('sha256').update(canonical(rulePack)).digest('hex');
+  const rulePackSha256 = hashRulePack(rulePack);
   const state = production.context!;
   if (state.versions.some(v => v.rulePack.id === rulePack.id && v.rulePack.version === rulePack.version && v.rulePackSha256 !== rulePackSha256))
     throw new AppError('RULE_PACK_VERSION_CHANGED', 409, { fields: ['rulePackRef'] });
   const version = (state.versions.at(-1)?.version ?? 0) + 1;
-  state.versions.push({ version, label: `P${version}`, context: structuredClone(context), rulePack: structuredClone(rulePack),
-    rulePackSha256, activatedBy: actor, activatedAt: new Date().toISOString() });
+  const snapshot = { version, label: `P${version}`, context: structuredClone(context), rulePack: structuredClone(rulePack),
+    rulePackSha256, activatedBy: actor, activatedAt: new Date().toISOString() };
+  state.versions.push(snapshot);
   state.activeVersion = version;
   delete state.draft;
+  return snapshot;
 }

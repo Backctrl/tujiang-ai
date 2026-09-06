@@ -4,18 +4,13 @@ import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fixture, command, extraction } from './helpers.js';
-import { activateContext, loadProductionCatalog, productionCatalogSchema, saveContextDraft, type ContextDraft, type RulePack } from '../src/production-context.js';
+import { activateContext, loadProductionCatalog, productionCatalogSchema, saveContextDraft } from '../src/production-context.js';
 import type { Production } from '../src/production.js';
 import { Worker } from '../src/worker.js';
-
-// Synthetic test-only rule; never used by the production directory.
-const rule: RulePack = { id: 'synthetic', version: '1', officialUrl: 'https://example.org/synthetic-test-rule',
-  verifiedAt: '2026-01-01T00:00:00Z', verifiedBy: 'test-reviewer',
-  target: { platform: 'test', site: 'test-us', country: 'US', language: 'en-US', currency: 'USD', unitSystem: 'imperial' },
-  allowedWidthsPx: [1000], allowedFormats: ['png'], requiredFacts: [{ key: 'identity', description: 'Test identity', allowUnknown: false, allowNotApplicable: false }] };
-const context: ContextDraft = { productBrief: { productName: 'Test chair', internalCode: 'T1', category: 'chair', stage: 'new',
-  introduction: 'Test only', commercialIntent: 'Test launch' }, primaryTarget: rule.target,
-  canvasProfile: { widthPx: 1000, format: 'png' }, rulePackRef: { id: rule.id, version: rule.version } };
+import { context, rule } from './fixtures/production-context.js';
+import { buildApp } from '../src/app.js';
+import { LocalObjects } from '../src/objects.js';
+import { migrate } from '../src/database.js';
 
 test('local rule catalog is explicit, validated and empty by default', async () => {
   assert.deepEqual(await loadProductionCatalog(), { rulePacks: [] });
@@ -169,5 +164,59 @@ test('production context writes during a legacy fact run preserve its actual inp
     assert.equal(p.production!.context!.activeVersion, 1);
     assert.equal(p.contractVersion, 'stage-a.1');
     assert.deepEqual(p.sections, []);
+  } finally { await f.close(); }
+});
+
+test('rule identity binds globally: a second service accepts the same hash and rejects substitution in a fresh project', async () => {
+  const f = await fixture({ rulePacks: [rule] });
+  const changed = buildApp(f.store, new LocalObjects('unused-rule-only-test'), {
+    token: 'rule-peer-test-token', actor: 'test-human', productionCatalog: { rulePacks: [{ ...rule, verifiedBy: 'other-reviewer' }] },
+  });
+  try {
+    let first = await f.write(await f.create(), 'production/initialize');
+    first = await f.write(first, 'production/context/draft', { context });
+    first = await f.write(first, 'production/context/activate');
+    let same = await f.write(await f.create(), 'production/initialize');
+    same = await f.write(same, 'production/context/draft', { context });
+    same = await f.write(same, 'production/context/activate');
+    assert.equal(same.production!.context!.versions[0]!.rulePackSha256, first.production!.context!.versions[0]!.rulePackSha256);
+    const binding = await f.db.query('SELECT * FROM production_rule_packs');
+    assert.equal(binding.rows.length, 1);
+    let other = await f.write(await f.create(), 'production/initialize');
+    other = await f.write(other, 'production/context/draft', { context });
+    const beforeReceipts = await f.db.query('SELECT key FROM command_receipts');
+    const result = await changed.inject({ method: 'POST', url: `/api/projects/${other.id}/production/context/activate`,
+      headers: { authorization: 'Bearer rule-peer-test-token' }, payload: command(other) });
+    assert.equal(result.statusCode, 409);
+    assert.equal(result.json().error.code, 'RULE_PACK_VERSION_CHANGED');
+    assert.deepEqual(await f.store.get(other.id), other);
+    assert.deepEqual(await f.store.get(first.id), first);
+    assert.deepEqual((await f.db.query('SELECT * FROM production_rule_packs')).rows, binding.rows);
+    assert.deepEqual((await f.db.query('SELECT key FROM command_receipts')).rows, beforeReceipts.rows);
+  } finally { await changed.close(); await f.close(); }
+});
+
+test('migration backfills immutable historical rule bindings and rejects conflicting history atomically', async () => {
+  const f = await fixture({ rulePacks: [rule] });
+  try {
+    let first = await f.write(await f.create(), 'production/initialize');
+    first = await f.write(first, 'production/context/draft', { context });
+    first = await f.write(first, 'production/context/activate');
+    await f.db.query('DROP TABLE production_rule_packs'); // Isolated PGlite fixture simulating the pre-registry schema.
+    await migrate(f.db);
+    await migrate(f.db);
+    assert.equal((await f.db.query('SELECT id FROM production_rule_packs')).rows.length, 1);
+    assert.deepEqual(await f.store.get(first.id), first);
+    let legacyConflict = await f.write(await f.create(), 'production/initialize');
+    legacyConflict = await f.store.command(legacyConflict.id, command(legacyConflict), 'test.legacy-context', 'test-human', current => {
+      saveContextDraft(current!.production!, context);
+      activateContext(current!.production!, { rulePacks: [{ ...rule, verifiedBy: 'legacy-conflict' }] }, 'test-human');
+      return current!;
+    });
+    const registry = await f.db.query('SELECT * FROM production_rule_packs');
+    await assert.rejects(migrate(f.db), /RULE_PACK_VERSION_CHANGED/);
+    assert.deepEqual(await f.store.get(first.id), first);
+    assert.deepEqual(await f.store.get(legacyConflict.id), legacyConflict);
+    assert.deepEqual((await f.db.query('SELECT * FROM production_rule_packs')).rows, registry.rows);
   } finally { await f.close(); }
 });

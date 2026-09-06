@@ -11,6 +11,9 @@ import { buildApp } from '../src/app.js';
 import { LocalObjects } from '../src/objects.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { initializeProduction } from '../src/production.js';
+import { activateContext, bindRulePackVersion, saveContextDraft, type RulePack } from '../src/production-context.js';
+import { context, rule } from './fixtures/production-context.js';
 
 const configuredUrl = process.env.TEST_DATABASE_URL;
 if (!configuredUrl) throw new Error('TEST_DATABASE_URL is required: real PostgreSQL integration tests cannot be skipped.');
@@ -105,13 +108,26 @@ async function seed(store: Store, queued = false) {
     return p;
   });
 }
+async function stagedContext(store: Store) {
+  const p = await seed(store);
+  return store.command(p.id, command(p), 'test.context.draft', 'pg-test', current => {
+    initializeProduction(current!); saveContextDraft(current!.production!, context); return current!;
+  }, { preserveStageAInput: true });
+}
+async function activateRegistered(store: Store, p: Project, rulePack: RulePack = rule, body = command(p)) {
+  return store.command(p.id, body, 'production.context.activated', 'pg-test', async (current, tx) => {
+    const activated = activateContext(current!.production!, { rulePacks: [rulePack] }, 'pg-test');
+    await bindRulePackVersion(tx, activated);
+    return current!;
+  }, { preserveStageAInput: true });
+}
 
 test('real PostgreSQL: concurrent migrations are repeatable and failed transactions roll back', async () => {
   await isolated(async (db, peer) => {
     await Promise.all([migrate(db), migrate(peer)]);
     await migrate(db);
     const tables = await db.query<{ table_name: string }>('SELECT table_name FROM information_schema.tables WHERE table_schema=current_schema() ORDER BY table_name');
-    assert.deepEqual(tables.rows.map(r => r.table_name), ['command_receipts', 'project_revisions', 'projects']);
+    assert.deepEqual(tables.rows.map(r => r.table_name), ['command_receipts', 'production_rule_packs', 'project_revisions', 'projects']);
     const p = createProject('rollback');
     await assert.rejects(db.transaction(async tx => {
       await new Store(db).save(p, tx);
@@ -259,5 +275,57 @@ test('real PostgreSQL: terminating its own idle connection reports safely and re
     assert.deepEqual(await new Store(target).get(p.id), p);
     const history = await target.query<{ state: Project }>('SELECT state FROM project_revisions WHERE project_id=$1', [p.id]);
     assert.deepEqual(history.rows.map(r => r.state), [p]);
+  });
+});
+
+test('real PostgreSQL: rule binding is shared across projects, persists after restart and rejects a changed catalog', async () => {
+  await isolated(async (db, peer, reconnect) => {
+    await migrate(db);
+    const stores = [new Store(db), new Store(peer)];
+    const drafts = await Promise.all(stores.map(stagedContext));
+    const firstBody = command(drafts[0]!);
+    const activated = await Promise.all([
+      activateRegistered(stores[0]!, drafts[0]!, rule, firstBody),
+      activateRegistered(stores[1]!, drafts[1]!),
+    ]);
+    const bindings = (await db.query('SELECT * FROM production_rule_packs')).rows;
+    assert.equal(bindings.length, 1);
+    const first = activated[0]!;
+    assert.equal(first.production!.context!.versions[0]!.rulePackSha256, activated[1]!.production!.context!.versions[0]!.rulePackSha256);
+    await Promise.all([db.close(), peer.close()]);
+    db.close = peer.close = async () => {};
+    const fresh = await reconnect();
+    await migrate(fresh);
+    const store = new Store(fresh);
+    assert.deepEqual((await fresh.query('SELECT * FROM production_rule_packs')).rows, bindings);
+    assert.deepEqual(await store.get(first.id), first);
+    const changed = { ...rule, verifiedBy: 'new-server-config' };
+    assert.deepEqual(await activateRegistered(store, drafts[0]!, changed, firstBody), first);
+    const other = await stagedContext(store);
+    const receipts = (await fresh.query('SELECT key FROM command_receipts')).rows.length;
+    await assert.rejects(activateRegistered(store, other, changed), error => error instanceof AppError && error.code === 'RULE_PACK_VERSION_CHANGED');
+    assert.deepEqual(await store.get(other.id), other);
+    assert.deepEqual(await store.get(first.id), first);
+    assert.equal((await fresh.query('SELECT key FROM command_receipts')).rows.length, receipts);
+  });
+});
+
+test('real PostgreSQL: concurrent services cannot bind different hashes to the same rule identity', async () => {
+  await isolated(async (db, peer) => {
+    await migrate(db);
+    const stores = [new Store(db), new Store(peer)];
+    const drafts = await Promise.all(stores.map(stagedContext));
+    const receipts = (await db.query('SELECT key FROM command_receipts')).rows.length;
+    const outcomes = await Promise.allSettled([
+      activateRegistered(stores[0]!, drafts[0]!),
+      activateRegistered(stores[1]!, drafts[1]!, { ...rule, verifiedBy: 'different-server-catalog' }),
+    ]);
+    assert.equal(outcomes.filter(result => result.status === 'fulfilled').length, 1);
+    const loserIndex = outcomes.findIndex(result => result.status === 'rejected');
+    const loser = outcomes[loserIndex]!;
+    assert.ok(loser.status === 'rejected' && loser.reason instanceof AppError && loser.reason.code === 'RULE_PACK_VERSION_CHANGED');
+    assert.deepEqual(await stores[loserIndex]!.get(drafts[loserIndex]!.id), drafts[loserIndex]);
+    assert.equal((await db.query('SELECT id FROM production_rule_packs')).rows.length, 1);
+    assert.equal((await db.query('SELECT key FROM command_receipts')).rows.length, receipts + 1);
   });
 });
