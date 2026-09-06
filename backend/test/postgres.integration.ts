@@ -14,6 +14,7 @@ import { join } from 'node:path';
 import { initializeProduction } from '../src/production.js';
 import { activateContext, bindRulePackVersion, saveContextDraft, type RulePack } from '../src/production-context.js';
 import { context, rule } from './fixtures/production-context.js';
+import { scopedContext, scopedRule, headerScope } from './fixtures/scoped-rules.js';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { IngestionWorker } from '../src/ingestion-worker.js';
 import { parseMaterial } from '../src/material-parser.js';
@@ -111,10 +112,10 @@ async function seed(store: Store, queued = false) {
     return p;
   });
 }
-async function stagedContext(store: Store) {
+async function stagedContext(store: Store, draft = context) {
   const p = await seed(store);
   return store.command(p.id, command(p), 'test.context.draft', 'pg-test', current => {
-    initializeProduction(current!); saveContextDraft(current!.production!, context); return current!;
+    initializeProduction(current!); saveContextDraft(current!.production!, draft); return current!;
   }, { preserveStageAInput: true });
 }
 async function activateRegistered(store: Store, p: Project, rulePack: RulePack = rule, body = command(p)) {
@@ -285,7 +286,7 @@ test('real PostgreSQL: rule binding is shared across projects, persists after re
   await isolated(async (db, peer, reconnect) => {
     await migrate(db);
     const stores = [new Store(db), new Store(peer)];
-    const drafts = await Promise.all(stores.map(stagedContext));
+    const drafts = await Promise.all(stores.map(store => stagedContext(store)));
     const firstBody = command(drafts[0]!);
     const activated = await Promise.all([
       activateRegistered(stores[0]!, drafts[0]!, rule, firstBody),
@@ -317,7 +318,7 @@ test('real PostgreSQL: concurrent services cannot bind different hashes to the s
   await isolated(async (db, peer) => {
     await migrate(db);
     const stores = [new Store(db), new Store(peer)];
-    const drafts = await Promise.all(stores.map(stagedContext));
+    const drafts = await Promise.all(stores.map(store => stagedContext(store)));
     const receipts = (await db.query('SELECT key FROM command_receipts')).rows.length;
     const outcomes = await Promise.allSettled([
       activateRegistered(stores[0]!, drafts[0]!),
@@ -330,6 +331,81 @@ test('real PostgreSQL: concurrent services cannot bind different hashes to the s
     assert.deepEqual(await stores[loserIndex]!.get(drafts[loserIndex]!.id), drafts[loserIndex]);
     assert.equal((await db.query('SELECT id FROM production_rule_packs')).rows.length, 1);
     assert.equal((await db.query('SELECT key FROM command_receipts')).rows.length, receipts + 1);
+  });
+});
+
+test('real PostgreSQL: concurrent HTTP services bind one scoped rule content and roll back the conflicting project', async () => {
+  await isolated(async (db, peer) => {
+    await migrate(db);
+    const stores = [new Store(db), new Store(peer)];
+    const drafts = await Promise.all(stores.map(store => stagedContext(store, scopedContext)));
+    const packs = [scopedRule, { ...scopedRule, description: 'Different scoped content under the same identity' }];
+    const token = randomUUID(); const headers = { authorization: `Bearer ${token}` };
+    const objects = new LocalObjects(join(tmpdir(), `unused-scoped-${randomUUID()}`));
+    const apps = stores.map((store, index) => buildApp(store, objects, { actor: 'pg-test', token,
+      productionCatalog: { rulePacks: [rule], scopedRulePacks: [packs[index]!] } }));
+    try {
+      const receipts = (await db.query('SELECT key FROM command_receipts')).rows.length;
+      const responses = await Promise.all(apps.map((app, index) => app.inject({ method: 'POST',
+        url: `/api/projects/${drafts[index]!.id}/production/context/activate`, headers, payload: command(drafts[index]) })));
+      assert.deepEqual(responses.map(response => response.statusCode).sort(), [200, 409]);
+      const loser = responses.findIndex(response => response.statusCode === 409); const winner = 1 - loser;
+      assert.equal(responses[loser]!.json().error.code, 'RULE_PACK_VERSION_CHANGED');
+      assert.deepEqual(await stores[loser]!.get(drafts[loser]!.id), drafts[loser]);
+      const result = responses[winner]!.json<Project>();
+      assert.deepEqual(result.production!.context!.versions[0]!.rulePack, packs[winner]);
+      assert.deepEqual(await stores[winner]!.get(result.id), result);
+      assert.equal((await db.query('SELECT id FROM production_rule_packs')).rows.length, 1);
+      assert.equal((await db.query('SELECT key FROM command_receipts')).rows.length, receipts + 1);
+    } finally { await Promise.all(apps.map(app => app.close())); }
+  });
+});
+
+test('real PostgreSQL: both rule models backfill unchanged, survive restart and check the frozen scope after catalog changes', async () => {
+  await isolated(async (db, peer, reconnect) => {
+    await migrate(db);
+    const store = new Store(db); const token = randomUUID(); const headers = { authorization: `Bearer ${token}` };
+    const objects = new LocalObjects(join(tmpdir(), `unused-scoped-${randomUUID()}`));
+    const app = buildApp(store, objects, { token, actor: 'pg-test', productionCatalog: { rulePacks: [rule], scopedRulePacks: [scopedRule] } });
+    let closed = false;
+    try {
+      let p = await activateRegistered(store, await stagedContext(store));
+      const legacy = structuredClone(p.production!.context!.versions[0]!);
+      p = await store.command(p.id, command(p), 'test.scoped.draft', 'pg-test', current => {
+        saveContextDraft(current!.production!, scopedContext); return current!;
+      }, { preserveStageAInput: true });
+      const response = await app.inject({ method: 'POST', url: `/api/projects/${p.id}/production/context/activate`, headers, payload: command(p) });
+      assert.equal(response.statusCode, 200); p = response.json<Project>();
+      const readBindings = (connection: Database) => connection.query('SELECT id,version,sha256,rule_pack FROM production_rule_packs ORDER BY id,version');
+      const bindings = (await readBindings(db)).rows;
+      const revisions = (await db.query('SELECT * FROM project_revisions WHERE project_id=$1 ORDER BY revision', [p.id])).rows;
+      const receipts = (await db.query('SELECT key,fingerprint,response FROM command_receipts ORDER BY key')).rows;
+      assert.equal(bindings.length, 2);
+      // This table belongs only to the invocation's isolated, random test schema.
+      await db.query('DROP TABLE production_rule_packs');
+      await Promise.all([migrate(db), migrate(peer)]); await migrate(db);
+      assert.deepEqual((await readBindings(db)).rows, bindings);
+      assert.deepEqual(await store.get(p.id), p);
+      await app.close(); closed = true;
+      await Promise.all([db.close(), peer.close()]); db.close = peer.close = async () => {};
+      const fresh = await reconnect(); await migrate(fresh);
+      const freshStore = new Store(fresh);
+      const altered = { ...scopedRule, constraints: scopedRule.constraints.map(constraint => constraint.ruleId === 'header-width'
+        ? { ...constraint, status: 'verified' as const, sourceIds: ['module-fields'], constraint: { kind: 'numeric' as const, min: 1900 } } : constraint) };
+      const restarted = buildApp(freshStore, objects, { token, actor: 'pg-test', productionCatalog: { rulePacks: [rule], scopedRulePacks: [altered] } });
+      try {
+        const checked = await restarted.inject({ method: 'POST', url: `/api/projects/${p.id}/production/rules/check`, headers,
+          payload: { contextVersion: 2, subjects: [{ id: 'frozen header', scope: headerScope, values: { widthPx: 1200, heightPx: 700, format: 'png' } }] } });
+        assert.equal(checked.statusCode, 200);
+        assert.equal(checked.json().issueSeverity, 'none');
+        assert.equal(checked.json().rulePackSha256, p.production!.context!.versions[1]!.rulePackSha256);
+        assert.deepEqual((await freshStore.get(p.id)).production!.context!.versions[0], legacy);
+        assert.deepEqual(await freshStore.get(p.id), p);
+        assert.deepEqual((await readBindings(fresh)).rows, bindings);
+        assert.deepEqual((await fresh.query('SELECT * FROM project_revisions WHERE project_id=$1 ORDER BY revision', [p.id])).rows, revisions);
+        assert.deepEqual((await fresh.query('SELECT key,fingerprint,response FROM command_receipts ORDER BY key')).rows, receipts);
+      } finally { await restarted.close(); }
+    } finally { if (!closed) await app.close(); }
   });
 });
 

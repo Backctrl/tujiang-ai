@@ -6,6 +6,12 @@ import { sameJsonValue, useReviewedDraft } from './project-drafts.js'
 import { compileContextForm, contextDifferences, contextForm, contextReadiness, projectContextBase, selectedRule, type ContextForm } from './project-context.js'
 
 export type ContextSession = Pick<ProjectSession, 'project' | 'getLatestProject' | 'canWrite' | 'catalog' | 'write'>
+function needsScopedEditor(project?: Project | null) {
+  const state = project?.production?.context
+  const active = state?.versions.find(version => version.version === state.activeVersion)
+  return !!(active && 'schemaVersion' in active.rulePack)
+    || state?.draft?.primaryTarget?.contentType !== undefined || state?.draft?.canvasProfile?.selectionBasis !== undefined
+}
 export function useProjectContext(s: ContextSession) {
   const state = s.project?.production?.context
   const activeVersion = state?.versions.find(version => version.version === state.activeVersion)
@@ -18,30 +24,35 @@ export function useProjectContext(s: ContextSession) {
   // An untouched form follows the current server snapshot. Active versions remain read-only.
   const form = local.active ? local.value : serverForm
   const readOnly = !!activeVersion && !serverDraft && !local.active
-  const canEdit = s.canWrite && initialized && !readOnly
+  // The legacy form cannot round-trip scoped fields. Keep its historical readOnly meaning separate.
+  const compatibilityBlocked = needsScopedEditor(s.project)
+  // SSE may update the latest snapshot before React replaces the previous callbacks.
+  const compatibleNow = () => !compatibilityBlocked && !needsScopedEditor(s.getLatestProject())
+  const canEdit = s.canWrite && initialized && !readOnly && !compatibilityBlocked
   const compiled = compileContextForm(form)
   const issues = [...compiled.errors, ...contextReadiness(compiled.context, s.catalog)]
   const savedIssues = serverDraft ? contextReadiness(serverDraft, s.catalog) : []
-  const rule = readOnly ? activeVersion?.rulePack : selectedRule(compiled.context, s.catalog)
-  const canSave = s.canWrite && initialized && !local.needsReview && !compiled.errors.length && (local.active || (!serverDraft && !activeVersion))
-  const canActivate = s.canWrite && initialized && !!serverDraft && !local.active && !local.needsReview && !savedIssues.length
+  const rule = readOnly ? activeVersion?.rulePack : compatibilityBlocked ? undefined : selectedRule(compiled.context, s.catalog)
+  const canSave = s.canWrite && initialized && !compatibilityBlocked && !local.needsReview && !compiled.errors.length && (local.active || (!serverDraft && !activeVersion))
+  const canActivate = s.canWrite && initialized && !compatibilityBlocked && !!serverDraft && !local.active && !local.needsReview && !savedIssues.length
   const setField = (key: keyof ContextForm, value: string) => {
-    if (canEdit) local.setValue({ ...form, [key]: value })
+    if (canEdit && compatibleNow()) local.setValue({ ...form, [key]: value })
   }
   const setRule = (id: string, version: string) => {
-    if (canEdit) local.setValue({ ...form, rulePackId: id, rulePackVersion: version })
+    if (canEdit && compatibleNow()) local.setValue({ ...form, rulePackId: id, rulePackVersion: version })
   }
   const applyRuleTarget = () => {
-    if (canEdit && rule) local.setValue({ ...form, ...rule.target })
+    if (canEdit && rule && compatibleNow()) local.setValue({ ...form, ...rule.target })
   }
+  const canCopyVersion = (version?: ProjectContextVersion) => !!version && s.canWrite && initialized && compatibleNow() && !('schemaVersion' in version.rulePack)
   const requestCopy = (version: ProjectContextVersion) => {
-    if (!s.canWrite || !initialized) return
+    if (!canCopyVersion(version)) return
     const prepared = local.prepareReplacement(contextForm(version.context))
     if (local.active || serverDraft) setPendingCopy({ label: version.label, prepared })
     else local.replace(prepared)
   }
   const confirmCopy = () => {
-    if (!s.canWrite || !pendingCopy) return
+    if (!s.canWrite || !pendingCopy || !compatibleNow()) return
     local.replace(pendingCopy.prepared); setPendingCopy(null)
   }
   const discard = () => { if (s.canWrite) { local.discard(); setPendingCopy(null) } }
@@ -53,18 +64,18 @@ export function useProjectContext(s: ContextSession) {
     local.discard(); setPendingCopy(null)
   }
   const save = () => {
-    if (!canSave) return
+    if (!canSave || !compatibleNow()) return
     void s.write('production/context/draft', { context: compiled.context }, '制作配置草稿已保存。信息完整且规则匹配后，可明确启用新版本。', afterSave)
   }
   const activate = () => {
-    if (!canActivate) return
+    if (!canActivate || !compatibleNow()) return
     void s.write('production/context/activate', {}, '制作配置新版本已启用，历史版本保持不变。')
   }
   const initialize = () => {
     if (!s.canWrite || s.project?.production) return
     void s.write('production/initialize', {}, '已开启制作配置，请填写并明确保存。')
   }
-  return { initialized, state, activeVersion, serverDraft, form, readOnly, canEdit, local, compiled, issues, rule,
+  return { initialized, state, activeVersion, serverDraft, form, readOnly, compatibilityBlocked, canEdit, canCopyVersion, local, compiled, issues, rule,
     canSave, canActivate, setField, setRule, applyRuleTarget, save, activate, initialize, discard, requestCopy, pendingCopy, confirmCopy,
     cancelCopy: () => setPendingCopy(null), copyVersion, setCopyVersion,
     selectedCopyVersion: state?.versions.find(version => String(version.version) === copyVersion) ?? activeVersion,
