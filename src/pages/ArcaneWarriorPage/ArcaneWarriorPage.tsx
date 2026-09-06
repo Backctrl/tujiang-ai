@@ -22,6 +22,9 @@ const components = [ProjectSetup, FactsStage, StoryStage, ChapterStage, MarketSt
 export default function ArcaneWarriorPage() {
   const session = useProjectSession()
   const { project, conflictBefore } = session
+  const productionContext = project?.production?.context
+  const activeTarget = productionContext?.versions.find(version => version.version === productionContext.activeVersion)?.context.primaryTarget
+  const targetLabel = activeTarget ? `${activeTarget.platform} / ${activeTarget.site} / ${activeTarget.language}` : productionContext?.draft ? '草稿未启用' : '尚未配置'
   const [stage, setStage] = useState<StageId>('setup')
   const [activityOpen, setActivityOpen] = useState(false)
   const stageIndex = stages.findIndex(s => s.id === stage)
@@ -30,7 +33,7 @@ export default function ArcaneWarriorPage() {
     <header className="topbar">
       <BrandMark />
       <div className="context-item"><span>项目</span><strong>{project?.name ?? '尚未连接项目'}</strong></div>
-      <div className="context-item"><span>市场</span><strong>尚未配置</strong></div>
+      <div className="context-item"><span>首发目标</span><strong>{targetLabel}</strong></div>
       <div className="context-item"><span>服务端快照</span><strong>{project ? `R${project.revision}` : '尚未读取'}</strong></div>
       <div className="topbar-spacer" />
       <div className="sync-state" role="status">{session.busy ? '正在请求' : session.pending ? '结果待核对' : session.eventsStatus}</div>
