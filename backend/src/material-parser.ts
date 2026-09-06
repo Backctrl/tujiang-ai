@@ -114,11 +114,25 @@ function jsonBlocks(material: Material, text: string): MaterialBlock[] {
   visit(root, '');
   return blocks;
 }
+function requireStaticPng(bytes: Buffer): void {
+  // libvips can decode only APNG's default image without reporting metadata.pages.
+  // Read chunk boundaries: acTL inside compressed pixels or text is not a chunk.
+  for (let offset = 8; offset + 12 <= bytes.length;) {
+    const end = offset + bytes.readUInt32BE(offset) + 12;
+    if (end > bytes.length) failure('INVALID_IMAGE');
+    const type = bytes.toString('ascii', offset + 4, offset + 8);
+    if (type === 'acTL') failure('ANIMATED_IMAGE_UNSUPPORTED');
+    if (type === 'IEND') return;
+    offset = end;
+  }
+  failure('INVALID_IMAGE');
+}
 export async function parseMaterial(material: Material, bytes: Buffer): Promise<MaterialParseResult> {
   if (bytes.length !== material.sizeBytes || createHash('sha256').update(bytes).digest('hex') !== material.sha256) failure('SOURCE_FILE_INTEGRITY_FAILED');
   if (['png', 'jpeg', 'webp'].includes(material.format)) {
     const format = imageFormat(bytes);
     if (!format || format !== material.format) failure('INVALID_IMAGE');
+    if (format === 'png') requireStaticPng(bytes);
     try {
       const metadata = await sharp(bytes, { failOn: 'warning', limitInputPixels: false }).metadata();
       if (!metadata.width || !metadata.height || metadata.format !== format) failure('INVALID_IMAGE');

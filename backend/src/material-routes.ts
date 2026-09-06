@@ -23,8 +23,11 @@ export function registerMaterialRoutes(app: FastifyInstance, store: Store, objec
       const saved = await objects.putBinary(decoded.bytes);
       if (existing) {
         const origin = materialOrigin(body, actor);
-        const comparable = (value: typeof origin) => JSON.stringify([value.fileName, value.mimeType, value.source, value.usageHint, value.uploadedBy]);
-        if (!existing.origins.some(item => comparable(item) === comparable(origin))) existing.origins.push(origin);
+        const comparable = (value: typeof origin) => JSON.stringify([value.fileName, value.mimeType,
+          value.source.kind, value.source.url, value.source.title, value.source.revision, value.source.locator,
+          value.usageHint, value.uploadedBy]);
+        const originKey = comparable(origin);
+        if (!existing.origins.some(item => comparable(item) === originKey)) existing.origins.push(origin);
         audit(project!, 'material.original.deduplicated', actor, { materialId: existing.id, sha256: existing.sha256 });
       } else {
         const material = createMaterial(body, decoded, saved.objectKey, actor);
