@@ -1,3 +1,4 @@
+import { useProjectDraft } from './project-drafts'
 import { useRef, useState } from 'react'
 import { ArrowLeft, ArrowRight, CheckCircle2, Circle, FileText, Info, Layers3, Lock, Plus, RefreshCw, ShieldCheck, Upload } from 'lucide-react'
 import type { StageId } from './domain'
@@ -10,10 +11,10 @@ const statusLabel: Record<Fact['status'], string> = { candidate: '待确认', co
 
 export function ProjectSetup({ session: s, onStage }: Props) {
   const [name, setName] = useState('')
-  const [productName, setProductName] = useState<string | null>(null)
-  const [documentName, setDocumentName] = useState('')
-  const [locator, setLocator] = useState('')
-  const [text, setText] = useState('')
+  const [productName, setProductName] = useProjectDraft<string | null>(s.project?.id, 'productName', null)
+  const [documentName, setDocumentName] = useProjectDraft(s.project?.id, 'documentName', '')
+  const [locator, setLocator] = useProjectDraft(s.project?.id, 'locator', '')
+  const [text, setText] = useProjectDraft(s.project?.id, 'evidenceText', '')
   const [fileError, setFileError] = useState('')
   const [importing, setImporting] = useState(false)
   const importingRef = useRef(false)
@@ -38,8 +39,11 @@ export function ProjectSetup({ session: s, onStage }: Props) {
       <div className="form-panel setup-section" id="setup-0"><PanelTitle eyebrow="01 / PRODUCT FOUNDATION" title="产品基础信息" action={<Chip tone={s.project?.identity ? 'green' : 'muted'}>{s.project?.identity ? '身份已确认' : '待连接与确认'}</Chip>} />
         <div className="form-grid setup-form-grid">
           <label className="wide">连接凭据<input type="password" autoComplete="off" disabled={s.busy || ((!!s.project || !!s.pending) && !s.authExpired)} value={s.token} onChange={e => s.setToken(e.target.value)} placeholder="仅保存在当前页面内存" /></label>
-          <label>项目 ID<input value={s.projectId} disabled={!!s.project || s.busy || !!s.pending} onChange={e => s.setProjectId(e.target.value)} /></label><label>项目名称<input maxLength={150} value={s.project?.name ?? name} disabled={!!s.project || s.busy || !!s.pending} onChange={e => setName(e.target.value)} /></label>
-          <Button disabled={!s.token.trim() || !s.projectId.trim() || s.busy || (!!s.pending && !s.project)} onClick={() => void s.refresh()}>读取项目</Button><Button disabled={!!s.project || !s.token.trim() || !name.trim() || s.busy || !!s.pending} onClick={() => void s.create(name)}>创建项目</Button>
+          <Button disabled={!s.token.trim() || s.busy || !!s.pending} onClick={() => void s.listProjects()}>连接并读取项目列表</Button>
+          <label className="wide">已有项目<select value={s.projects.some(p => p.id === s.project?.id) ? s.project?.id : ''} disabled={!s.canSwitch || !s.token.trim()} onChange={e => void s.selectProject(e.target.value)}><option value="">选择项目</option>{s.projects.map(p => <option key={p.id} value={p.id}>{p.name} · R{p.revision}</option>)}</select></label>
+          <label>新项目名称<input maxLength={150} value={name} disabled={!s.canSwitch} onChange={e => setName(e.target.value)} /></label><Button disabled={!s.token.trim() || !name.trim() || !s.canSwitch} onClick={() => void s.create(name)}>创建项目</Button>
+          <p className="integration-note wide">切换项目时保留各项目本地草稿；凭据不保存。未决请求或未处理版本冲突期间不能切换。</p>
+          <details className="wide"><summary>按项目 ID 打开（兼容入口）</summary><label>项目 ID<input value={s.projectId} disabled={!s.canSwitch} onChange={e => s.setProjectId(e.target.value)} /></label><Button disabled={!s.token.trim() || !s.projectId.trim() || !s.canSwitch} onClick={() => void s.selectProject(s.projectId.trim())}>打开项目</Button></details>
           <label>产品名称<input maxLength={150} disabled={!s.canWrite} value={identityValue} onChange={e => setProductName(e.target.value)} /></label><label>内部代号<input disabled value="" placeholder="后端尚未支持" /></label>
           <label>产品品类<select disabled><option>尚未接入</option></select></label><label>产品阶段<select disabled><option>尚未接入</option></select></label><label className="wide">一句话介绍<input disabled value="" placeholder="后端尚未支持" /></label>
           {s.project?.identity && <label className="wide">修改原因<textarea maxLength={1000} value={s.reason} onChange={e => s.setReason(e.target.value)} disabled={!s.canWrite} /></label>}
@@ -73,8 +77,8 @@ export function FactsStage({ session: s, onStage }: Props) {
   const [filter, setFilter] = useState('all')
   const [sourceFilter, setSourceFilter] = useState('')
   const [query, setQuery] = useState('')
-  const [draft, setDraft] = useState<Candidate>(emptyCandidate)
-  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useProjectDraft<Candidate>(s.project?.id, 'factCandidate', emptyCandidate)
+  const [editing, setEditing] = useProjectDraft(s.project?.id, 'factEditing', false)
   const [replacement, setReplacement] = useState<Candidate | null>(null)
   const facts = s.project?.facts ?? []
   const sources = s.project?.evidence ?? []

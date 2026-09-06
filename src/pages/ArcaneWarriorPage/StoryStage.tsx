@@ -1,3 +1,4 @@
+import { useProjectDraft } from './project-drafts'
 import { useState } from 'react'
 import { ArrowDown, ArrowLeft, ArrowUp, Bot, Check, ChevronDown, Circle, Image as ImageIcon, Layers3, Plus, RefreshCw, Sparkles } from 'lucide-react'
 import type { StageId } from './domain'
@@ -13,7 +14,7 @@ function dependencyKey(project: Project | null) {
 }
 export default function StoryStage({ session, onStage }: { session: ProjectSession; onStage: (stage: StageId) => void }) {
   const { project, canPlan, busy, write, confirmed, reason, setReason, reasonValid, runConsent, setRunConsent } = session
-  const [draft, setDraft] = useState<Draft | null>(null)
+  const [draft, setDraft] = useProjectDraft<Draft | null>(project?.id, 'storyDraft', null)
   const [selectedIndex, setSelectedIndex] = useState(0)
   const [view, setView] = useState<'overview' | 'detail'>('overview')
   const chapters = draft?.chapters ?? project?.storyboard?.chapters ?? []
