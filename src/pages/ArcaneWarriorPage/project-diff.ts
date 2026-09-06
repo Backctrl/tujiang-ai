@@ -23,9 +23,10 @@ export function projectDifferences(before: Project, after: Project) {
     else {
       if (!sameJsonValue(old.parse, material.parse) || !sameJsonValue(old.blocks, material.blocks)) changes.push(`原件解析：${material.fileName} · ${materialStatus(old)} → ${materialStatus(material)}（${material.blocks.length} 个候选）`)
       if (!sameJsonValue(old.origins, material.origins)) changes.push(`原件来源：${material.fileName}（${old.origins.length} → ${material.origins.length} 次导入）`)
+      if (!sameJsonValue(old.usageReview, material.usageReview)) changes.push(`原件用途：${material.fileName}（第 ${old.usageReview?.version ?? 0} → ${material.usageReview?.version ?? 0} 版），请核对资料块用途及关联事实。`)
     }
   }
   changes.push(...contextDifferences(projectContextBase(before), projectContextBase(after)))
-  if (!changes.length) changes.push('运行任务、预检或其他服务端记录已更新；本地输入仍保留。')
+  if (!changes.length) changes.push(sameJsonValue(before, after) ? '服务端数据与请求依据相同，请核对错误说明和保留输入。' : '运行任务、预检或其他服务端记录已更新；本地输入仍保留。')
   return changes
 }

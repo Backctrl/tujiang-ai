@@ -1,5 +1,6 @@
 import type { MaterialSource } from '../../../backend/src/production-materials.js'
 import { ApiError, type PreparedProjectWrite, type Project } from './stage-a-api.js'
+import { isReviewTarget, reviewFieldsAllowed, type ReviewKind } from './review-requests.js'
 
 export type MaterialLocalEntry = {
   id: string; projectId: string; fileName: string; mimeType: string; sizeBytes: number; file: Blob;
@@ -7,7 +8,8 @@ export type MaterialLocalEntry = {
   status: 'waiting' | 'uploading' | 'uncertain' | 'rejected' | 'conflict'; message?: string;
 }
 export type MaterialOperation = {
-  id: 'active'; kind: 'upload' | 'parse-retry'; prepared: PreparedProjectWrite; before: Project; label: string; entryId?: string;
+  id: 'active'; kind: 'upload' | 'parse-retry' | 'review'; prepared: PreparedProjectWrite; before: Project; label: string; entryId?: string;
+  reviewKind?: ReviewKind;
   parseProgressRebases?: number;
 }
 export interface MaterialIntakeStorage {
@@ -32,12 +34,14 @@ export function validateMaterialOperation(value: unknown): MaterialOperation {
     op.prepared.projectId !== p.id ||
     (op.parseProgressRebases !== undefined && (!Number.isInteger(op.parseProgressRebases) || op.parseProgressRebases < 0 || op.parseProgressRebases > 1)) ||
     !(op.kind === 'upload' && op.prepared.suffix === 'production/materials' && typeof op.entryId === 'string') &&
-    !(op.kind === 'parse-retry' && /^production\/materials\/[a-f\d-]+\/parse\/retry$/i.test(op.prepared.suffix))) throw new ApiError('INVALID_MATERIAL_RECOVERY', 0)
+    !(op.kind === 'parse-retry' && /^production\/materials\/[a-f\d-]+\/parse\/retry$/i.test(op.prepared.suffix)) &&
+    !(op.kind === 'review' && op.entryId === undefined && op.parseProgressRebases === undefined && isReviewTarget(op.reviewKind, op.prepared.suffix))) throw new ApiError('INVALID_MATERIAL_RECOVERY', 0)
   let body: Record<string, unknown>
   try { body = JSON.parse(op.prepared.body) as Record<string, unknown> } catch { throw new ApiError('INVALID_MATERIAL_RECOVERY', 0) }
   if (!body || body.expectedProjectVersion !== p.version || body.expectedRevision !== p.revision ||
     typeof body.idempotencyKey !== 'string' || !/^[a-f\d-]{36}$/i.test(body.idempotencyKey) ||
-    (op.kind === 'upload' && (typeof body.contentBase64 !== 'string' || typeof body.fileName !== 'string' || typeof body.mimeType !== 'string' || !body.source))) throw new ApiError('INVALID_MATERIAL_RECOVERY', 0)
+    (op.kind === 'upload' && (typeof body.contentBase64 !== 'string' || typeof body.fileName !== 'string' || typeof body.mimeType !== 'string' || !body.source)) ||
+    (op.kind === 'review' && (!op.reviewKind || !reviewFieldsAllowed(op.reviewKind, body, true)))) throw new ApiError('INVALID_MATERIAL_RECOVERY', 0)
   return op as MaterialOperation
 }
 

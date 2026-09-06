@@ -1,6 +1,8 @@
 import type { Project } from '../../../backend/src/contracts.js'
 import type { RulePack } from '../../../backend/src/production-context.js'
+import type { MaterialReviewCenter } from '../../../backend/src/production-material-usage.js'
 import { contextFieldLabel, isRuleCatalog } from './project-context.js'
+import { isMaterialReviewCenter } from './material-review.js'
 export type { Project, Fact, Storyboard, Section } from '../../../backend/src/contracts.js'
 export type ProjectSummary = Pick<Project, 'id' | 'name' | 'version' | 'revision' | 'contractVersion'> & { updatedAt: string }
 export type PreparedProjectWrite = Readonly<{ projectId: string; suffix: string; body: string }>
@@ -30,6 +32,18 @@ function responseError(response: Response, data: { error?: { code?: string; fiel
 // Same-origin only: the reverse proxy owns the backend destination, never the browser token.
 export class StageAApi {
   constructor(private token: string, private request: typeof fetch = fetch) {}
+  async materialReviews(projectId: string): Promise<MaterialReviewCenter> {
+    let response: Response
+    try {
+      response = await this.request(`/api/projects/${encodeURIComponent(projectId)}/production/material-reviews`, {
+        headers: { Authorization: `Bearer ${this.token}` }, redirect: 'error', signal: AbortSignal.timeout(15000),
+      })
+    } catch { throw new ApiError('CONNECTION_UNCERTAIN', 0) }
+    const data: unknown = await response.json().catch(() => { if (!response.ok) return {}; throw new ApiError('INVALID_MATERIAL_REVIEWS', 502) })
+    if (!response.ok) throw responseError(response, (data ?? {}) as Parameters<typeof responseError>[1])
+    if (!isMaterialReviewCenter(data) || data.projectId !== projectId) throw new ApiError('INVALID_MATERIAL_REVIEWS', 502)
+    return data
+  }
   async catalog(): Promise<RulePack[]> {
     let response: Response
     try {
@@ -106,10 +120,19 @@ const messages: Record<string, string> = {
   SOURCE_FILE_INTEGRITY_FAILED: '原件完整性检查未通过，请联系维护人员恢复正确原件。',
   ORIGINAL_INTEGRITY_MISMATCH: '下载内容与原件记录不一致，已停止保存，请刷新后重试。',
   LOCAL_FILE_READ_FAILED: '无法读取本地文件，请重新选择原件。',
-  LOCAL_RECOVERY_SAVE_FAILED: '无法保存浏览器恢复记录，可能是存储不可用或空间不足。此份文件尚未发送，请恢复浏览器存储后重试。',
+  LOCAL_RECOVERY_SAVE_FAILED: '无法保存浏览器恢复记录，可能是存储不可用或空间不足。本次请求尚未发送，请恢复浏览器存储后重试。',
   LOCAL_RECOVERY_SETTLE_FAILED: '服务已返回结果，但浏览器恢复记录未能更新。请恢复浏览器存储后使用原操作重试核对。',
   LOCAL_RECOVERY_READ_FAILED: '无法读取浏览器恢复记录，新的写入已暂停。请检查浏览器存储后重新读取。',
   INVALID_MATERIAL_RECOVERY: '材料恢复记录不完整，新的写入已暂停。请联系维护人员核对浏览器中的原请求。',
+  INVALID_MATERIAL_REVIEWS: '待处理任务返回内容不完整，请重新读取或核对服务版本。',
+  INVALID_REVIEW_REQUEST: '审核请求类型或字段不符合当前接口，请刷新后重试。',
+  MATERIAL_BLOCK_NOT_FOUND: '资料块已不可用，请读取最新原件并重新选择。',
+  MATERIAL_PARSE_REQUIRED: '请等待原件成功解析后再审核用途。',
+  MATERIAL_SOURCE_INVALID: '原件或用途来源已变化，请读取最新项目并复核该资料块。',
+  TEXT_EVIDENCE_REQUIRED: '只有文字资料块可作为产品证据；图片可选择素材或参考用途。',
+  DECODED_IMAGE_REQUIRED: '只有成功解码的图片资料块可作为可用素材。',
+  SOURCE_RECONFIRMATION_NOT_REQUIRED: '该事实当前无需来源重确认，请读取最新任务。',
+  INVALID_RECONFIRMATION_SOURCE: '新证据必须来自同一原件、同一资料块，并包含原事实摘录。',
   UNSUPPORTED_PRODUCTION_CONTRACT: '当前制作配置与服务版本不兼容，请更新客户端后重试。',
   PRODUCTION_CONTEXT_INCOMPLETE: '制作配置尚未完整，请补齐列出的字段后启用。',
   RULE_PACK_UNAVAILABLE: '所选平台规则版本暂不可用。可保留草稿，补齐规则或重新选择后启用。',
