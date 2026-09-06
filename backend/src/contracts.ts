@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { Production } from './production.js';
+import type { FactSourceReconfirmation, FactSourceReview, MaterialProvenance, MaterialWithdrawal } from './production-material-usage.js';
 
 export const CONTRACT_VERSION = 'stage-a.1';
 export const writeSchema = z.object({
@@ -60,6 +61,8 @@ export const draftState = (): StateAxes => ({ issueSeverity: 'none', runStatus: 
 export interface Evidence {
   id: string; documentName: string; locator: string; usage: 'product_evidence';
   text: string; sha256: string; objectKey: string; createdBy: string;
+  origin?: 'manual_entry' | 'material'; createdAt?: string;
+  availability?: 'available' | 'withdrawn'; materialSource?: MaterialProvenance; withdrawn?: MaterialWithdrawal;
 }
 export interface Fact {
   id: string; attribute: string; role: 'core' | 'supporting'; value: string; evidenceId: string; quote: string;
@@ -68,6 +71,7 @@ export interface Fact {
   locked: boolean; issueSeverity: StateAxes['issueSeverity'];
   confirmedBy?: string; confirmedAt?: string;
   correctsFactId?: string; createdBy?: string; reason?: string;
+  sourceReview?: FactSourceReview; sourceReconfirmations?: FactSourceReconfirmation[];
 }
 export interface Section extends StateAxes {
   id: string; kind: 'diagnostic_draft'; sourceRunId: string; factIds: string[];

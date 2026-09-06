@@ -1,4 +1,4 @@
-import { applyOutput, failureCode } from './domain.js';
+import { applyOutput, checkSkillInputs, failureCode } from './domain.js';
 import type { ModelGateway } from './openrouter.js';
 import { Store } from './store.js';
 import type { ModelObservation } from './contracts.js';
@@ -16,6 +16,7 @@ export class Worker {
       if (observation) (current.observations ??= []).push({ ...observation, attempt: run.attempt, ...(errorCode ? { errorCode } : {}) });
     };
     try {
+      checkSkillInputs(project, run.skill);
       output = await this.model.generate(run.skill, project, value => { observation = value; });
       await this.store.finish(project.id, run.id, run.attempt, (p, current) => { applyOutput(p, current, output); record(current); }, observation);
     } catch (error) {
