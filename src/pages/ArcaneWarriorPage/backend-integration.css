@@ -62,3 +62,6 @@
 .connected-workbench .material-card b { white-space: normal; }
 .connected-workbench .material-upload p, .connected-workbench .material-upload summary,
 .connected-workbench .material-card p, .connected-workbench .material-card summary { font-size: 12px; line-height: 1.8; }
+/* Keep long and expanded source cards at their content height inside the scrolling facts rail. */
+.connected-workbench .material-sidebar { display: flex; flex: 1; min-height: 0; flex-direction: column; align-items: stretch; }
+.connected-workbench .material-sidebar > * { flex: 0 0 auto; min-width: 0; }
