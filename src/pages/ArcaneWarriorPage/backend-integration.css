@@ -1,0 +1,52 @@
+/* Required connection/empty-state controls use the existing workbench design. */
+.connected-workbench [hidden] { display: none !important; }
+.connected-workbench .workspace { display: flex; flex-direction: column; }
+.connected-workbench .stage-surfaces { flex: 1; min-height: 0; overflow: auto; }
+.connected-workbench .stage-surface { height: 100%; min-height: 0; }
+.connected-workbench .stage-surface > .three-column { height: 100%; min-height: 0; }
+.connected-workbench .connection-feedback { flex: 0 0 auto; max-height: 200px; overflow: auto; padding: 8px 24px; border-bottom: 1px solid var(--line); background: var(--panel-2); font-size: 12px; }
+.connected-workbench .connection-feedback p { margin: 4px 0; line-height: 1.6; }
+.connected-workbench .connection-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.connected-workbench .snapshot-comparison { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.connected-workbench .snapshot-comparison pre { max-height: 200px; overflow: auto; font-size: 11px; }
+.connected-workbench .context-item { min-width: 0; }
+.connected-workbench .context-item strong { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.connected-workbench .topbar > .button { margin-right: 10px; }
+.connected-workbench .activity-panel { position: absolute; z-index: 8; right: 24px; bottom: var(--action-h); width: 360px; max-height: 60vh; overflow: auto; background: var(--panel); border: 1px solid var(--line); padding: 18px; font-size: 12px; }
+.connected-workbench .activity-panel p { padding-block: 10px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; line-height: 1.8; }
+.connected-workbench .integration-note { font-size: 12px; color: var(--ink-2); line-height: 1.8; overflow-wrap: anywhere; }
+.connected-workbench .tree-search input { min-width: 0; width: 100%; border: 0; background: transparent; color: var(--ink); }
+.connected-workbench .canvas-gate { padding: 24px; }
+.connected-workbench .canvas-gate p { max-width: 400px; line-height: 1.8; }
+.connected-workbench .canvas-toolbar { flex-wrap: wrap; min-height: 44px; height: auto; gap: 8px; }
+.connected-workbench .inspector-block p { overflow-wrap: anywhere; }
+.connected-workbench .qa-total, .connected-workbench .market-mini p { font-size: 11px; line-height: 1.8; }
+.connected-workbench .qa-group > p { padding: 0 12px; }
+.connected-workbench .preview-workspace .canvas-gate { text-align: center; margin-inline: 42px; }
+.connected-workbench .button:disabled, .connected-workbench button:disabled { cursor: not-allowed; }
+.connected-workbench input:disabled, .connected-workbench textarea:disabled, .connected-workbench select:disabled { opacity: .55; }
+.connected-workbench button:focus-visible, .connected-workbench input:focus-visible, .connected-workbench textarea:focus-visible, .connected-workbench select:focus-visible, .connected-workbench summary:focus-visible { outline: 2px solid var(--yellow); outline-offset: 2px; }
+.connected-workbench .market-preview { display: grid; place-items: center; }
+.connected-workbench .story-main > label { display: grid; gap: 7px; margin: 10px 14px; font-size: 12px; flex: 0 0 auto; }
+.connected-workbench .story-main > label textarea { width: 100%; min-height: 58px; padding: 9px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); font: inherit; resize: vertical; }
+.connected-workbench .story-main > .button { margin: 0 14px 12px; flex: 0 0 auto; }
+.connected-workbench .story-main > .spec-editor, .connected-workbench .story-main > .script-stack { flex: 1; min-height: 0; overflow: auto; }
+.connected-workbench .story-main > .empty-state { flex: 1; min-height: 0; }
+.connected-workbench .inline-editor fieldset { grid-column: 1 / -1; border: 1px solid var(--line); padding: 12px; min-width: 0; font-size: 12px; }
+.connected-workbench .inline-editor fieldset label { display: flex; align-items: flex-start; gap: 8px; margin: 10px 0; }
+.connected-workbench .inline-editor input[type=checkbox] { width: auto; margin-top: 3px; }
+.connected-workbench .story-agent > label, .connected-workbench .fact-queue .inspector-block > label { display: flex; align-items: flex-start; gap: 8px; margin: 12px 0; font-size: 12px; line-height: 1.7; }
+.connected-workbench .story-agent > label input, .connected-workbench .fact-queue .inspector-block > label input { margin-top: 4px; }
+.connected-workbench .setup-check .check-lead, .connected-workbench .check-row .lucide-circle { color: var(--ink-2); }
+.connected-workbench .fact-inspector .inspector-block textarea { width: 100%; min-height: 65px; padding: 9px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); font: inherit; }
+.connected-workbench .fact-queue { min-height: 0; overflow: auto; }
+.connected-workbench .fact-row > span { min-width: 0; overflow-wrap: anywhere; }
+.connected-workbench .fact-row > span:nth-child(3) { font-size: 10px; }
+.connected-workbench .meta-grid b, .connected-workbench .reason-list p { overflow-wrap: anywhere; }
+.connected-workbench .source-card details p { white-space: pre-wrap; max-height: 200px; overflow: auto; overflow-wrap: anywhere; }
+.connected-workbench .story-preview .phone-no { position: static; display: block; margin: 18px 0 10px; }
+.connected-workbench .story-tree > button > .lucide-circle { color: var(--ink-3); }
+.connected-workbench .inline-editor fieldset label { font-size: 12px; line-height: 1.7; }
+.connected-workbench .story-agent summary, .connected-workbench .story-agent li { font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; }
+.connected-workbench .story-agent li small { display: block; font-size: 10px; }
+.connected-workbench .fact-inspector .inspector-block > label { display: grid; gap: 8px; }

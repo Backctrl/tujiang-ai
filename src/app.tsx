@@ -14,7 +14,7 @@ import RegisterPage from "@/pages/RegisterPage/RegisterPage";
 import ForgotPasswordPage from "@/pages/ForgotPasswordPage/ForgotPasswordPage";
 import NotFoundPage from "@/pages/NotFoundPage/NotFoundPage";
 import ArcaneWarriorPage from "@/pages/ArcaneWarriorPage/ArcaneWarriorPage";
-import StageAWorkbench from "@/pages/ArcaneWarriorPage/StageAWorkbench";
+
 import { AuthProvider } from "@/context/AuthContext";
 import { AdminAuthProvider } from "@/context/AdminAuthContext";
 import { AdminLayout } from "@/components/AdminLayout";
@@ -43,6 +43,8 @@ import AdminRolesPage from "@/pages/admin/AdminRolesPage";
 import AdminAuditLogsPage from "@/pages/admin/AdminAuditLogsPage";
 import AdminErrorLogsPage from "@/pages/admin/AdminErrorLogsPage";
 
+function LegacyWorkbenchRedirect() { return <Navigate to="/arcane-warrior" replace /> }
+
 export default function App() {
   return (
     <AuthProvider>
@@ -52,7 +54,7 @@ export default function App() {
         <Route path="/register" element={<RegisterPage />} />
         <Route path="/forgot-password" element={<ForgotPasswordPage />} />
         <Route path="/arcane-warrior" element={<ArcaneWarriorPage />} />
-        <Route path="/arcane-warrior/stage-a" element={<StageAWorkbench />} />
+        <Route path="/arcane-warrior/stage-a" element={<LegacyWorkbenchRedirect />} />
 
         {/* 主应用 - 带 Sidebar + 路由守卫 */}
         <Route element={<Layout />}>

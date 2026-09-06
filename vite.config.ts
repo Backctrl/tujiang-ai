@@ -3,7 +3,7 @@ import { defineConfig } from '@lark-apaas/coding-preset-vite-react'
 
 export default defineConfig({
   server: {
-    proxy: { '/api': { target: 'http://127.0.0.1:4311', changeOrigin: false } },
+    proxy: { '/api': { target: process.env.TUJIANG_API_TARGET || 'http://127.0.0.1:3100', changeOrigin: false } },
   },
   resolve: {
     alias: {
