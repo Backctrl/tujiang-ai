@@ -13,6 +13,12 @@ function canonical(value: unknown): string {
 }
 export class Store {
   constructor(readonly db: Database) {}
+  async list() {
+    const { rows } = await this.db.query(`SELECT id, state->>'name' AS name, version,
+      (state->>'revision')::integer AS revision, state->>'contractVersion' AS "contractVersion",
+      updated_at AS "updatedAt" FROM projects ORDER BY updated_at DESC, id ASC`);
+    return rows;
+  }
   async get(id: string, tx: Connection = this.db, lock = false): Promise<Project> {
     const { rows } = await tx.query<{ state: Project }>(`SELECT state FROM projects WHERE id=$1 ${lock ? 'FOR UPDATE' : ''}`, [id]);
     if (!rows[0]) throw new AppError('PROJECT_NOT_FOUND', 404);
@@ -23,7 +29,7 @@ export class Store {
       ON CONFLICT(id) DO UPDATE SET version=$2, state=$3::jsonb, updated_at=now()`, [p.id, p.version, JSON.stringify(p)]);
     await tx.query('INSERT INTO project_revisions(project_id,revision,state) VALUES ($1,$2,$3::jsonb)', [p.id, p.revision, JSON.stringify(p)]);
   }
-  async command(id: string | undefined, body: { expectedProjectVersion: number; expectedRevision: number; idempotencyKey: string }, operation: string, actor: string, change: (p?: Project) => Promise<Project> | Project) {
+  async command(id: string | undefined, body: { expectedProjectVersion: number; expectedRevision: number; idempotencyKey: string }, operation: string, actor: string, change: (p?: Project) => Promise<Project> | Project, options: { preserveStageAInput?: boolean; noChange?: (p: Project) => boolean } = {}) {
     const key = `${actor}:${body.idempotencyKey}`;
     const fingerprint = createHash('sha256').update(canonical({ id, operation, body })).digest('hex');
     return this.db.transaction(async (tx) => {
@@ -37,7 +43,11 @@ export class Store {
       const latest = { currentProjectVersion: current?.version ?? 0, currentRevision: current?.revision ?? 0 };
       if ((current?.version ?? 0) !== body.expectedProjectVersion) throw new AppError('VERSION_CONFLICT', 409, latest);
       if ((current?.revision ?? 0) !== body.expectedRevision) throw new AppError('REVISION_CONFLICT', 409, latest);
-      if (current) { current.revision++; current.inputRevision = current.revision; delete current.qa; }
+      if (current && options.noChange?.(current)) {
+        await tx.query('INSERT INTO command_receipts(key,fingerprint,response) VALUES ($1,$2,$3::jsonb)', [key, fingerprint, JSON.stringify(current)]);
+        return current;
+      }
+      if (current) { current.revision++; if (!options.preserveStageAInput) { current.inputRevision = current.revision; delete current.qa; } }
       const next = await change(current);
       audit(next, operation, actor);
       await this.save(next, tx);
