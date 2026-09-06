@@ -65,3 +65,20 @@
 /* Keep long and expanded source cards at their content height inside the scrolling facts rail. */
 .connected-workbench .material-sidebar { display: flex; flex: 1; min-height: 0; flex-direction: column; align-items: stretch; }
 .connected-workbench .material-sidebar > * { flex: 0 0 auto; min-width: 0; }
+
+/* The material review center stays inside the original Facts three-column workbench. */
+.connected-workbench .material-review-tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px 8px; }
+.connected-workbench .material-review-tabs button { height: auto; min-height: 36px; padding: 8px; font-size: 11px; }
+.connected-workbench .material-review-row { grid-template-columns: 92px minmax(0, 1fr) 80px; gap: 10px; }
+.connected-workbench .review-filters { margin: 10px; font-size: 11px; }
+.connected-workbench .review-filters input { flex: 1; min-width: 120px; }
+.connected-workbench .review-filters input, .connected-workbench .review-filters select,
+.connected-workbench .material-review-inspector select { padding: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); font: inherit; }
+.connected-workbench .material-review-inspector { overflow-wrap: anywhere; }
+.connected-workbench .material-review-inspector > p, .connected-workbench .material-review-inspector summary { font-size: 12px; line-height: 1.8; }
+.connected-workbench .material-review-inspector label { display: grid; gap: 7px; font-size: 11px; line-height: 1.8; }
+.connected-workbench .material-review-inspector select { max-width: 100%; min-width: 0; width: 100%; }
+.connected-workbench .review-block { padding: 12px 0; border-bottom: 1px solid var(--line); }
+.connected-workbench .review-block > p { font-size: 12px; line-height: 1.8; }
+.connected-workbench .review-block .source-card { min-height: 0; }
+.connected-workbench .review-source-text { white-space: pre-wrap; max-height: 280px; overflow: auto; }
