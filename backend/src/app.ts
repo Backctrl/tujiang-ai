@@ -8,6 +8,8 @@ import { LocalObjects } from './objects.js';
 import { Store, audit } from './store.js';
 import { initializeProduction, requireProduction, PRODUCTION_CONTRACT_VERSION } from './production.js';
 import { activateContext, bindRulePackVersion, contextDraftSchema, productionCatalogSchema, saveContextDraft, type ProductionCatalog } from './production-context.js';
+import { materialUploadSchema, uploadLimitDetails } from './production-materials.js';
+import { MATERIAL_UPLOAD_PATH, registerMaterialRoutes } from './material-routes.js';
 
 const projectParams = z.object({ id: z.string().uuid() });
 const factParams = projectParams.extend({ factId: z.string().uuid(), action: z.enum(['confirm', 'reject', 'retract']) });
@@ -25,16 +27,17 @@ export function buildApp(store: Store, objects: LocalObjects, options: { token: 
   app.setErrorHandler((error, request, reply) => {
     const typed = error as Error & { statusCode?: number };
     const status = error instanceof AppError ? error.statusCode : error instanceof z.ZodError ? 400 : typed.statusCode && typed.statusCode < 500 ? typed.statusCode : 500;
-    const code = error instanceof AppError ? error.code : error instanceof z.ZodError ? 'INVALID_REQUEST' : status === 500 ? 'INTERNAL_ERROR' : 'INVALID_REQUEST';
+    const oversizedMaterial = status === 413 && request.routeOptions.url === MATERIAL_UPLOAD_PATH;
+    const code = oversizedMaterial ? 'FILE_TOO_LARGE' : error instanceof AppError ? error.code : error instanceof z.ZodError ? 'INVALID_REQUEST' : status === 500 ? 'INTERNAL_ERROR' : 'INVALID_REQUEST';
     reply.code(status).send({ error: { code, requestId: request.id,
-      ...(error instanceof AppError && error.details ? { details: error.details } : {}),
+      ...(oversizedMaterial ? { details: uploadLimitDetails() } : error instanceof AppError && error.details ? { details: error.details } : {}),
       ...(error instanceof z.ZodError ? { fields: error.issues.map(i => i.path.join('.')) } : {}) } });
   });
   app.get('/health', async () => ({ status: 'ok', stage: 'A' }));
   app.get('/ready', async () => { await store.db.query('SELECT 1'); return { status: 'ready' }; });
   app.get('/api/contracts', async () => ({ version: CONTRACT_VERSION,
     productionVersion: PRODUCTION_CONTRACT_VERSION,
-    requests: Object.fromEntries(Object.entries({ productionContextDraft: contextWriteSchema, productionContextActivate: writeSchema.strict(), productionInitialize: writeSchema.strict(), create: createSchema, identity: identitySchema, evidence: evidenceSchema,
+    requests: Object.fromEntries(Object.entries({ materialUpload: materialUploadSchema, materialParseRetry: writeSchema.strict(), productionContextDraft: contextWriteSchema, productionContextActivate: writeSchema.strict(), productionInitialize: writeSchema.strict(), create: createSchema, identity: identitySchema, evidence: evidenceSchema,
       factReview: reasonSchema, factCandidate: candidateSchema, identityCorrection: identityCorrectionSchema,
       storyboardEdit: storyboardEditSchema, sectionEdit: sectionEditSchema, candidateApply: reasonSchema, sectionSelect: reasonSchema,
       run: runSchema, write: writeSchema.strict() }).map(([name, schema]) => [name, z.toJSONSchema(schema)])),
@@ -46,6 +49,7 @@ export function buildApp(store: Store, objects: LocalObjects, options: { token: 
     return reply.code(201).send(p);
   });
   app.get('/api/projects', async () => ({ projects: await store.list() }));
+  registerMaterialRoutes(app, store, objects, options.actor);
   app.get('/api/production/catalog', async () => ({ contractVersion: PRODUCTION_CONTRACT_VERSION, ...productionCatalog }));
   app.post('/api/projects/:id/production/context/draft', async request => {
     const { id } = projectParams.parse(request.params);
