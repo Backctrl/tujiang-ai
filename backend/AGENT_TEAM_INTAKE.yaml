@@ -1,0 +1,150 @@
+schema_version: 1
+packet_id: tujiang-stage-a-followup-20260905-094503Z
+packet_type: GOAL_INTAKE
+status: SUPERSEDED
+created_at: '2026-09-05T09:45:03Z'
+received_at: null
+source:
+  role: origin_project_coordinator
+  project_id: null
+  project_path: 'F:\Project\tujiang-ai-source'
+  thread_id: '01a070b1-1170-7b72-addc-ba248f0d1329'
+  thread_evidence: 'Previous open_in_codex tool response returned this calling thread ID.'
+destination:
+  role: registered_controller
+  project_id: c7a5c55c-b64a-4c60-adcb-6eb1addafe5e
+  project_path: 'F:\Agent-Team-Control'
+  thread_id: '01a07090-ed06-75f2-963a-bdd4ae76cdf6'
+transport:
+  mode: manual_copy
+  delivered_by_user: false
+  receipt_confirmed: false
+goal_id: null
+task_ids: []
+payload:
+  execution_update: >-
+    用户后续明确要求“现在分工进行开发吧”，并替换了项目执行规则。
+    原项目根线程已直接创建postgres_integration和model_evaluation原生子线程，
+    本包保留为历史转交草案，不再作为本轮开发的前置条件，亦不代表中央台账已登记。
+    实际分工与验收结果见同目录TEAM_PROGRESS.md。
+  objective: >-
+    按李硕已确认计划继续图匠阶段A后端开发，以不同Agent承担实现和独立验收。
+    优先完成后端独立依赖修复、真实PostgreSQL联调、OpenRouter离线评测准备。
+    请控制中心登记Goal、签发READY工作包，不重复询问已授权目标。
+  approved_scope:
+    - '在当前仓库backend/建立和完善后端。'
+    - '阶段A：文本证据、候选事实、人工确认、初步顺序、一个诊断Section草稿、QA预检。'
+    - '阶段B后续完成市场适配、正式QA和导出，本轮不扩展实施。'
+    - '模型统一OpenRouter，按任务能力选型，可按Skill配置；尚未固定具体模型。'
+    - '用户明确要求按计划推进并使用Agent Team分工。'
+  boundaries:
+    - '不更改旧前端，不代用户发送飞书群消息，不部署或合并main。'
+    - '保留所有现有修改；不删除生产数据或运行清理命令。'
+    - '本地测试数据库须明确隔离，不对已有生产库迁移。'
+    - '不得输出密钥或.env值；付费批量模型评测待明确模型、样本和预算。'
+    - '原生子线程只隔离上下文，共享文件系统；并行写入须有互斥所有权或Worktree。'
+  current_state:
+    branch: main
+    head: a7ded87fbd4725a083893b3ef360840ed78bc5eb
+    git_status: ['M .gitignore', '?? backend/', '?? docs/', '?? tmp_aw/']
+    preserve: 'docs/和tmp_aw/是原有内容；backend/及.gitignore包含上一轮未提交实现。'
+    previous_validation: '上一轮typecheck、build及20项测试通过；本轮没有重跑，不冒称新证据。'
+    verified_now:
+      - 'Docker CLI存在，Docker引擎未运行；docker info无法连接dockerDesktopLinuxEngine。'
+      - 'backend/.env不存在；未读取或输出任何凭据。'
+      - 'backend/package.json与package-lock.json含miaoda-vite-react-app: file:..，独立依赖需修复。'
+      - 'codexhost delegate --help返回命令不存在；当前无已验证跨顶层线程send/read接口。'
+    runtime: danger-full-access
+    entry_behavior: read-only
+    isolation_note: 'Controller入口保持行为只读；原项目协调者仅写本转交产物，未派发正式开发包。'
+  implementation:
+    - 'Fastify/TypeScript，PostgreSQL JSONB聚合与修订快照、事务幂等回执。'
+    - 'PostgreSQL持久化任务队列、Worker租约与失败重试、SSE。'
+    - '单操作者本地Bearer令牌；不是生产多用户鉴权。'
+    - 'OpenRouter结构化文本接口、独立事实与规划模型配置；无真实模型验收。'
+    - '本地内容寻址文件存储；生产对象存储未接入。'
+    - '测试采用PGlite及模型替身；已测试HTTP SSE与落盘重启，不等于真实PG多连接测试。'
+  baselines:
+    - url: https://oriniture.feishu.cn/docx/EQzNdi9Szo7T1DxsIEMc2ku4nie
+      title: 产品功能与交互契约v1
+      revision_read: 57
+    - url: https://oriniture.feishu.cn/docx/XHktdDPkKoTPbvxytjKcEfCanPg
+      title: 端到端使用流程与业务逻辑v1
+      revision_read: 15
+    - '工程入口：backend/README.md、backend/MODEL_CAPABILITIES.md、backend/src/contracts.ts。'
+  proposed_work_packages:
+    - alias: dependency_and_pg_runtime
+      role: backend_implementation
+      classification: STANDARD
+      suggested_model: gpt-5.6-terra
+      suggested_reasoning_effort: high
+      reason: '边界明确，但涉及数据库真实并发、运行与恢复。'
+      ownership:
+        - backend/package.json
+        - backend/package-lock.json
+        - backend/compose.yaml
+        - backend/README.md
+        - '新增backend/test/postgres.integration.ts及专属运行脚本（实际路径由执行包冻结）。'
+      work:
+        - '核实并移除不应存在的file:..父工程依赖，验证独立npm ci。'
+        - '在明确隔离的本地PostgreSQL运行迁移，验证真实多连接事务、幂等、Worker互斥和中断恢复。'
+        - '记录真实服务启动、重启持久化及可重复命令；不能用PGlite替代该验收。'
+      constraints:
+        - '不得触碰模型评测包所有权；核心src缺陷回报后另派串行修复。'
+        - '新增脚本只由本包修改package.json；为评测包登记脚本放在集成阶段。'
+    - alias: openrouter_evaluation_preparation
+      role: model_evaluation_implementation
+      classification: STANDARD
+      suggested_model: gpt-5.6-terra
+      suggested_reasoning_effort: high
+      reason: '需将已有能力和Schema转为可重复评测，真实样本尚缺。'
+      ownership:
+        - backend/MODEL_CAPABILITIES.md
+        - '新增backend/evaluation/目录。'
+        - '新增backend/test/evaluation.test.ts。'
+      work:
+        - '准备离线评测工具和样本Schema，覆盖结构、证据锚点、冲突、事实白名单和不批准约束。'
+        - '合成样本必须明确标注；真实黄金样本不得捏造。'
+        - '定义候选模型、真实产品样本、费用上限等真实评测输入。'
+      constraints:
+        - '不修改package.json、共享src或PG测试文件；依赖/脚本需求回报集成。'
+        - '离线工作可先做；无模型/密钥/样本时不得伪造真实OpenRouter成绩。'
+    - alias: integrated_independent_qa
+      role: independent_qa
+      classification: COMPLEX
+      suggested_model: gpt-5.6-sol
+      suggested_reasoning_effort: high
+      reason: '独立核验事务、运行状态、证据链和恢复边界。'
+      dependencies: [dependency_and_pg_runtime, openrouter_evaluation_preparation, origin_integration]
+      ownership: '只读实际集成结果；可执行必要测试，不修改实现。'
+      work:
+        - '必须新建不同于实现者的原生子线程，复核变更范围与运行证据。'
+        - '验证实际PG结果与离线模型测试边界、人工门、stale恢复、动态章节及预检不批准。'
+        - '失败交回原实现线程返工，复验后回传中央登记。'
+  dispatch_notes:
+    - '建议模型在当前collaboration工具声明中可选；正式派发时由控制中心核对、记录，不静默替换。'
+    - '没有为上述建议包创建实现或QA线程；当前只有入口子线程/root/handoff_controller。'
+    - '核心共享代码修复若必要，另派有所有权的串行包，不让两个实现者同时改。'
+  commands:
+    cwd: 'F:\Project\tujiang-ai-source\backend'
+    verified_script_names: ['npm run typecheck', 'npm test', 'npm run build', 'npm run migrate', 'npm run dev', 'npm start']
+    note: '只核查脚本存在；测试库确定后才执行迁移和服务启动。'
+  missing_inputs:
+    - '中央Goal ID及签发的EXECUTION_PACKET；已授权后端目标不需要重新确认。'
+    - 'Docker引擎启动或明确的本地PostgreSQL测试实例；由运行包排查。'
+    - '真实产品规格书及人工验收依据，仅阻塞真实样本评测。'
+    - '具体候选模型、环境变量凭据及付费评测预算，仅阻塞真实模型评测。'
+    - '岳凯前端联调源码版本，仅阻塞真实前端联调，不阻塞后端与离线评测。'
+expected_response: >-
+  请关联或建立Goal并登记以上现状，冻结DAG、文件所有权、模型与验收标准，
+  为输入齐全的工作包返回EXECUTION_PACKET。用户将包交回图匠原项目后，
+  原项目根线程按包创建并管理原生开发线程，完成后再按独立QA包创建验收线程。
+approval_boundaries:
+  - '本包是GOAL_INTAKE，不是控制中心已签发的执行包，不代表已送达或已登记。'
+  - '正式线程可在用户已授权目标内创建；部署、默认分支合并和付费批量评测不在本次授权内。'
+evidence:
+  - 'F:\Agent-Team-Control\controller.yaml'
+  - 'F:\Agent-Team-Control\AGENTS.md'
+  - 'F:\Agent-Team-Control\TEAM.md'
+  - 'F:\Agent-Team-Control\tasks\HANDOFF.template.yaml'
+  - '本轮git status、git branch、git rev-parse、docker info和依赖rg输出。'

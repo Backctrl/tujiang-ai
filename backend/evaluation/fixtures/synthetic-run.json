@@ -1,0 +1,9 @@
+{
+  "config": {
+    "modelId": "synthetic/protocol-only", "provider": "synthetic",
+    "maxRequests": 1, "maxInputTokens": 10000, "maxOutputTokens": 2000,
+    "maxCostUsd": 0.1, "timeoutMs": 1000, "acceptEstimatedBudget": false
+  },
+  "fixtures": ["synthetic-extraction.json"],
+  "capabilitiesFile": "synthetic-endpoints.json"
+}

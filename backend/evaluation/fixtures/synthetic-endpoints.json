@@ -1,0 +1,13 @@
+{
+  "synthetic": true,
+  "data": {
+    "id": "synthetic/protocol-only",
+    "architecture": { "input_modalities": ["text"], "output_modalities": ["text"] },
+    "endpoints": [{
+      "tag": "synthetic", "provider_name": "Synthetic", "model_id": "synthetic/protocol-only", "status": 0,
+      "context_length": 20000, "max_prompt_tokens": 16000, "max_completion_tokens": 4000,
+      "supported_parameters": ["response_format", "structured_outputs", "max_tokens"],
+      "pricing": { "prompt": "0.000001", "completion": "0.000002", "request": "0" }
+    }]
+  }
+}

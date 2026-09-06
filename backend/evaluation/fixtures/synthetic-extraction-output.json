@@ -1,0 +1,6 @@
+{
+  "facts": [
+    { "attribute": "容量", "value": "500 ml", "role": "core", "evidenceId": "11111111-1111-4111-8111-111111111111", "quote": "容量：500 ml。" },
+    { "attribute": "容量", "value": "600 ml", "role": "core", "evidenceId": "11111111-1111-4111-8111-111111111111", "quote": "另一版规格容量：600 ml。" }
+  ]
+}
