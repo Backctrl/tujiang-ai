@@ -7,14 +7,14 @@ import { createProject, enqueue, retryRun } from '../src/domain.js';
 import { Worker } from '../src/worker.js';
 import { AppError } from '../src/errors.js';
 import type { Project } from '../src/contracts.js';
+import { buildApp } from '../src/app.js';
+import { LocalObjects } from '../src/objects.js';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { initializeProduction } from '../src/production.js';
 import { activateContext, bindRulePackVersion, saveContextDraft, type RulePack } from '../src/production-context.js';
 import { context, rule } from './fixtures/production-context.js';
 import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { buildApp } from '../src/app.js';
-import { LocalObjects } from '../src/objects.js';
 import { IngestionWorker } from '../src/ingestion-worker.js';
 import { parseMaterial } from '../src/material-parser.js';
 
@@ -60,6 +60,45 @@ async function isolated(action: (db: Database, peer: Database, reconnect: (onIdl
 
 const command = (p?: Project, idempotencyKey = randomUUID()) => ({
   expectedProjectVersion: p?.version ?? 0, expectedRevision: p?.revision ?? 0, idempotencyKey,
+});
+
+test('real PostgreSQL: HTTP production initialization preserves legacy snapshots and receipts', async () => {
+  await isolated(async (db) => {
+    await migrate(db);
+    const store = new Store(db);
+    const token = randomUUID();
+    // These routes never write object files; no fixture directory is created.
+    const app = buildApp(store, new LocalObjects(join(tmpdir(), `unused-${randomUUID()}`)), { token, actor: 'pg-test' });
+    const headers = { authorization: `Bearer ${token}` };
+    const body = { ...command(), name: 'Legacy production migration fixture' };
+    try {
+      const create = await app.inject({ method: 'POST', url: '/api/projects', headers, payload: body });
+      assert.equal(create.statusCode, 201);
+      const old = create.json<Project>();
+      const oldHistory = await db.query('SELECT state FROM project_revisions WHERE project_id=$1 ORDER BY revision', [old.id]);
+      const unauthorized = await app.inject({ method: 'GET', url: '/api/projects' });
+      assert.equal(unauthorized.statusCode, 401);
+      const listing = await app.inject({ method: 'GET', url: '/api/projects', headers });
+      assert.equal(listing.json().projects[0].id, old.id);
+      assert.deepEqual(await store.get(old.id), old);
+      const url = `/api/projects/${old.id}/production/initialize`;
+      const initBody = command(old);
+      const initialized = await app.inject({ method: 'POST', url, headers, payload: initBody });
+      assert.equal(initialized.statusCode, 200);
+      const next = initialized.json<Project>();
+      assert.deepEqual(next.production?.objects, []);
+      assert.deepEqual(next.sections, old.sections);
+      assert.equal(next.revision, old.revision + 1);
+      const repeat = await app.inject({ method: 'POST', url, headers, payload: command(next) });
+      assert.deepEqual(repeat.json(), next);
+      const replay = await app.inject({ method: 'POST', url: '/api/projects', headers, payload: body });
+      assert.deepEqual(replay.json(), old);
+      assert.deepEqual((await db.query('SELECT state FROM project_revisions WHERE project_id=$1 AND revision=$2', [old.id, old.revision])).rows, oldHistory.rows);
+      assert.deepEqual(await store.get(old.id), next);
+      const conflict = await app.inject({ method: 'POST', url, headers, payload: { ...initBody, expectedRevision: next.revision } });
+      assert.equal(conflict.statusCode, 409);
+    } finally { await app.close(); }
+  });
 });
 async function seed(store: Store, queued = false) {
   return store.command(undefined, command(), 'project.created', 'pg-test', () => {
