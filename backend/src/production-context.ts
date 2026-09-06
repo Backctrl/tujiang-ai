@@ -4,24 +4,22 @@ import { z } from 'zod';
 import { AppError } from './errors.js';
 import type { Production } from './production.js';
 import type { Connection } from './database.js';
+import { label, legacyPrimaryTargetSchema, canvasProfileSchema, rulePackRefSchema, requiredFactSchema,
+  completeContextSchema, contextDraftSchema, type ContextDraft, type CompleteContext, type PrimaryTarget } from './production-context-shapes.js';
+import { scopedRulePackSchema, validateScopedContext, type ScopedRulePack } from './production-rules.js';
+export { productBriefSchema, primaryTargetSchema, canvasProfileSchema, rulePackRefSchema, contextDraftSchema, completeContextSchema } from './production-context-shapes.js';
+export type { ProductBrief, PrimaryTarget, CanvasProfile, RulePackRef, ContextDraft, CompleteContext } from './production-context-shapes.js';
+export type { ScopedRulePack } from './production-rules.js';
 
-const label = z.string().trim().min(1).max(200);
-export const productBriefSchema = z.object({ productName: label, internalCode: label, category: label, stage: label,
-  introduction: z.string().trim().min(1).max(10000), commercialIntent: z.string().trim().min(1).max(2000) }).strict();
-export const primaryTargetSchema = z.object({ platform: label, site: label,
-  country: z.string().regex(/^[A-Z]{2}$/), language: z.string().regex(/^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/),
-  currency: z.string().regex(/^[A-Z]{3}$/), unitSystem: z.enum(['metric', 'imperial']) }).strict();
-export const canvasProfileSchema = z.object({ widthPx: z.number().int().min(1).max(20000), format: z.enum(['png', 'jpeg', 'webp']) }).strict();
-export const rulePackRefSchema = z.object({ id: label, version: label }).strict();
+/** Legacy canvas allowlists are preserved exactly; they cannot encode scoped platform constraints. */
 export const rulePackSchema = rulePackRefSchema.extend({
   officialUrl: z.string().url().refine(value => new URL(value).protocol === 'https:', 'HTTPS source required'),
   verifiedAt: z.string().datetime().refine(value => Date.parse(value) <= Date.now(), 'Verification cannot be in the future'),
   verifiedBy: label,
-  target: primaryTargetSchema,
+  target: legacyPrimaryTargetSchema,
   allowedWidthsPx: z.array(z.number().int().min(1).max(20000)).min(1),
   allowedFormats: z.array(canvasProfileSchema.shape.format).min(1),
-  requiredFacts: z.array(z.object({ key: label, description: z.string().trim().min(1).max(1000),
-    allowUnknown: z.boolean(), allowNotApplicable: z.boolean() }).strict()),
+  requiredFacts: z.array(requiredFactSchema),
 }).strict().superRefine((rule, ctx) => {
   const uniqueFields = {
     allowedWidthsPx: rule.allowedWidthsPx,
@@ -32,26 +30,18 @@ export const rulePackSchema = rulePackRefSchema.extend({
     if (new Set<string | number>(values).size !== values.length) ctx.addIssue({ code: 'custom', path: [field], message: 'Duplicate rule values' });
   }
 });
-export const productionCatalogSchema = z.object({ rulePacks: z.array(rulePackSchema) }).strict().superRefine((catalog, ctx) => {
-  const keys = catalog.rulePacks.map(rule => JSON.stringify([rule.id, rule.version]));
+export const storedRulePackSchema = z.union([rulePackSchema, scopedRulePackSchema]);
+export const productionCatalogSchema = z.object({ rulePacks: z.array(rulePackSchema), scopedRulePacks: z.array(scopedRulePackSchema).optional() }).strict().superRefine((catalog, ctx) => {
+  const keys = [...catalog.rulePacks, ...(catalog.scopedRulePacks ?? [])].map(rule => JSON.stringify([rule.id, rule.version]));
   if (new Set(keys).size !== keys.length) ctx.addIssue({ code: 'custom', message: 'Duplicate rule pack identity' });
 });
-export const contextDraftSchema = z.object({ productBrief: productBriefSchema.partial().optional(),
-  primaryTarget: primaryTargetSchema.partial().optional(), canvasProfile: canvasProfileSchema.partial().optional(),
-  rulePackRef: rulePackRefSchema.optional() }).strict();
-export const completeContextSchema = z.object({ productBrief: productBriefSchema, primaryTarget: primaryTargetSchema,
-  canvasProfile: canvasProfileSchema, rulePackRef: rulePackRefSchema }).strict();
-export type ProductBrief = z.infer<typeof productBriefSchema>;
-export type PrimaryTarget = z.infer<typeof primaryTargetSchema>;
-export type CanvasProfile = z.infer<typeof canvasProfileSchema>;
-export type RulePackRef = z.infer<typeof rulePackRefSchema>;
-export type RulePack = z.infer<typeof rulePackSchema>;
+export type LegacyRulePack = z.infer<typeof rulePackSchema>;
+export type RulePack = LegacyRulePack;
+export type StoredRulePack = z.infer<typeof storedRulePackSchema>;
 export type ProductionCatalog = z.infer<typeof productionCatalogSchema>;
-export type ContextDraft = z.infer<typeof contextDraftSchema>;
-export type CompleteContext = z.infer<typeof completeContextSchema>;
 export interface ProjectContextVersion {
   version: number; label: string; context: CompleteContext;
-  rulePack: RulePack; rulePackSha256: string; activatedBy: string; activatedAt: string;
+  rulePack: StoredRulePack; rulePackSha256: string; activatedBy: string; activatedAt: string;
 }
 export interface ProjectContext {
   draft?: ContextDraft; versions: ProjectContextVersion[]; activeVersion?: number;
@@ -68,12 +58,12 @@ function canonical(value: unknown): string {
   if (value && typeof value === 'object') return `{${Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([k,v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(',')}}`;
   return JSON.stringify(value) ?? 'null';
 }
-export function hashRulePack(rulePack: RulePack): string {
+export function hashRulePack(rulePack: StoredRulePack): string {
   return createHash('sha256').update(canonical(rulePack)).digest('hex');
 }
 /** Called in the same transaction as activation, or while backfilling historical bindings. */
 export async function bindRulePackVersion(tx: Connection, snapshot: Pick<ProjectContextVersion, 'rulePack' | 'rulePackSha256' | 'activatedBy'>): Promise<void> {
-  const rule = rulePackSchema.parse(snapshot.rulePack);
+  const rule = storedRulePackSchema.parse(snapshot.rulePack);
   if (hashRulePack(rule) !== snapshot.rulePackSha256) throw new AppError('RULE_PACK_SNAPSHOT_INVALID', 409);
   await tx.query(`INSERT INTO production_rule_packs(id, version, sha256, rule_pack, registered_by)
     VALUES ($1,$2,$3,$4::jsonb,$5) ON CONFLICT(id,version) DO NOTHING`,
@@ -86,16 +76,25 @@ export function activateContext(production: Production, catalog: ProductionCatal
   if (!parsed.success) throw new AppError('PRODUCTION_CONTEXT_INCOMPLETE', 409,
     { fields: parsed.error.issues.map(issue => issue.path.join('.') || 'context') });
   const context = parsed.data;
-  const rulePack = catalog.rulePacks.find(rule => rule.id === context.rulePackRef.id && rule.version === context.rulePackRef.version);
+  const rulePack = [...catalog.rulePacks, ...(catalog.scopedRulePacks ?? [])].find(rule => rule.id === context.rulePackRef.id && rule.version === context.rulePackRef.version);
   if (!rulePack) throw new AppError('RULE_PACK_UNAVAILABLE', 409, { fields: ['rulePackRef'] });
-  const targetFields = (Object.keys(rulePack.target) as (keyof PrimaryTarget)[])
-    .filter(key => rulePack.target[key] !== context.primaryTarget[key]).map(key => `primaryTarget.${key}`);
+  const scoped = isScopedRulePack(rulePack);
+  if (!scoped && (context.primaryTarget.contentType !== undefined || context.canvasProfile.selectionBasis !== undefined))
+    throw new AppError('SCOPED_RULE_PACK_REQUIRED', 409, { fields: ['rulePackRef'], recovery: '明确内容类型的目标必须选择 scoped-rules.1，不能使用 legacy 画布列表。' });
+  if (scoped && context.primaryTarget.contentType === undefined)
+    throw new AppError('SCOPED_CONTENT_TYPE_REQUIRED', 409, { fields: ['primaryTarget.contentType'] });
+  const expectedTarget: PrimaryTarget = rulePack.target;
+  const targetFields = (Object.keys(expectedTarget) as (keyof PrimaryTarget)[])
+    .filter(key => expectedTarget[key] !== context.primaryTarget[key]).map(key => `primaryTarget.${key}`);
   if (targetFields.length) throw new AppError('RULE_PACK_TARGET_MISMATCH', 409, { fields: targetFields });
-  const canvasFields = [
-    ...(!rulePack.allowedWidthsPx.includes(context.canvasProfile.widthPx) ? ['canvasProfile.widthPx'] : []),
-    ...(!rulePack.allowedFormats.includes(context.canvasProfile.format) ? ['canvasProfile.format'] : []),
-  ];
-  if (canvasFields.length) throw new AppError('CANVAS_OUTSIDE_RULE_PACK', 409, { fields: canvasFields });
+  if (scoped) validateScopedContext(context, rulePack);
+  else {
+    const canvasFields = [
+      ...(!rulePack.allowedWidthsPx.includes(context.canvasProfile.widthPx) ? ['canvasProfile.widthPx'] : []),
+      ...(!rulePack.allowedFormats.includes(context.canvasProfile.format) ? ['canvasProfile.format'] : []),
+    ];
+    if (canvasFields.length) throw new AppError('CANVAS_OUTSIDE_RULE_PACK', 409, { fields: canvasFields });
+  }
   const rulePackSha256 = hashRulePack(rulePack);
   const state = production.context!;
   if (state.versions.some(v => v.rulePack.id === rulePack.id && v.rulePack.version === rulePack.version && v.rulePackSha256 !== rulePackSha256))
@@ -107,4 +106,7 @@ export function activateContext(production: Production, catalog: ProductionCatal
   state.activeVersion = version;
   delete state.draft;
   return snapshot;
+}
+export function isScopedRulePack(rulePack: StoredRulePack): rulePack is ScopedRulePack {
+  return 'schemaVersion' in rulePack && rulePack.schemaVersion === 'scoped-rules.1';
 }
