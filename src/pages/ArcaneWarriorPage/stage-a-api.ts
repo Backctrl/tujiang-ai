@@ -1,5 +1,6 @@
 import type { Project } from '../../../backend/src/contracts.js'
 export type { Project, Fact, Storyboard, Section } from '../../../backend/src/contracts.js'
+export type ProjectSummary = Pick<Project, 'id' | 'name' | 'version' | 'revision' | 'contractVersion'> & { updatedAt: string }
 
 export class ApiError extends Error {
   constructor(public code: string, public status: number, public fields: string[] = []) { super(code) }
@@ -8,6 +9,13 @@ export class ApiError extends Error {
 // Same-origin only: the reverse proxy owns the backend destination, never the browser token.
 export class StageAApi {
   constructor(private token: string, private request: typeof fetch = fetch) {}
+  async list(): Promise<ProjectSummary[]> {
+    const response = await this.request('/api/projects', { headers: { Authorization: `Bearer ${this.token}` }, redirect: 'error', signal: AbortSignal.timeout(15000) })
+    if (!response.ok) throw new ApiError(response.status === 401 ? 'UNAUTHORIZED' : 'REQUEST_FAILED', response.status)
+    const data = await response.json()
+    if (!Array.isArray(data.projects) || !data.projects.every((p: ProjectSummary) => typeof p.id === 'string' && typeof p.name === 'string' && Number.isInteger(p.revision) && Number.isInteger(p.version) && p.contractVersion === 'stage-a.1' && typeof p.updatedAt === 'string')) throw new ApiError('INVALID_RESPONSE', 502)
+    return data.projects
+  }
   async send(path: string, body?: Record<string, unknown>): Promise<Project> {
     let response: Response
     try {

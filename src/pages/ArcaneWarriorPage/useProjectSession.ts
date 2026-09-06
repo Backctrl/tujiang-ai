@@ -1,6 +1,8 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { readProjectEvents } from './project-events'
+import { readDraft, draftKey } from './project-drafts'
 import { ApiError, errorMessage, StageAApi } from './stage-a-api'
-import type { Project } from './stage-a-api'
+import type { Project, ProjectSummary } from './stage-a-api'
 
 const projectStorageKey = 'tujiang_stage_a_project_id'
 function previousProjectId() {
@@ -9,6 +11,9 @@ function previousProjectId() {
 
 export function useProjectSession() {
   const [project, setProject] = useState<Project | null>(null)
+  const currentId = useRef<string | null>(null)
+  const [projects, setProjects] = useState<ProjectSummary[]>([])
+  const [eventsStatus, setEventsStatus] = useState('尚未连接')
   const [projectId, setProjectId] = useState(previousProjectId)
   const [token, updateToken] = useState('')
   const tokenRef = useRef('')
@@ -18,12 +23,18 @@ export function useProjectSession() {
   const busyRef = useRef(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
-  const [reason, setReason] = useState('')
+  const [reason, updateReason] = useState('')
+  const setReason = (value: string) => {
+    updateReason(value)
+    if (currentId.current) try { localStorage.setItem(draftKey(currentId.current, 'reason'), JSON.stringify(value)) } catch { /* Optional draft persistence. */ }
+  }
   const [runConsent, setRunConsent] = useState(false)
   const [pending, setPending] = useState<null | { run: () => Promise<Project>; label: string }>(null)
   const [conflictBefore, setConflictBefore] = useState<Project | null>(null)
   const api = () => new StageAApi(tokenRef.current)
   const accept = (next: Project) => {
+    if (currentId.current !== next.id) { updateReason(readDraft(next.id, 'reason', '')); setRunConsent(false) }
+    currentId.current = next.id
     setProject(old => old?.id === next.id && old.revision > next.revision ? old : next)
     setProjectId(next.id)
     try { localStorage.setItem(projectStorageKey, next.id) } catch { /* Persistence is optional; the server snapshot remains authoritative. */ }
@@ -46,6 +57,55 @@ export function useProjectSession() {
     } finally { busyRef.current = false; setBusy(false) }
   }
   const canWrite = !!project && !!token.trim() && !busy && !pending && !conflictBefore && !authExpired
+  const canSwitch = !busy && !pending && !conflictBefore
+  const listProjects = async () => {
+    if (!token.trim() || busyRef.current || pending) return
+    busyRef.current = true; setBusy(true); setError('')
+    try { setProjects(await api().list()); setAuthExpired(false); setNotice('项目列表已更新，选择项目继续。') }
+    catch (err) { setError(errorMessage(err)); if (err instanceof ApiError && err.status === 401) { setAuthExpired(true); setRunConsent(false) } }
+    finally { busyRef.current = false; setBusy(false) }
+  }
+  const selectProject = async (id: string) => {
+    if (!canSwitch || busyRef.current || !token.trim() || !id) return
+    await perform(() => api().get(id), '已打开项目，恢复该项目的本地草稿。', false)
+  }
+  useEffect(() => {
+    const id = project?.id
+    if (!id || !token || authExpired) return
+    let disposed = false, cursor = '', attempt = 0, timer: ReturnType<typeof setTimeout> | undefined
+    let snapshotTimer: ReturnType<typeof setTimeout> | undefined
+    const controller = new AbortController()
+    let reading = false, dirty = false
+    const refreshFromEvent = async () => {
+      dirty = true
+      if (reading) return
+      reading = true
+      try {
+        while (dirty && !disposed) {
+          dirty = false
+          const next = await new StageAApi(token).get(id)
+          if (!disposed && currentId.current === id) setProject(old => old?.id === id && old.revision <= next.revision ? next : old)
+        }
+      } catch (err) {
+        if (!disposed && err instanceof ApiError && err.status === 401) { setAuthExpired(true); setRunConsent(false) }
+        else if (!disposed) { clearTimeout(snapshotTimer); snapshotTimer = setTimeout(() => void refreshFromEvent(), 3000) }
+      } finally { reading = false }
+    }
+    const connect = async () => {
+      if (disposed) return
+      setEventsStatus(attempt ? '连接中断，正在重连' : '正在连接状态通知')
+      try {
+        const response = await fetch(`/api/projects/${encodeURIComponent(id)}/events${cursor ? `?after=${cursor}` : ''}`, { headers: { Authorization: `Bearer ${token}`, ...(cursor ? { 'Last-Event-ID': cursor } : {}) }, signal: controller.signal, redirect: 'error' })
+        if (response.ok) { setEventsStatus('任务状态自动更新'); void refreshFromEvent() }
+        await readProjectEvents(response, nextCursor => { if (!cursor || Number(nextCursor) > Number(cursor)) { cursor = nextCursor; void refreshFromEvent() } })
+      } catch (err) {
+        if (!disposed && err instanceof ApiError && err.status === 401) { setAuthExpired(true); setRunConsent(false); setEventsStatus('凭据已失效'); return }
+      }
+      if (!disposed) { setEventsStatus('连接中断，稍后自动重连'); timer = setTimeout(() => void connect(), Math.min(30000, 1000 * 2 ** Math.min(attempt++, 5))) }
+    }
+    void connect()
+    return () => { disposed = true; controller.abort(); clearTimeout(timer); clearTimeout(snapshotTimer) }
+  }, [project?.id, token, authExpired])
   const write = (path: string, body: Record<string, unknown>, label: string, onSaved?: (next: Project) => void) => {
     if (!project || !canWrite || busyRef.current) return
     const key = crypto.randomUUID()
@@ -56,7 +116,7 @@ export function useProjectSession() {
     }, label)
   }
   const create = (name: string) => {
-    if (project || !token.trim() || pending || conflictBefore || busyRef.current || !name.trim()) return
+    if (!token.trim() || pending || conflictBefore || busyRef.current || !name.trim()) return
     const key = crypto.randomUUID()
     setRunConsent(false)
     return perform(() => api().create(name.trim(), key), '项目已创建，请确认产品身份并添加资料。')
@@ -74,7 +134,7 @@ export function useProjectSession() {
   const confirmed = project?.facts.filter(f => f.status === 'confirmed') ?? []
   const hasConflict = project?.facts.some(f => f.issueSeverity === 'blocker') ?? false
   const canPlan = canWrite && !!project?.identity && confirmed.some(f => f.role === 'core') && !hasConflict
-  return { project, projectId, setProjectId, token, setToken, authExpired, busy, error, notice, pending, conflictBefore,
+  return { project, projectId, setProjectId, token, setToken, authExpired, busy, error, notice, pending, conflictBefore, projects, listProjects, selectProject, canSwitch, eventsStatus,
     canWrite, write, create, refresh, retry, resolveConflict, confirmed, hasConflict, canPlan,
     reason, setReason, reasonValid: !!reason.trim() && reason.length <= 1000, runConsent, setRunConsent }
 }
