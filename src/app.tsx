@@ -13,6 +13,7 @@ import LoginPage from "@/pages/LoginPage/LoginPage";
 import RegisterPage from "@/pages/RegisterPage/RegisterPage";
 import ForgotPasswordPage from "@/pages/ForgotPasswordPage/ForgotPasswordPage";
 import NotFoundPage from "@/pages/NotFoundPage/NotFoundPage";
+import ArcaneWarriorPage from "@/pages/ArcaneWarriorPage/ArcaneWarriorPage";
 import { AuthProvider } from "@/context/AuthContext";
 import { AdminAuthProvider } from "@/context/AdminAuthContext";
 import { AdminLayout } from "@/components/AdminLayout";
@@ -49,6 +50,7 @@ export default function App() {
         <Route path="/login" element={<LoginPage />} />
         <Route path="/register" element={<RegisterPage />} />
         <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+        <Route path="/arcane-warrior" element={<ArcaneWarriorPage />} />
 
         {/* 主应用 - 带 Sidebar + 路由守卫 */}
         <Route element={<Layout />}>
