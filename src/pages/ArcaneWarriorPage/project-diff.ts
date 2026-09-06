@@ -1,4 +1,5 @@
 import type { Project } from './stage-a-api.js'
+import { contextDifferences, projectContextBase } from './project-context.js'
 
 export function projectDifferences(before: Project, after: Project) {
   const changes: string[] = []
@@ -14,6 +15,7 @@ export function projectDifferences(before: Project, after: Project) {
   if (JSON.stringify(before.evidence) !== JSON.stringify(after.evidence)) changes.push(`产品资料已更新（${before.evidence.length} → ${after.evidence.length} 份），请在项目设置核对原文。`)
   if (JSON.stringify(before.storyboard) !== JSON.stringify(after.storyboard)) changes.push('故事顺序或依赖已变化，请在故事线对照服务端顺序与保留的草稿。')
   if (JSON.stringify(before.sections) !== JSON.stringify(after.sections)) changes.push('项目诊断稿已变化，请重新核对诊断预检。')
+  changes.push(...contextDifferences(projectContextBase(before), projectContextBase(after)))
   if (!changes.length) changes.push('运行任务、预检或其他服务端记录已更新；本地输入仍保留。')
   return changes
 }
