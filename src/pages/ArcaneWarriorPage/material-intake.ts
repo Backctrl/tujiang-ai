@@ -102,7 +102,7 @@ export async function executeMaterialOperation(operation: MaterialOperation, api
       if (current.kind === 'upload') receivedMaterial(next)
       receiveSnapshot(next)
     } catch (error) {
-      const kind = writeFailureKind(error)
+      const kind = current.kind === 'review' && error instanceof ApiError && error.status === 409 ? 'conflict' : writeFailureKind(error)
       if (kind === 'uncertain') return uncertain(error)
       if (!replay && current.kind === 'upload' && error instanceof ApiError && error.status === 409 && error.code === 'REVISION_CONFLICT'
         && (current.parseProgressRebases ?? 0) < 1) {

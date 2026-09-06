@@ -7,6 +7,7 @@ import { errorMessage } from './stage-a-api'
 import type { ProjectSession } from './useProjectSession'
 import type { MaterialIntakeController } from './useMaterialIntake'
 import { useProjectDraft } from './project-drafts'
+import { usageStatusLabels } from './material-review'
 
 type Props = { intake: MaterialIntakeController; session: ProjectSession }
 const hintLabel = { unknown: '未分类', product_evidence: '产品证据线索', asset: '素材线索', reference: '参考线索', mixed: '混合线索' }
@@ -66,16 +67,16 @@ export function MaterialUploadFields({ intake, session, surface }: Props & { sur
   </div>
 }
 
-function SourceLocation({ source }: { source: MaterialSource }) {
+export function SourceLocation({ source }: { source: MaterialSource }) {
   const url = safeSourceUrl(source.url)
   return <div><p>{source.kind === 'feishu_export' ? '飞书导出' : '本地原件'}{source.title ? ` · ${source.title}` : ''}</p>{url && <p><a href={url} target="_blank" rel="noopener noreferrer">打开记录的原文链接</a></p>}{source.revision && <p>原文版本：{source.revision}</p>}{source.locator && <p>原文位置：{source.locator}</p>}</div>
 }
 
-function CandidateContent({ block }: { block: MaterialBlock }) {
+export function CandidateContent({ block }: { block: MaterialBlock }) {
   return <div className="inspector-block"><b>{blockLabel[block.kind]} · 待审核</b><p>{materialBlockLocation(block)}</p>{block.text !== undefined && <p>{block.text}</p>}{block.cells && <details><summary>查看 {block.cells.length} 个单元格</summary><ol>{block.cells.map((cell, index) => <li key={index}><p>{cell || '（空单元格）'}</p></li>)}</ol></details>}{block.image && <><p>{block.image.widthPx} × {block.image.heightPx} px · {block.image.format.toUpperCase()}{block.image.hasAlpha ? ' · 含透明通道' : ''}{block.image.orientation ? ` · 方向 ${block.image.orientation}` : ''}</p><p>仅验证图片并读取尺寸等信息，未执行 OCR 或图片语义识别。</p></>}<details><summary>追溯此候选</summary><p>候选 ID：{block.id}</p><p>原件 ID：{block.materialId}</p><p>原件 SHA-256：{block.sourceSha256}</p><p>解析版本：{block.parserVersion}</p></details></div>
 }
 
-export function MaterialCard({ material, intake, session }: Props & { material: Material }) {
+export function MaterialCard({ material, intake, session, onReview }: Props & { material: Material; onReview?: (id: string) => void }) {
   const [downloading, setDownloading] = useState(false)
   const [downloadError, setDownloadError] = useState('')
   const [page, setPage] = useState(0)
@@ -89,14 +90,14 @@ export function MaterialCard({ material, intake, session }: Props & { material: 
     setDownloading(true); setDownloadError('')
     try { await intake.download(material) } catch (err) { setDownloadError(errorMessage(err)) } finally { setDownloading(false) }
   }
-  return <article className="source-card material-card">{icon}<div><b title={material.fileName}>{material.fileName}</b><span>{material.format.toUpperCase()} · {fileSize(material.sizeBytes)}</span><span>{status} · {material.blocks.length} 个候选</span><Chip tone="muted">用途待审核 · {hintLabel[material.usage.hint]}</Chip>
+  return <article className="source-card material-card">{icon}<div><b title={material.fileName}>{material.fileName}</b><span>{material.format.toUpperCase()} · {fileSize(material.sizeBytes)}</span><span>{status} · {material.blocks.length} 个候选</span><Chip tone={material.usage.status === 'reviewed' ? 'green' : 'muted'}>{usageStatusLabels[material.usage.status]} · {hintLabel[material.usage.hint]}</Chip>
     <details><summary>查看来源与原件信息</summary>{material.origins.map((origin, index) => <div className="inspector-block" key={index}><b>{origin.fileName}</b><SourceLocation source={origin.source} /><p>导入时间：{new Date(origin.uploadedAt).toLocaleString('zh-CN')}</p></div>)}<p>原件 ID：{material.id}</p><p>SHA-256：{material.sha256}</p></details>
     <details><summary>查看解析记录</summary>{material.parse.notes.map((note, index) => <p key={index}>{note}</p>)}{material.parse.errorCode && <p>{material.parse.errorCode}</p>}<p>当前尝试：{material.parse.attempt} 次</p>{material.parse.attempts.map(attempt => <p key={attempt.attempt}>第 {attempt.attempt} 次 · {attempt.status === 'succeeded' ? '成功' : attempt.status === 'failed' ? '失败' : '执行中'}{attempt.errorCode ? ` · ${attempt.errorCode}` : ''}</p>)}</details>
     {!!material.blocks.length && <details><summary>查看候选与原文位置（{material.blocks.length}）</summary><p>以下内容保留为待审核候选。</p>{material.blocks.slice(pageIndex * pageSize, (pageIndex + 1) * pageSize).map(block => <CandidateContent key={block.id} block={block} />)}{material.blocks.length > pageSize && <div className="connection-actions material-actions"><Button disabled={pageIndex === 0} onClick={() => setPage(pageIndex - 1)}>上一页候选</Button><span>第 {pageIndex + 1} / {Math.ceil(material.blocks.length / pageSize)} 页</span><Button disabled={(pageIndex + 1) * pageSize >= material.blocks.length} onClick={() => setPage(pageIndex + 1)}>下一页候选</Button></div>}</details>}
     {failed && <p role="status">{material.parse.notes[0] ?? '解析未完成。可重试此文件，或修复内容后上传新原件。'}</p>}{downloadError && <p role="alert">{downloadError}</p>}
-  </div><div className="source-status"><StatusDot tone={failed ? 'red' : material.parse.runStatus === 'succeeded' ? 'green' : 'muted'} />{status}</div><div className="source-status material-actions"><Button disabled={!session.token.trim() || downloading} onClick={() => void download()}><Download size={14} aria-hidden="true" />{downloading ? '下载原件中…' : '下载原件'}</Button>{failed && <Button disabled={!session.canWrite} onClick={() => void session.retryMaterialParse(material.id)}><RefreshCw size={14} aria-hidden="true" />重试解析</Button>}</div></article>
+  </div><div className="source-status"><StatusDot tone={failed ? 'red' : material.parse.runStatus === 'succeeded' ? 'green' : 'muted'} />{status}</div><div className="source-status material-actions"><Button disabled={!session.token.trim() || downloading} onClick={() => void download()}><Download size={14} aria-hidden="true" />{downloading ? '下载原件中…' : '下载原件'}</Button>{failed && <Button disabled={!session.canWrite} onClick={() => void session.retryMaterialParse(material.id)}><RefreshCw size={14} aria-hidden="true" />重试解析</Button>}{onReview && <Button disabled={material.parse.runStatus !== 'succeeded' || material.parse.queueStatus !== 'done'} onClick={() => onReview(material.id)}>{material.usage.status === 'pending' ? '审核用途' : '查看或纠正用途'}</Button>}</div></article>
 }
 
-export function MaterialList({ intake, session }: Props) {
-  return <>{intake.materials.map(material => <MaterialCard key={material.id} material={material} intake={intake} session={session} />)}{!intake.materials.length && <p className="hint">尚无服务端原件。等待上传的本地文件会单独列出。</p>}</>
+export function MaterialList({ intake, session, onReview }: Props & { onReview?: (id: string) => void }) {
+  return <>{intake.materials.map(material => <MaterialCard key={material.id} material={material} intake={intake} session={session} onReview={onReview} />)}{!intake.materials.length && <p className="hint">尚无服务端原件。等待上传的本地文件会单独列出。</p>}</>
 }
