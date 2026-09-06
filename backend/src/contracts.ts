@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { Production } from './production.js';
 
 export const CONTRACT_VERSION = 'stage-a.1';
 export const writeSchema = z.object({
@@ -96,6 +97,7 @@ export interface Audit {
   data: Record<string, unknown>;
 }
 export interface Project {
+  production?: Production;
   id: string; name: string; version: number; revision: number; contractVersion: string;
   inputRevision?: number;
   identity?: { productName: string; confirmedBy: string; confirmedAt: string };

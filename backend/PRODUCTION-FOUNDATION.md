@@ -1,0 +1,9 @@
+# Production foundation (M1)
+
+`stage-a.1` responses remain compatible. `GET /api/projects` returns `{ projects }`, with summary fields `id`, `name`, `version`, `revision`, `contractVersion`, `updatedAt`, ordered by `updatedAt DESC, id ASC`. It requires the same bearer authentication and currently returns the complete list.
+
+`POST /api/projects/:id/production/initialize` accepts the existing strict write envelope. It explicitly adds optional `project.production = { contractVersion: 'production.1', objects: [] }`. It never promotes diagnostic drafts, creates formal Sections, or approves anything. Reads do not initialize data. Existing snapshots and command receipts are immutable; a repeat initialization with the current expected versions creates only its command receipt and does not advance revision. Replaying a receipt returns its original response. Unsupported production versions fail closed.
+
+The project revision remains the concurrency/audit cursor. Production objects carry separate business revisions and exact upstream revision references. Internal `reviseProductionObject` checks the expected object revision and rejects approved objects with `APPROVED_PRODUCTION_OBJECT_IMMUTABLE` before mutation. For draft/in-review objects it resets approval to draft and propagates staleness only to dependent objects. Staleness does not erase historical approval. These helpers are a foundation for future typed commands, not a public generic object editing API. No formal authoring, approval, rendering or export capability is introduced here.
+
+Initialization preserves Stage A input revision and QA because it changes none of their business inputs. Ordinary Stage A commands retain their existing semantics. Production object versions are not derived from project audit or Worker revisions.

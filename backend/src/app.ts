@@ -6,6 +6,7 @@ import { createProject, enqueue, preflight, retryRun, reviewFact, addCandidate, 
 import { AppError } from './errors.js';
 import { LocalObjects } from './objects.js';
 import { Store, audit } from './store.js';
+import { initializeProduction, PRODUCTION_CONTRACT_VERSION } from './production.js';
 
 const projectParams = z.object({ id: z.string().uuid() });
 const factParams = projectParams.extend({ factId: z.string().uuid(), action: z.enum(['confirm', 'reject', 'retract']) });
@@ -29,7 +30,8 @@ export function buildApp(store: Store, objects: LocalObjects, options: { token: 
   app.get('/health', async () => ({ status: 'ok', stage: 'A' }));
   app.get('/ready', async () => { await store.db.query('SELECT 1'); return { status: 'ready' }; });
   app.get('/api/contracts', async () => ({ version: CONTRACT_VERSION,
-    requests: Object.fromEntries(Object.entries({ create: createSchema, identity: identitySchema, evidence: evidenceSchema,
+    productionVersion: PRODUCTION_CONTRACT_VERSION,
+    requests: Object.fromEntries(Object.entries({ productionInitialize: writeSchema.strict(), create: createSchema, identity: identitySchema, evidence: evidenceSchema,
       factReview: reasonSchema, factCandidate: candidateSchema, identityCorrection: identityCorrectionSchema,
       storyboardEdit: storyboardEditSchema, sectionEdit: sectionEditSchema, candidateApply: reasonSchema, sectionSelect: reasonSchema,
       run: runSchema, write: writeSchema.strict() }).map(([name, schema]) => [name, z.toJSONSchema(schema)])),
@@ -39,6 +41,13 @@ export function buildApp(store: Store, objects: LocalObjects, options: { token: 
     const body = createSchema.parse(request.body);
     const p = await store.command(undefined, body, 'project.created', options.actor, () => createProject(body.name));
     return reply.code(201).send(p);
+  });
+  app.get('/api/projects', async () => ({ projects: await store.list() }));
+  app.post('/api/projects/:id/production/initialize', async request => {
+    const { id } = projectParams.parse(request.params);
+    const body = writeSchema.strict().parse(request.body);
+    return store.command(id, body, 'production.initialized', options.actor, p => { initializeProduction(p!); return p!; },
+      { preserveStageAInput: true, noChange: p => p.production?.contractVersion === PRODUCTION_CONTRACT_VERSION });
   });
   app.get('/api/projects/:id', async request => store.get(projectParams.parse(request.params).id));
   app.get('/api/projects/:id/revisions/:revision', async request => {
