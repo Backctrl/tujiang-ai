@@ -9,8 +9,9 @@ import { Store } from '../src/store.js';
 import { buildApp } from '../src/app.js';
 import { LocalObjects } from '../src/objects.js';
 import type { Project } from '../src/contracts.js';
+import type { ProductionCatalog } from '../src/production-context.js';
 
-export async function fixture() {
+export async function fixture(productionCatalog?: ProductionCatalog) {
   const engine = new PGlite();
   const wrap = (client: Pick<PGlite, 'query'>): Connection => ({
     async query<T extends Record<string, unknown>>(sql: string, params?: unknown[]) {
@@ -22,7 +23,7 @@ export async function fixture() {
   const dir = await mkdtemp(join(tmpdir(), 'tujiang-backend-'));
   const store = new Store(db);
   const token = randomUUID();
-  const app = buildApp(store, new LocalObjects(dir), { token, actor: 'test-human' });
+  const app = buildApp(store, new LocalObjects(dir), { token, actor: 'test-human', productionCatalog });
   const headers = { authorization: `Bearer ${token}` };
   async function post(url: string, payload: unknown) { return app.inject({ method: 'POST', url, headers, payload: payload as Record<string, unknown> }); }
   async function create() {

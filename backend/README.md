@@ -2,6 +2,8 @@
 
 当前仓库内的独立 TypeScript 后端工程。交付目标是可运行、可测试的阶段 A 基础：文本证据 → 候选事实 → 人工逐条确认 → 初步顺序和未批准 Section 验证草稿 → QA 预检。岳凯六阶段工作台已接入现有受限能力，旧五步向导不在本轮范围。当前接入与验收见 [前端合并记录](../docs/yuekai-integration/README.md)。
 
+完整 MVP 正在以可选 `production.1` 生产域扩展。M1 提供显式初始化与项目列表；M2 提供项目上下文草稿、经人工核验的本地规则目录及不可变 P 版本，接口与边界见 [项目上下文契约](PRODUCTION-CONTEXT.md)。这些扩展不把旧诊断稿变为正式章节。
+
 ## 基线与工程选择
 
 - [端到端流程 v1，revision 15](https://oriniture.feishu.cn/docx/XHktdDPkKoTPbvxytjKcEfCanPg)
@@ -74,6 +76,11 @@ npm run verify:local-runtime -- --restart
 | --- | --- |
 | `GET /ready` | 数据库连通性；不证明模型已配置 |
 | `POST /api/projects` | 创建项目 |
+| `GET /api/projects` | 已认证的项目摘要列表 |
+| `GET /api/production/catalog` | 本地人工核验规则目录；默认空 |
+| `POST /api/projects/:id/production/initialize` | 用户显式初始化可选生产域，重复调用无额外迁移 |
+| `POST /api/projects/:id/production/context/draft` | 已初始化项目整体保存部分配置草稿 |
+| `POST /api/projects/:id/production/context/activate` | 验证完整草稿、目标和规则，追加不可变 P 版本 |
 | `GET /api/projects/:id` | 最新项目快照，含事实、运行、草稿、QA 与审计 |
 | `GET /api/projects/:id/revisions/:revision` | 不可变历史快照 |
 | `POST /api/projects/:id/identity/confirm` | 员工明确确认产品身份，仅允许首次确认 |

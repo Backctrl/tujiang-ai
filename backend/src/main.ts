@@ -5,12 +5,15 @@ import { LocalObjects } from './objects.js';
 import { OpenRouter } from './openrouter.js';
 import { Worker } from './worker.js';
 import { buildApp } from './app.js';
+import { loadProductionCatalog } from './production-context.js';
 
 async function main() {
   const env = config();
+  const productionCatalog = await loadProductionCatalog(env.PRODUCTION_CATALOG_PATH);
   const db = postgres(env.DATABASE_URL, () => console.error('Database idle connection closed; the next operation will reconnect.'));
   const store = new Store(db);
-  const app = buildApp(store, new LocalObjects(env.OBJECT_DIR), { token: env.BACKEND_API_TOKEN, actor: env.BACKEND_ACTOR_ID });
+  const app = buildApp(store, new LocalObjects(env.OBJECT_DIR), { token: env.BACKEND_API_TOKEN, actor: env.BACKEND_ACTOR_ID,
+    productionCatalog });
   const worker = new Worker(store, new OpenRouter({ apiKey: env.OPENROUTER_API_KEY, model: env.OPENROUTER_MODEL,
     factModel: env.OPENROUTER_FACT_MODEL, planModel: env.OPENROUTER_PLAN_MODEL, timeoutMs: env.OPENROUTER_TIMEOUT_MS,
     provider: env.OPENROUTER_PROVIDER, maxInputTokens: env.OPENROUTER_MAX_INPUT_TOKENS,
@@ -29,4 +32,4 @@ async function main() {
   process.once('SIGINT', () => void close());
   process.once('SIGTERM', () => void close());
 }
-main().catch(() => { console.error('Backend startup failed. Check environment configuration, PostgreSQL and npm run migrate.'); process.exit(1); });
+main().catch(() => { console.error('Backend startup failed. Check environment configuration, production catalog, PostgreSQL and npm run migrate.'); process.exit(1); });
