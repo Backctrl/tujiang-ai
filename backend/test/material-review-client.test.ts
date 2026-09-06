@@ -74,6 +74,140 @@ async function ui(name: string) {
   finally { assets.deregister(); }
 }
 
+test('actual manual evidence controls normalize labels and clear after HTTP receipt or same-request replay without changing source text', async () => {
+  const f = await fixture();
+  try {
+    const url = await f.app.listen({ port: 0, host: '127.0.0.1' });
+    const transport: typeof fetch = (path, options) => fetch(`${url}${path}`, options);
+    const client = new StageAApi(f.headers.authorization.slice(7), transport);
+    const { ManualEvidenceFields } = await ui('ManualEvidenceFields');
+    for (const surface of ['setup', 'facts'] as const) for (const loseResponse of [false, true]) await withStorage(async values => {
+      const project = await client.create(`Manual receipt ${surface} ${loseResponse}`);
+      const field = (name: string) => surface === 'setup' ? name : `manualEvidence:facts:${name}`;
+      const inputs = { documentName: '  Manual QA source  ', locator: '  paragraph 1  ', evidenceText: '  Capacity 10 kg\n' };
+      for (const [name, value] of Object.entries(inputs)) values.set(draftKey(project.id, field(name)), JSON.stringify(value));
+      let captured: Record<string, unknown> | undefined, receipt: Project | undefined, current = project;
+      function findSave(node: ReactNode): ReactElement<{ children?: ReactNode; disabled?: boolean; onClick?: () => void }> | undefined {
+        if (Array.isArray(node)) { for (const child of node) { const found = findSave(child); if (found) return found; } return; }
+        if (!isValidElement<{ children?: ReactNode; disabled?: boolean; onClick?: () => void }>(node)) return;
+        return node.props.children === '保存文字证据' ? node : findSave(node.props.children);
+      }
+      function Invoke() {
+        const once = useRef(false);
+        const session = { ...useProjectSession(), project: current, getLatestProject: () => current, canWrite: true,
+          reviewWrite: (_kind: ReviewKind, _path: string, fields: Record<string, unknown>, _label: string, onSaved?: (next: Project) => void) => {
+            captured = fields; if (receipt) { current = receipt; onSaved?.(receipt); } return Promise.resolve({ kind: 'blocked' as const });
+          } };
+        const tree = ManualEvidenceFields({ session, surface }) as ReactNode;
+        if (!once.current) { once.current = true; const save = findSave(tree); assert.ok(save?.props.onClick); assert.equal(save.props.disabled, false); save.props.onClick(); }
+        return tree;
+      }
+      renderToStaticMarkup(createElement(Invoke));
+      assert.deepEqual(captured, { documentName: 'Manual QA source', locator: 'paragraph 1', text: inputs.evidenceText, usage: 'product_evidence' });
+      const storage = new ReviewStorage();
+      const operation = prepareReviewWrite(project, 'manual-evidence', 'evidence', captured!, 'Manual evidence saved');
+      const sent: string[] = [];
+      const dropping = new StageAApi(f.headers.authorization.slice(7), async (path, options) => {
+        sent.push(String(options?.body)); const response = await transport(path, options);
+        if (loseResponse && sent.length === 1) throw new Error('Synthetic lost success response');
+        return response;
+      });
+      let outcome = await executeMaterialOperation(operation, dropping, storage, () => undefined);
+      if (loseResponse) {
+        assert.equal(outcome.kind, 'uncertain'); assert.ok(storage.pending);
+        const read = await client.get(project.id); assert.equal(read.evidence.length, 1);
+        outcome = await executeMaterialOperation((await storage.readPending())!, dropping, storage, () => undefined, true);
+        assert.deepEqual(sent, [operation.prepared.body, operation.prepared.body]);
+      }
+      assert.equal(outcome.kind, 'saved'); if (outcome.kind !== 'saved') throw new Error('Expected saved receipt');
+      receipt = outcome.project;
+      assert.equal(receipt.evidence.length, 1); assert.equal(receipt.evidence[0]!.text, inputs.evidenceText);
+      const html = renderToStaticMarkup(createElement(Invoke));
+      for (const name of Object.keys(inputs)) assert.equal(JSON.parse(values.get(draftKey(project.id, field(name)))!), '');
+      assert.match(html, /disabled=""[^>]*>保存文字证据/);
+      assert.equal((await client.get(project.id)).evidence.length, 1);
+      const withdrawn = structuredClone(receipt); withdrawn.evidence[0]!.availability = 'withdrawn';
+      for (const [name, value] of Object.entries(inputs)) values.set(draftKey(project.id, field(name)), JSON.stringify(value));
+      function Withdrawn() { return createElement(ManualEvidenceFields, { surface, session: { ...useProjectSession(), project: withdrawn, getLatestProject: () => withdrawn, canWrite: true } }); }
+      const withdrawnHtml = renderToStaticMarkup(createElement(Withdrawn));
+      assert.doesNotMatch(withdrawnHtml, /这份文字证据已保存/); assert.doesNotMatch(withdrawnHtml, /disabled=""[^>]*>保存文字证据/);
+    });
+  } finally { await f.close(); }
+});
+
+test('restored manual evidence has an explicit saved-record state without onSaved, preserves old requests and other surface drafts, and guards stale clicks', async () => {
+  const f = await fixture();
+  try {
+    const url = await f.app.listen({ port: 0, host: '127.0.0.1' });
+    const transport: typeof fetch = (path, options) => fetch(`${url}${path}`, options);
+    const client = new StageAApi(f.headers.authorization.slice(7), transport);
+    const { ManualEvidenceFields } = await ui('ManualEvidenceFields');
+    for (const surface of ['setup', 'facts'] as const) await withStorage(async values => {
+      const project = await client.create(`Restored manual input ${surface}`);
+      const otherSurface = surface === 'setup' ? 'facts' : 'setup';
+      const field = (area: 'setup' | 'facts', name: string) => area === 'setup' ? name : `manualEvidence:facts:${name}`;
+      const fields = { documentName: '  Manual recovery source  ', locator: '  paragraph 1  ', text: '  Capacity 10 kg\n', usage: 'product_evidence' };
+      for (const area of [surface, otherSurface] as const) for (const [name, value] of Object.entries({ documentName: area === surface ? fields.documentName : 'Other independent draft', locator: fields.locator, evidenceText: fields.text })) {
+        values.set(draftKey(project.id, field(area, name)), JSON.stringify(value));
+      }
+      const beforeDrafts = new Map(values), storage = new ReviewStorage();
+      // This is an old, already-frozen operation from before label normalization was introduced.
+      const operation = prepareReviewWrite(project, 'manual-evidence', 'evidence', fields, 'Old manual request');
+      const bodies: string[] = [];
+      const interrupted = new StageAApi(f.headers.authorization.slice(7), async (path, options) => {
+        bodies.push(String(options?.body)); await transport(path, options); throw new Error('Synthetic lost success');
+      });
+      assert.equal((await executeMaterialOperation(operation, interrupted, storage, () => undefined)).kind, 'uncertain');
+      assert.ok(storage.pending);
+      let latest = await client.get(project.id), visible = latest, calls = 0;
+      function findAction(node: ReactNode, label: string): ReactElement<{ children?: ReactNode; disabled?: boolean; onClick?: () => void }> | undefined {
+        if (Array.isArray(node)) { for (const child of node) { const found = findAction(child, label); if (found) return found; } return; }
+        if (!isValidElement<{ children?: ReactNode; disabled?: boolean; onClick?: () => void }>(node)) return;
+        return node.props.children === label ? node : findAction(node.props.children, label);
+      }
+      let action = '保存文字证据', expectedDisabled = true, permitted = false;
+      function Inspect() {
+        const once = useRef(false);
+        const session = { ...useProjectSession(), project: visible, getLatestProject: () => latest, canWrite: permitted,
+          reviewWrite: () => { calls++; return Promise.resolve({ kind: 'blocked' as const }); } };
+        const tree = ManualEvidenceFields({ session, surface }) as ReactNode;
+        if (!once.current) { once.current = true; const button = findAction(tree, action); assert.ok(button?.props.onClick); assert.equal(button.props.disabled, expectedDisabled); button.props.onClick(); }
+        return tree;
+      }
+      const beforeReplay = renderToStaticMarkup(createElement(Inspect));
+      assert.match(beforeReplay, /这份文字证据已保存/); assert.deepEqual(values, beforeDrafts); assert.ok(storage.pending);
+      const recovering = new StageAApi(f.headers.authorization.slice(7), async (path, options) => { bodies.push(String(options?.body)); return transport(path, options); });
+      const restored = (await storage.readPending())!;
+      const replay = await executeMaterialOperation(restored, recovering, storage, next => { latest = next; visible = next; }, true);
+      assert.equal(replay.kind, 'saved'); assert.equal(storage.pending, undefined);
+      assert.deepEqual(bodies, [operation.prepared.body, operation.prepared.body]);
+      assert.equal(JSON.parse(bodies[1]!).documentName, fields.documentName, 'the frozen old body was not normalized during recovery');
+      assert.deepEqual(values, beforeDrafts, 'no serialized onSaved callback or cross-surface automatic clearing');
+      permitted = true;
+      assert.match(renderToStaticMarkup(createElement(Inspect)), /这份文字证据已保存/); assert.equal(calls, 0);
+      // A pre-GET callback must also refuse another write when only the latest ref has the receipt.
+      visible = project; expectedDisabled = false;
+      renderToStaticMarkup(createElement(Inspect)); assert.equal(calls, 0);
+      visible = latest; action = '清空这份已保存草稿';
+      renderToStaticMarkup(createElement(Inspect));
+      for (const name of ['documentName', 'locator', 'evidenceText']) {
+        assert.equal(JSON.parse(values.get(draftKey(project.id, field(surface, name)))!), '');
+        assert.equal(values.get(draftKey(project.id, field(otherSurface, name))), beforeDrafts.get(draftKey(project.id, field(otherSurface, name))));
+      }
+      assert.equal((await client.get(project.id)).evidence.length, 1);
+    });
+    await withStorage(async values => {
+      let derived = await parsed(f); const material = derived.production!.materials![0]!;
+      derived = await f.write(derived, `production/materials/${material.id}/usage`, { reason: 'Synthetic product source', decisions: [{ blockId: material.blocks[0]!.id, usage: 'product_evidence' }] });
+      const source = derived.evidence[0]!; assert.ok(source.materialSource);
+      for (const [name, value] of Object.entries({ documentName: source.documentName, locator: source.locator, evidenceText: source.text })) values.set(draftKey(derived.id, name), JSON.stringify(value));
+      function View() { return createElement(ManualEvidenceFields, { session: { ...useProjectSession(), project: derived, getLatestProject: () => derived, canWrite: true } }); }
+      const html = renderToStaticMarkup(createElement(View));
+      assert.doesNotMatch(html, /这份文字证据已保存/); assert.doesNotMatch(html, /disabled=""[^>]*>保存文字证据/);
+    });
+  } finally { await f.close(); }
+});
+
 test('real HTTP review client: precise block decisions, pre-submit impact, all four task types and locked source reconfirmation', async () => {
   const f = await fixture();
   try {
