@@ -50,3 +50,18 @@
 .connected-workbench .story-agent summary, .connected-workbench .story-agent li { font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; }
 .connected-workbench .story-agent li small { display: block; font-size: 10px; }
 .connected-workbench .fact-inspector .inspector-block > label { display: grid; gap: 8px; }
+
+/* Material intake keeps the existing setup columns while making each original readable. */
+.connected-workbench .material-upload, .connected-workbench .material-list { min-width: 0; }
+.connected-workbench .material-list { display: grid; grid-template-columns: minmax(0, 1fr); align-content: start; }
+.connected-workbench .material-card { min-width: 0; grid-template-columns: auto minmax(0, 1fr); }
+.connected-workbench .material-card > div, .connected-workbench .material-card details { min-width: 0; }
+.connected-workbench .material-card .source-status, .connected-workbench .material-actions { flex-wrap: wrap; }
+.connected-workbench .material-actions .button { flex: 0 0 auto; white-space: nowrap; }
+.connected-workbench .material-upload, .connected-workbench .material-card { overflow-wrap: anywhere; }
+.connected-workbench .material-card b { white-space: normal; }
+.connected-workbench .material-upload p, .connected-workbench .material-upload summary,
+.connected-workbench .material-card p, .connected-workbench .material-card summary { font-size: 12px; line-height: 1.8; }
+/* Keep long and expanded source cards at their content height inside the scrolling facts rail. */
+.connected-workbench .material-sidebar { display: flex; flex: 1; min-height: 0; flex-direction: column; align-items: stretch; }
+.connected-workbench .material-sidebar > * { flex: 0 0 auto; min-width: 0; }

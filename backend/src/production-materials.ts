@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { writeSchema } from './contracts.js';
 import { AppError } from './errors.js';
+import type { MaterialUsageReview } from './production-material-usage.js';
 
 export const MATERIAL_PARSER_VERSION = 'ingest.1';
 export const MAX_FILE_BYTES = 10 * 1024 * 1024;
@@ -69,7 +70,8 @@ export interface MaterialParse {
 export interface Material {
   id: string; fileName: string; format: MaterialFormat; declaredMimeType: string; detectedMimeType?: string;
   sha256: string; objectKey: string; sizeBytes: number; source: MaterialSource; uploadedAt: string; uploadedBy: string;
-  origins: MaterialOrigin[]; usage: { status: 'pending'; hint: MaterialUsageHint };
+  origins: MaterialOrigin[]; usage: { status: 'pending' | 'partially_reviewed' | 'reviewed'; hint: MaterialUsageHint };
+  usageReview?: MaterialUsageReview;
   parse: MaterialParse; blocks: MaterialBlock[];
 }
 export const MATERIAL_MIMES: Record<MaterialFormat, string> = {

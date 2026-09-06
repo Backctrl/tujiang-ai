@@ -1,14 +1,45 @@
 import type { Project } from '../../../backend/src/contracts.js'
+import type { RulePack } from '../../../backend/src/production-context.js'
+import { contextFieldLabel, isRuleCatalog } from './project-context.js'
 export type { Project, Fact, Storyboard, Section } from '../../../backend/src/contracts.js'
 export type ProjectSummary = Pick<Project, 'id' | 'name' | 'version' | 'revision' | 'contractVersion'> & { updatedAt: string }
+export type PreparedProjectWrite = Readonly<{ projectId: string; suffix: string; body: string }>
+
+export function prepareProjectWrite(project: Project, suffix: string, fields: Record<string, unknown> = {}, key = crypto.randomUUID()): PreparedProjectWrite {
+  return Object.freeze({ projectId: project.id, suffix, body: JSON.stringify({
+    ...fields, expectedProjectVersion: project.version, expectedRevision: project.revision, idempotencyKey: key,
+  }) })
+}
 
 export class ApiError extends Error {
-  constructor(public code: string, public status: number, public fields: string[] = []) { super(code) }
+  constructor(public code: string, public status: number, public fields: string[] = [], public hint = '') { super(code) }
+}
+
+export function writeFailureKind(error: unknown): 'conflict' | 'rejected' | 'uncertain' {
+  if (error instanceof ApiError && ['VERSION_CONFLICT', 'REVISION_CONFLICT'].includes(error.code)) return 'conflict'
+  return error instanceof ApiError && error.status >= 400 && error.status < 500 && error.status !== 401 && error.code !== 'INVALID_RESPONSE' ? 'rejected' : 'uncertain'
+}
+
+function responseError(response: Response, data: { error?: { code?: string; fields?: unknown; details?: { fields?: unknown; hint?: unknown } } }) {
+  const fields: unknown = data.error?.fields ?? data.error?.details?.fields
+  const hint = data.error?.details?.hint
+  return new ApiError(data.error?.code ?? (response.status === 401 ? 'UNAUTHORIZED' : 'REQUEST_FAILED'), response.status,
+    Array.isArray(fields) ? fields.filter((field): field is string => typeof field === 'string') : [], typeof hint === 'string' ? hint : '')
 }
 
 // Same-origin only: the reverse proxy owns the backend destination, never the browser token.
 export class StageAApi {
   constructor(private token: string, private request: typeof fetch = fetch) {}
+  async catalog(): Promise<RulePack[]> {
+    let response: Response
+    try {
+      response = await this.request('/api/production/catalog', { headers: { Authorization: `Bearer ${this.token}` }, redirect: 'error', signal: AbortSignal.timeout(15000) })
+    } catch { throw new ApiError('CONNECTION_UNCERTAIN', 0) }
+    if (!response.ok) throw new ApiError(response.status === 401 ? 'UNAUTHORIZED' : 'REQUEST_FAILED', response.status)
+    const data: unknown = await response.json().catch(() => { throw new ApiError('INVALID_PRODUCTION_CATALOG', 502) })
+    if (!isRuleCatalog(data)) throw new ApiError('INVALID_PRODUCTION_CATALOG', 502)
+    return data.rulePacks
+  }
   async list(): Promise<ProjectSummary[]> {
     const response = await this.request('/api/projects', { headers: { Authorization: `Bearer ${this.token}` }, redirect: 'error', signal: AbortSignal.timeout(15000) })
     if (!response.ok) throw new ApiError(response.status === 401 ? 'UNAUTHORIZED' : 'REQUEST_FAILED', response.status)
@@ -16,17 +47,29 @@ export class StageAApi {
     if (!Array.isArray(data.projects) || !data.projects.every((p: ProjectSummary) => typeof p.id === 'string' && typeof p.name === 'string' && Number.isInteger(p.revision) && Number.isInteger(p.version) && p.contractVersion === 'stage-a.1' && typeof p.updatedAt === 'string')) throw new ApiError('INVALID_RESPONSE', 502)
     return data.projects
   }
-  async send(path: string, body?: Record<string, unknown>): Promise<Project> {
+  async original(projectId: string, materialId: string): Promise<Blob> {
+    let response: Response
+    try {
+      response = await this.request(`/api/projects/${encodeURIComponent(projectId)}/production/materials/${encodeURIComponent(materialId)}/original`, {
+        headers: { Authorization: `Bearer ${this.token}` }, redirect: 'error', signal: AbortSignal.timeout(15000),
+      })
+    } catch { throw new ApiError('CONNECTION_UNCERTAIN', 0) }
+    if (!response.ok) throw responseError(response, await response.json().catch(() => ({})))
+    try { return await response.blob() } catch { throw new ApiError('CONNECTION_UNCERTAIN', 0) }
+  }
+  async send(path: string, body?: Record<string, unknown> | string): Promise<Project> {
     let response: Response
     try {
       response = await this.request(`/api${path}`, {
         method: body ? 'POST' : 'GET', redirect: 'error', signal: AbortSignal.timeout(15000),
         headers: { Authorization: `Bearer ${this.token}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
-        ...(body ? { body: JSON.stringify(body) } : {}),
+        ...(body ? { body: typeof body === 'string' ? body : JSON.stringify(body) } : {}),
       })
     } catch { throw new ApiError('CONNECTION_UNCERTAIN', 0) }
     const data = await response.json().catch(() => { throw new ApiError('INVALID_RESPONSE', response.status) })
-    if (!response.ok) throw new ApiError(data.error?.code ?? 'REQUEST_FAILED', response.status, data.error?.fields)
+    if (!response.ok) {
+      throw responseError(response, data)
+    }
     if (data.contractVersion !== 'stage-a.1' || typeof data.id !== 'string' || !Number.isInteger(data.revision) ||
       !Number.isInteger(data.version) || !Array.isArray(data.facts) || !Array.isArray(data.evidence) ||
       !Array.isArray(data.runs) || !Array.isArray(data.sections) || !Array.isArray(data.audit)) throw new ApiError('INVALID_RESPONSE', 502)
@@ -37,10 +80,9 @@ export class StageAApi {
     return this.send('/projects', { name, expectedProjectVersion: 0, expectedRevision: 0, idempotencyKey: key })
   }
   write(project: Project, suffix: string, fields: Record<string, unknown> = {}, key = crypto.randomUUID()) {
-    return this.send(`/projects/${encodeURIComponent(project.id)}/${suffix}`, {
-      ...fields, expectedProjectVersion: project.version, expectedRevision: project.revision, idempotencyKey: key,
-    })
+    return this.executePrepared(prepareProjectWrite(project, suffix, fields, key))
   }
+  executePrepared(prepared: PreparedProjectWrite) { return this.send(`/projects/${encodeURIComponent(prepared.projectId)}/${prepared.suffix}`, prepared.body) }
 }
 
 const messages: Record<string, string> = {
@@ -50,6 +92,30 @@ const messages: Record<string, string> = {
   REVISION_CONFLICT: '项目已被其他操作更新。请读取最新版本，复核差异后重新提交。',
   CONNECTION_UNCERTAIN: '连接中断，结果尚未确认。请读取最新项目核对；重试原请求会保留同一个操作编号。',
   INVALID_RESPONSE: '服务返回内容不符合阶段 A 契约，请检查 API 代理与后端版本。',
+  INVALID_PRODUCTION_CATALOG: '平台规则目录暂不可用，请重新读取或联系维护人员核对。',
+  PRODUCTION_NOT_INITIALIZED: '请先在项目设置明确开启制作配置，再保存草稿。',
+  FILE_TOO_LARGE: '单个原件最多 10 MiB，请缩小文件后重新选择。',
+  EMPTY_FILE: '文件没有内容，请选择有内容的原件。',
+  UNSUPPORTED_FILE_TYPE: '暂不支持该文件格式，请导出为 TXT、Markdown、CSV、JSON、PNG、JPEG 或 WebP。',
+  FILE_TYPE_MISMATCH: '文件名、声明格式与实际内容不一致，请保留真实文件格式。',
+  INVALID_FILE_ENCODING: '无法读取原始文件内容，请重新选择文件。',
+  MATERIAL_LIMIT: '本项目已达到 50 份解析原件的上限。',
+  MATERIAL_NOT_FOUND: '此项目中未找到该原件，请刷新资料列表。',
+  PARSE_RETRY_NOT_ALLOWED: '该文件当前不处于解析失败状态，请刷新资料列表。',
+  SOURCE_FILE_MISSING: '原件暂不可用，请重新上传相同原件后重试解析。',
+  SOURCE_FILE_INTEGRITY_FAILED: '原件完整性检查未通过，请联系维护人员恢复正确原件。',
+  ORIGINAL_INTEGRITY_MISMATCH: '下载内容与原件记录不一致，已停止保存，请刷新后重试。',
+  LOCAL_FILE_READ_FAILED: '无法读取本地文件，请重新选择原件。',
+  LOCAL_RECOVERY_SAVE_FAILED: '无法保存浏览器恢复记录，可能是存储不可用或空间不足。此份文件尚未发送，请恢复浏览器存储后重试。',
+  LOCAL_RECOVERY_SETTLE_FAILED: '服务已返回结果，但浏览器恢复记录未能更新。请恢复浏览器存储后使用原操作重试核对。',
+  LOCAL_RECOVERY_READ_FAILED: '无法读取浏览器恢复记录，新的写入已暂停。请检查浏览器存储后重新读取。',
+  INVALID_MATERIAL_RECOVERY: '材料恢复记录不完整，新的写入已暂停。请联系维护人员核对浏览器中的原请求。',
+  UNSUPPORTED_PRODUCTION_CONTRACT: '当前制作配置与服务版本不兼容，请更新客户端后重试。',
+  PRODUCTION_CONTEXT_INCOMPLETE: '制作配置尚未完整，请补齐列出的字段后启用。',
+  RULE_PACK_UNAVAILABLE: '所选平台规则版本暂不可用。可保留草稿，补齐规则或重新选择后启用。',
+  RULE_PACK_TARGET_MISMATCH: '目标市场与所选平台规则不一致，请核对列出的目标字段。',
+  CANVAS_OUTSIDE_RULE_PACK: '图片宽度或格式超出所选平台规则，请按允许值修改。',
+  RULE_PACK_VERSION_CHANGED: '已使用的平台规则内容发生变化，请核验并提供新规则版本后启用。',
   UNRESOLVED_FACT_CONFLICT: '存在事实冲突。请逐条拒绝新候选，或撤回旧事实后确认新候选。',
   INVALID_EVIDENCE_REFERENCE: '引用必须是所选产品资料中连续、完全一致的原文。',
   CONFIRMED_CORE_FACT_REQUIRED: '请先确认至少一条核心事实。',
@@ -61,5 +127,5 @@ const messages: Record<string, string> = {
   STALE_SECTION: '章节草稿已失效，请复核依赖后保存新草稿。',
 }
 export function errorMessage(error: unknown) {
-  return error instanceof ApiError ? `${messages[error.code] ?? '操作未完成，请核对当前项目和前置条件。'}（${error.code}${error.fields.length ? `：${error.fields.join('、')}` : ''}）` : '操作未完成，请稍后检查连接。'
+  return error instanceof ApiError ? `${error.hint || messages[error.code] || '操作未完成，请核对当前项目和前置条件。'}（${error.code}${error.fields.length ? `：${error.fields.map(contextFieldLabel).join('、')}` : ''}）` : '操作未完成，请稍后检查连接。'
 }

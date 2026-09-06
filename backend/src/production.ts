@@ -1,13 +1,17 @@
 import { AppError } from './errors.js';
 import type { ProjectContext } from './production-context.js';
 import type { Material } from './production-materials.js';
+import type { MaterialAsset, MaterialReferenceBlock } from './production-material-usage.js';
 export const PRODUCTION_CONTRACT_VERSION = 'production.1';
 export interface ProductionObject {
   id: string; kind: 'facts' | 'storyboard' | 'section' | 'market' | 'export'; revision: number;
   dependencies: { id: string; revision: number }[];
   freshness: 'current' | 'stale'; approvalStatus: 'draft' | 'in_review' | 'approved';
 }
-export interface Production { contractVersion: typeof PRODUCTION_CONTRACT_VERSION; objects: ProductionObject[]; context?: ProjectContext; materials?: Material[] }
+export interface Production {
+  contractVersion: typeof PRODUCTION_CONTRACT_VERSION; objects: ProductionObject[]; context?: ProjectContext;
+  materials?: Material[]; assets?: MaterialAsset[]; references?: MaterialReferenceBlock[];
+}
 export function initializeProduction(project: { production?: Production }): boolean {
   if (project.production) {
     if (project.production.contractVersion !== PRODUCTION_CONTRACT_VERSION) throw new AppError('UNSUPPORTED_PRODUCTION_CONTRACT', 409);
