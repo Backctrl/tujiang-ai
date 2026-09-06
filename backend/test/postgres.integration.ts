@@ -15,10 +15,6 @@ import { initializeProduction } from '../src/production.js';
 import { activateContext, bindRulePackVersion, saveContextDraft, type RulePack } from '../src/production-context.js';
 import { context, rule } from './fixtures/production-context.js';
 import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { buildApp } from '../src/app.js';
-import { LocalObjects } from '../src/objects.js';
 import { IngestionWorker } from '../src/ingestion-worker.js';
 import { parseMaterial } from '../src/material-parser.js';
 
