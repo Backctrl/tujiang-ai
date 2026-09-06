@@ -3,7 +3,7 @@
 import * as React from 'react';
 import { cn } from '@/lib/utils';
 
-// 内联 SVG 占位图：1x1 渐变像素，base64 编码，零外部依赖
+// SVG text uses numeric entities so btoa receives ASCII while rendering Chinese.
 const FALLBACK_SRC =
   'data:image/svg+xml;base64,' +
   btoa(
@@ -13,7 +13,7 @@ const FALLBACK_SRC =
     '<stop offset="100%" stop-color="#e2e8f0"/>' +
     '</linearGradient></defs>' +
     '<rect width="400" height="300" fill="url(#g)"/>' +
-    '<text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#94a3b8" font-family="sans-serif" font-size="14">加载失败</text>' +
+    '<text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#94a3b8" font-family="sans-serif" font-size="14">&#21152;&#36733;&#22833;&#36133;</text>' +
     '</svg>',
   );
 type ImageFormat = 'jpg' | 'png' | 'webp' | 'bmp' | 'gif' | 'tiff';
