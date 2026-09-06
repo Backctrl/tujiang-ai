@@ -132,8 +132,9 @@ test('context client over HTTP saves partial drafts, explains blocked activation
     assert.deepEqual(p.production?.context?.draft, partial);
     await assert.rejects(client.write(p, 'production/context/activate'), (error: unknown) => {
       assert.ok(error instanceof ApiError); assert.equal(error.code, 'PRODUCTION_CONTEXT_INCOMPLETE');
-      assert.ok(error.fields.includes('productBrief.internalCode'));
-      assert.ok(errorMessage(error).includes('内部代号')); return true;
+      assert.ok(error.fields.includes('productBrief.category'));
+      assert.equal(error.fields.includes('productBrief.internalCode'), false);
+      assert.ok(errorMessage(error).includes('产品品类')); return true;
     });
     p = await client.write(p, 'production/context/draft', { context: compileContextForm(contextForm(complete)).context });
     p = await client.write(p, 'production/context/activate');
@@ -197,11 +198,11 @@ test('context draft restoration gates saves after upstream changes and unsubmitt
       edited.activate(); assert.equal(calls.length, 0);
       const external = structuredClone(project); external.revision++;
       external.production!.context!.draft!.productBrief!.introduction = 'External update';
-      const restored = renderContext({ ...session, project: external });
+      const restored = renderContext({ ...session, project: external, getLatestProject: () => external });
       assert.equal(restored.form.introduction, 'Local unsaved introduction');
       assert.equal(restored.local.needsReview, true); assert.equal(restored.canSave, false);
       assert.ok(restored.changes.some(change => change.includes('External update')));
-      const discarded = renderContext({ ...session, project: external }, context => context.discard());
+      const discarded = renderContext({ ...session, project: external, getLatestProject: () => external }, context => context.discard());
       assert.equal(discarded.form.introduction, 'External update');
       assert.equal(discarded.local.active, false); assert.equal(discarded.canActivate, true);
       const unrelated = structuredClone(external); unrelated.revision++; unrelated.name = 'Unrelated project rename';
