@@ -1,5 +1,5 @@
 import type { Project } from '../../../backend/src/contracts.js'
-export type { Project, Fact, Storyboard } from '../../../backend/src/contracts.js'
+export type { Project, Fact, Storyboard, Section } from '../../../backend/src/contracts.js'
 
 export class ApiError extends Error {
   constructor(public code: string, public status: number, public fields: string[] = []) { super(code) }
@@ -47,6 +47,9 @@ const messages: Record<string, string> = {
   CONFIRMED_CORE_FACT_REQUIRED: '请先确认至少一条核心事实。',
   CONFIRMED_PRODUCT_IDENTITY_REQUIRED: '请先在项目设置确认产品身份。',
   STALE_STORYBOARD: '故事顺序已失效，请根据当前身份与事实复核并保存。',
+  CURRENT_STORYBOARD_REQUIRED: '请先在故事线保存或应用一份有效顺序，再保存章节诊断稿。',
+  SECTION_OUTSIDE_STORYBOARD: '此稿或事实不属于当前故事顺序，请重新绑定当前故事线的已确认事实。',
+  UNCONFIRMED_FACT_REFERENCE: '引用的事实已撤回或尚未确认，请移除或重新绑定后保存新稿。',
   STALE_SECTION: '章节草稿已失效，请复核依赖后保存新草稿。',
 }
 export function errorMessage(error: unknown) {
