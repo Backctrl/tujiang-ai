@@ -1,0 +1,49 @@
+name: Verify frontend and stage A
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            backend/package-lock.json
+      - name: Install frontend
+        run: npm ci --ignore-scripts
+      - name: Install backend
+        run: npm ci --ignore-scripts
+        working-directory: backend
+      - name: Check frontend types and lint
+        run: npm run lint
+      - name: Build frontend
+        run: npx vite build
+      - name: Check backend types
+        run: npm run typecheck
+        working-directory: backend
+      - name: Test stage A with synthetic gateways
+        run: npm test
+        working-directory: backend
+      - name: Build backend
+        run: npm run build
+        working-directory: backend

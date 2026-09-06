@@ -1,0 +1,401 @@
+{
+  "id": "8469bcf8-83b1-4ae2-92ba-a92ee8406f7d",
+  "qa": {
+    "at": "2026-09-06T09:06:54.067Z",
+    "kind": "preflight",
+    "issues": [],
+    "sectionId": "629ee0b9-e95f-4fca-a7fd-3bb4db287a7a",
+    "notChecked": [
+      "market_rules",
+      "rendered_file",
+      "asset_quality",
+      "formal_approval"
+    ],
+    "exportAllowed": false,
+    "issueSeverity": "none",
+    "checkedVersion": 3,
+    "checkedRevision": 15
+  },
+  "name": "浏览器合成联调项目",
+  "runs": [
+    {
+      "id": "0892e642-49ba-4ac7-ad79-8703770bc586",
+      "skill": "extract-facts",
+      "output": {
+        "facts": [
+          {
+            "role": "core",
+            "quote": "10 kg",
+            "value": "10 kg",
+            "attribute": "capacity",
+            "evidenceId": "2229d068-1536-4a92-8c6f-adbb0d9d3f8f"
+          }
+        ]
+      },
+      "attempt": 1,
+      "freshness": "current",
+      "runStatus": "succeeded",
+      "queueStatus": "done",
+      "requestedBy": "test-human",
+      "issueSeverity": "none",
+      "approvalStatus": "draft",
+      "contextVersion": 2,
+      "contextRevision": 5,
+      "contextInputRevision": 4
+    },
+    {
+      "id": "464481a0-48be-40ba-a540-98d64621c41a",
+      "skill": "plan-section",
+      "output": {
+        "section": {
+          "factIds": [
+            "b7f4332c-9593-437b-9ef7-8bbbd95badb1"
+          ],
+          "purpose": "参数证据草稿",
+          "missingInputs": []
+        },
+        "chapters": [
+          {
+            "role": "feature",
+            "factIds": [
+              "b7f4332c-9593-437b-9ef7-8bbbd95badb1"
+            ],
+            "purpose": "说明产品承重参数"
+          }
+        ]
+      },
+      "attempt": 1,
+      "freshness": "current",
+      "runStatus": "succeeded",
+      "queueStatus": "done",
+      "requestedBy": "test-human",
+      "issueSeverity": "none",
+      "approvalStatus": "draft",
+      "contextVersion": 3,
+      "contextRevision": 10,
+      "contextInputRevision": 9
+    }
+  ],
+  "audit": [
+    {
+      "at": "2026-09-06T09:01:50.479Z",
+      "id": "e90dc420-13ca-41b7-8c2a-6db2d3e9f612",
+      "data": {},
+      "type": "project.created",
+      "actor": "test-human",
+      "revision": 1,
+      "projectVersion": 1
+    },
+    {
+      "at": "2026-09-06T09:02:15.529Z",
+      "id": "b47aa60b-4c73-479d-ab4f-6900e8b3eef3",
+      "data": {
+        "productName": "测试支架"
+      },
+      "type": "identity.employee_answer",
+      "actor": "test-human",
+      "revision": 2,
+      "projectVersion": 2
+    },
+    {
+      "at": "2026-09-06T09:02:15.529Z",
+      "id": "8c99a24e-5a7e-4ab0-a767-1784731defbb",
+      "data": {},
+      "type": "identity.confirmed",
+      "actor": "test-human",
+      "revision": 2,
+      "projectVersion": 2
+    },
+    {
+      "at": "2026-09-06T09:02:15.659Z",
+      "id": "f3c40f8e-c326-406f-91d0-49d8d8c74343",
+      "data": {},
+      "type": "evidence.added",
+      "actor": "test-human",
+      "revision": 3,
+      "projectVersion": 2
+    },
+    {
+      "at": "2026-09-06T09:04:08.596Z",
+      "id": "008edb31-26e4-4264-80b2-4c25ecd084cd",
+      "data": {},
+      "type": "run.requested",
+      "actor": "test-human",
+      "revision": 4,
+      "projectVersion": 2
+    },
+    {
+      "at": "2026-09-06T09:04:08.976Z",
+      "id": "62593b7f-ee86-402c-8370-ff7349d4c8ce",
+      "data": {
+        "runId": "0892e642-49ba-4ac7-ad79-8703770bc586",
+        "attempt": 1
+      },
+      "type": "run.started",
+      "actor": "worker",
+      "revision": 5,
+      "projectVersion": 2
+    },
+    {
+      "at": "2026-09-06T09:04:08.98Z",
+      "id": "a58099d0-06f1-43fb-a977-677189dbf098",
+      "data": {
+        "runId": "0892e642-49ba-4ac7-ad79-8703770bc586",
+        "attempt": 1,
+        "errorCode": null
+      },
+      "type": "run.succeeded",
+      "actor": "worker",
+      "revision": 6,
+      "projectVersion": 2
+    },
+    {
+      "at": "2026-09-06T09:04:34.784Z",
+      "id": "4b4eac8f-3dbf-4099-949d-22d73e1a61ff",
+      "data": {
+        "factId": "b7f4332c-9593-437b-9ef7-8bbbd95badb1",
+        "reason": "合成测试：逐条核对规格原文",
+        "evidenceId": "2229d068-1536-4a92-8c6f-adbb0d9d3f8f"
+      },
+      "type": "fact.confirm",
+      "actor": "test-human",
+      "revision": 7,
+      "projectVersion": 3
+    },
+    {
+      "at": "2026-09-06T09:04:34.784Z",
+      "id": "dab2ece5-df0b-4a68-bf29-f2cb4934f70a",
+      "data": {},
+      "type": "fact.b7f4332c-9593-437b-9ef7-8bbbd95badb1.confirm",
+      "actor": "test-human",
+      "revision": 7,
+      "projectVersion": 3
+    },
+    {
+      "at": "2026-09-06T09:05:09.535Z",
+      "id": "9e024886-204f-4d1e-a5d3-a96ef7e0d30c",
+      "data": {
+        "reason": "合成测试：逐条核对规格原文",
+        "storyboardId": "46e10dd1-561a-42cf-b7eb-059b6ae63611"
+      },
+      "type": "storyboard.saved",
+      "actor": "test-human",
+      "revision": 8,
+      "projectVersion": 3
+    },
+    {
+      "at": "2026-09-06T09:05:09.535Z",
+      "id": "06195dec-8c50-4e5e-b264-414b620638c5",
+      "data": {},
+      "type": "storyboard.edit",
+      "actor": "test-human",
+      "revision": 8,
+      "projectVersion": 3
+    },
+    {
+      "at": "2026-09-06T09:05:09.598Z",
+      "id": "b4e9ee9f-3f82-49cc-a63f-16f227472585",
+      "data": {},
+      "type": "run.requested",
+      "actor": "test-human",
+      "revision": 9,
+      "projectVersion": 3
+    },
+    {
+      "at": "2026-09-06T09:05:09.941Z",
+      "id": "1c851c74-a582-459a-9518-e06eb6c9fcf6",
+      "data": {
+        "runId": "464481a0-48be-40ba-a540-98d64621c41a",
+        "attempt": 1
+      },
+      "type": "run.started",
+      "actor": "worker",
+      "revision": 10,
+      "projectVersion": 3
+    },
+    {
+      "at": "2026-09-06T09:05:09.944Z",
+      "id": "22b95dea-66f3-4a97-8901-3a3c828c712e",
+      "data": {
+        "runId": "464481a0-48be-40ba-a540-98d64621c41a",
+        "attempt": 1,
+        "errorCode": null
+      },
+      "type": "run.succeeded",
+      "actor": "worker",
+      "revision": 11,
+      "projectVersion": 3
+    },
+    {
+      "at": "2026-09-06T09:05:47.901Z",
+      "id": "52b6e9b7-f3f1-4895-a5a8-3bff7d5f52b0",
+      "data": {
+        "reason": "合成测试：逐条核对规格原文",
+        "sectionId": "629ee0b9-e95f-4fca-a7fd-3bb4db287a7a"
+      },
+      "type": "section.selected",
+      "actor": "test-human",
+      "revision": 12,
+      "projectVersion": 3
+    },
+    {
+      "at": "2026-09-06T09:05:47.901Z",
+      "id": "9ff50c93-f2a8-40f9-90dd-f4962ae4cd9b",
+      "data": {
+        "reason": "合成测试：逐条核对规格原文",
+        "candidateId": "dd219860-ee59-4e21-8fe5-4c7fb3889a87"
+      },
+      "type": "storyboard.candidate_applied",
+      "actor": "test-human",
+      "revision": 12,
+      "projectVersion": 3
+    },
+    {
+      "at": "2026-09-06T09:05:47.901Z",
+      "id": "1f38c0e9-43bb-47be-b3ae-6475a7709b0c",
+      "data": {},
+      "type": "storyboard.dd219860-ee59-4e21-8fe5-4c7fb3889a87.apply",
+      "actor": "test-human",
+      "revision": 12,
+      "projectVersion": 3
+    },
+    {
+      "at": "2026-09-06T09:05:48.035Z",
+      "id": "f7f0016b-458d-4d0b-92ed-269f9cd78366",
+      "data": {},
+      "type": "qa.preflight",
+      "actor": "test-human",
+      "revision": 13,
+      "projectVersion": 3
+    },
+    {
+      "at": "2026-09-06T09:06:17.524Z",
+      "id": "8a26d1b9-9e5b-45a8-85e5-7b0807cbf12b",
+      "data": {},
+      "type": "qa.preflight",
+      "actor": "test-human",
+      "revision": 14,
+      "projectVersion": 3
+    },
+    {
+      "at": "2026-09-06T09:06:54.067Z",
+      "id": "48c3b0a7-fc2b-4d57-b601-5fdfb3a733d3",
+      "data": {},
+      "type": "qa.preflight",
+      "actor": "test-human",
+      "revision": 15,
+      "projectVersion": 3
+    }
+  ],
+  "facts": [
+    {
+      "id": "b7f4332c-9593-437b-9ef7-8bbbd95badb1",
+      "end": 15,
+      "role": "core",
+      "quote": "10 kg",
+      "start": 10,
+      "value": "10 kg",
+      "locked": true,
+      "status": "confirmed",
+      "attribute": "capacity",
+      "evidenceId": "2229d068-1536-4a92-8c6f-adbb0d9d3f8f",
+      "confirmedAt": "2026-09-06T09:04:34.784Z",
+      "confirmedBy": "test-human",
+      "sourceRunId": "0892e642-49ba-4ac7-ad79-8703770bc586",
+      "issueSeverity": "none"
+    }
+  ],
+  "version": 3,
+  "evidence": [
+    {
+      "id": "2229d068-1536-4a92-8c6f-adbb0d9d3f8f",
+      "text": "Capacity: 10 kg. Alternate: 20 kg.",
+      "usage": "product_evidence",
+      "sha256": "a41408283fe59470418355cb4aa2f4f8cec2e31cf67f594e3db4061676f5ccb2",
+      "locator": "第1段",
+      "createdBy": "test-human",
+      "objectKey": "a41408283fe59470418355cb4aa2f4f8cec2e31cf67f594e3db4061676f5ccb2.txt",
+      "documentName": "合成规格书.txt"
+    }
+  ],
+  "identity": {
+    "confirmedAt": "2026-09-06T09:02:15.529Z",
+    "confirmedBy": "test-human",
+    "productName": "测试支架"
+  },
+  "revision": 15,
+  "sections": [
+    {
+      "id": "629ee0b9-e95f-4fca-a7fd-3bb4db287a7a",
+      "kind": "diagnostic_draft",
+      "factIds": [
+        "b7f4332c-9593-437b-9ef7-8bbbd95badb1"
+      ],
+      "purpose": "参数证据草稿",
+      "freshness": "current",
+      "runStatus": "succeeded",
+      "sourceRunId": "464481a0-48be-40ba-a540-98d64621c41a",
+      "storyboardId": "dd219860-ee59-4e21-8fe5-4c7fb3889a87",
+      "issueSeverity": "none",
+      "missingInputs": [],
+      "approvalStatus": "draft",
+      "identityRevision": 1
+    }
+  ],
+  "storyboard": {
+    "id": "dd219860-ee59-4e21-8fe5-4c7fb3889a87",
+    "chapters": [
+      {
+        "role": "feature",
+        "factIds": [
+          "b7f4332c-9593-437b-9ef7-8bbbd95badb1"
+        ],
+        "purpose": "说明产品承重参数"
+      }
+    ],
+    "freshness": "current",
+    "sourceRunId": "464481a0-48be-40ba-a540-98d64621c41a",
+    "approvalStatus": "draft",
+    "identityRevision": 1
+  },
+  "inputRevision": 15,
+  "contractVersion": "stage-a.1",
+  "currentSectionId": "629ee0b9-e95f-4fca-a7fd-3bb4db287a7a",
+  "identityRevision": 1,
+  "storyboardCandidates": [
+    {
+      "id": "46e10dd1-561a-42cf-b7eb-059b6ae63611",
+      "reason": "合成测试：逐条核对规格原文",
+      "chapters": [
+        {
+          "role": "feature",
+          "factIds": [
+            "b7f4332c-9593-437b-9ef7-8bbbd95badb1"
+          ],
+          "purpose": "员工顺序：说明承重证据"
+        }
+      ],
+      "editedBy": "test-human",
+      "freshness": "current",
+      "sourceRunId": "human",
+      "approvalStatus": "draft",
+      "identityRevision": 1
+    },
+    {
+      "id": "dd219860-ee59-4e21-8fe5-4c7fb3889a87",
+      "chapters": [
+        {
+          "role": "feature",
+          "factIds": [
+            "b7f4332c-9593-437b-9ef7-8bbbd95badb1"
+          ],
+          "purpose": "说明产品承重参数"
+        }
+      ],
+      "freshness": "current",
+      "sourceRunId": "464481a0-48be-40ba-a540-98d64621c41a",
+      "approvalStatus": "draft",
+      "identityRevision": 1
+    }
+  ]
+}
