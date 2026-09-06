@@ -58,7 +58,7 @@ interface ProjectContextVersion {
 - `allowedWidthsPx` 和 `allowedFormats`（非空、无重复）。
 - `requiredFacts`：显式数组，每项含唯一 `key`、`description`、`allowUnknown`、`allowNotApplicable`；后两项必须明确为布尔值。若核验结果确实没有额外必需事实，可显式提供空数组。
 
-目录由服务启动配置提供，不开放浏览器写规则或伪造核验者的接口。激活快照保留规则本体和内容哈希；同一项目已经使用过的 id/version 若出现不同内容，会返回 `RULE_PACK_VERSION_CHANGED`，避免对该项目静默替换旧规则。未提供跨项目历史规则注册服务。
+目录由服务启动配置提供，不开放浏览器写规则或伪造核验者的接口。激活快照保留规则本体和内容哈希；数据库 `production_rule_packs` 以 id/version 为唯一键绑定完整规则及哈希，所有项目共享。不同服务实例使用不同本地目录并发激活时，只允许一个内容首次注册；同内容可以复用，不同内容返回 `RULE_PACK_VERSION_CHANGED`。注册、上下文版本、审计和回执在同一事务中提交，重启后约束仍然有效。
 
 ## 错误与恢复
 
@@ -72,7 +72,7 @@ interface ProjectContextVersion {
 | 409 `RULE_PACK_UNAVAILABLE` | 草稿绑定规则不在当前目录中；补齐经核验目录或更换绑定 |
 | 409 `RULE_PACK_TARGET_MISMATCH` | 精确目标不一致；`error.details.fields` 给出不同目标字段 |
 | 409 `CANVAS_OUTSIDE_RULE_PACK` | 宽度或格式不允许；`error.details.fields` 给出对应画布字段 |
-| 409 `RULE_PACK_VERSION_CHANGED` | 同项目曾冻结相同 id/version 的其他内容；恢复规则或以新版本核验 |
+| 409 `RULE_PACK_VERSION_CHANGED` | 同一数据库已绑定相同 id/version 的其他内容；恢复规则或以新版本核验 |
 | 409 `VERSION_CONFLICT` / `REVISION_CONFLICT` | 读取最新项目，保留并比较本地草稿后显式重提，不自动覆盖 |
 | 409 `IDEMPOTENCY_CONFLICT` | 同 key 被用于不同意图；未决请求先按原内容查询/重试，不用该 key 发送修改后的正文 |
 
@@ -80,10 +80,12 @@ interface ProjectContextVersion {
 
 ## 兼容与验证
 
-上下文保存在既有 PostgreSQL JSONB 项目聚合中，不需 DDL 或历史批量迁移。写入、审计、完整修订快照、幂等回执仍在同一事务；失败不留下新版本。草稿保存只改草稿，激活只追加快照及更新 activeVersion，没有编辑/删除历史 P 版本接口。
+上下文保存在既有 PostgreSQL JSONB 项目聚合中。升级前运行 `npm run migrate`，幂等创建全局规则版本注册表，并从旧项目的历史 P 版本回填规则绑定，不重写项目、已激活上下文、修订快照或回执。若旧数据已出现相同规则版本异内容，或规则快照内容与哈希不一致，迁移原子拒绝并保留原数据，不能自动选择一个版本覆盖已批准内容。
+
+写入、审计、完整修订快照、幂等回执仍在同一事务；失败不留下新版本或孤立规则注册。草稿保存只改草稿，激活只追加快照及更新 activeVersion，没有编辑/删除历史 P 版本接口。
 
 本包不把上下文加入旧 `extract-facts` / `plan-section` 的输入，因此这些配置操作保留阶段 A `version`、`inputRevision` 和 QA，不让不相关的在途事实任务失效。未来正式 Skills 和对象必须显式引用 P 版本及依赖，再处理上下文变更带来的失效；本包没有宣称已完成该后续关联。
 
-`test/production-context.test.ts` 覆盖空目录与配置失败、规则 Schema、鉴权、显式初始化、部分草稿、整体替换、目标与画布阻断、P1/P2 不变性、历史读取、幂等重放、并发写入和旧事实任务并行。测试 RulePack 与产品均明确为合成数据，只存在于测试文件中。
+`test/production-context.test.ts` 覆盖空目录与配置失败、规则 Schema、鉴权、显式初始化、部分草稿、整体替换、目标与画布阻断、P1/P2 不变性、历史读取、幂等重放、并发写入、全局规则绑定、旧数据回填和旧事实任务并行。`test/postgres.integration.ts` 另覆盖独立连接的跨项目复用、同版本异内容并发竞争及连接池重启。测试 RulePack 与产品均明确为合成数据，只存在于测试目录中。
 
 运行 `npm run typecheck`、`npm test`、`npm run build`。默认测试是 PGlite 与模型替身；真实 PostgreSQL 组合验收和业务黄金样本签收由主 Agent 记录，不由合成测试代替。
