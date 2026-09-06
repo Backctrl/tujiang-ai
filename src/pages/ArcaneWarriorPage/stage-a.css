@@ -1,0 +1,27 @@
+.arcane-warrior-page.sa-shell { min-width: 900px; }
+.sa-shell .sa-workspace { padding: 12px 24px; }
+.sa-shell .sa-columns { display: grid; grid-template-columns: 240px minmax(340px, 1fr) 280px; gap: 12px; align-items: start; }
+.sa-shell .sa-panel { background: var(--panel); border: 1px solid var(--line); padding: 18px; min-width: 0; }
+.sa-shell h1 { font-size: 22px; margin: 0 0 18px; }
+.sa-shell h2 { font-size: 16px; margin: 20px 0 12px; }
+.sa-shell h3 { font-size: 14px; margin: 18px 0 10px; }
+.sa-shell p, .sa-shell li { font-size: 13px; line-height: 1.8; color: #b9bec8; overflow-wrap: anywhere; }
+.sa-shell .sa-field { display: grid; gap: 8px; margin: 14px 0; font-size: 12px; }
+.sa-shell input:not([type=checkbox]), .sa-shell textarea, .sa-shell select { width: 100%; padding: 9px; border: 1px solid var(--line-hot); background: var(--bg); color: var(--ink); border-radius: 3px; }
+.sa-shell textarea { resize: vertical; }
+.sa-shell .button { margin: 4px 6px 4px 0; white-space: normal; height: auto; min-height: 36px; padding: 8px 12px; }
+.sa-shell .sa-list-item { width: 100%; display: grid; gap: 8px; padding: 12px; margin: 8px 0; text-align: left; background: var(--panel-2); border: 1px solid var(--line); }
+.sa-shell .sa-list-item.selected { border-color: var(--yellow); }
+.sa-shell small { display: block; color: #b9bec8; overflow-wrap: anywhere; }
+.sa-shell .sa-record { border-top: 1px solid var(--line-hot); padding: 14px 0; }
+.sa-shell pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow: auto; font-size: 12px; background: var(--bg); padding: 12px; }
+.sa-shell .sa-check { display: flex; align-items: start; gap: 8px; font-size: 12px; margin: 10px 0; line-height: 1.7; }
+.sa-shell .sa-check input { margin-top: 5px; flex: none; }
+.sa-shell fieldset { padding: 12px; border: 1px solid var(--line); }
+.sa-shell .sa-messages p { margin: 0 0 12px; }
+.sa-shell [role=alert] { color: #efa09b; }
+.sa-shell a { color: var(--yellow); font-size: 13px; }
+.sa-shell details { margin: 12px 0; font-size: 12px; }
+.sa-shell summary { cursor: pointer; overflow-wrap: anywhere; }
+.sa-shell blockquote { border-left: 2px solid var(--yellow); padding-left: 14px; overflow-wrap: anywhere; }
+@media(max-width: 1100px) { .sa-shell .sa-columns { grid-template-columns: 200px minmax(320px, 1fr); } .sa-shell .sa-columns > aside:last-child { grid-column: 1 / -1; } }
