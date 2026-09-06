@@ -58,3 +58,7 @@
 .connected-workbench .material-card > div, .connected-workbench .material-card details { min-width: 0; }
 .connected-workbench .material-card .source-status, .connected-workbench .material-actions { flex-wrap: wrap; }
 .connected-workbench .material-actions .button { flex: 0 0 auto; white-space: nowrap; }
+.connected-workbench .material-upload, .connected-workbench .material-card { overflow-wrap: anywhere; }
+.connected-workbench .material-card b { white-space: normal; }
+.connected-workbench .material-upload p, .connected-workbench .material-upload summary,
+.connected-workbench .material-card p, .connected-workbench .material-card summary { font-size: 12px; line-height: 1.8; }
