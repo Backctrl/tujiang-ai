@@ -1,6 +1,7 @@
 import type { Material, MaterialBlock, MaterialSource } from '../../../backend/src/production-materials.js'
 import { ApiError, errorMessage, prepareProjectWrite, writeFailureKind, type Project, type StageAApi } from './stage-a-api.js'
 import type { MaterialIntakeStorage, MaterialLocalEntry, MaterialOperation } from './material-storage.js'
+import { sameJsonValue } from './project-drafts.js'
 
 export const materialFileAccept = '.txt,.md,.markdown,.csv,.json,.png,.jpg,.jpeg,.webp,text/plain,text/markdown,text/csv,application/json,image/png,image/jpeg,image/webp'
 export const maxMaterialFileBytes = 10 * 1024 * 1024
@@ -46,7 +47,7 @@ export async function prepareMaterialUpload(entry: MaterialLocalEntry, getLatest
   const contentBase64 = await fileContentBase64(entry.file)
   const before = getLatestProject()
   if (!before || before.id !== entry.projectId) throw new ApiError('PROJECT_CHANGED_DURING_UPLOAD', 409)
-  return { id: 'active', kind: 'upload', entryId: entry.id, before: structuredClone(before), label: `原件「${entry.fileName}」已接收，解析状态将自动更新。`,
+  return { id: 'active', kind: 'upload', entryId: entry.id, before: structuredClone(before), parseProgressRebases: 0, label: `原件「${entry.fileName}」已接收，解析状态将自动更新。`,
     prepared: prepareProjectWrite(before, 'production/materials', { fileName: entry.fileName, mimeType: entry.mimeType, contentBase64, source: entry.source }) }
 }
 export function prepareMaterialRetry(before: Project, materialId: string): MaterialOperation {
@@ -61,34 +62,76 @@ export function receivedMaterial(project: Project): Material {
   return material
 }
 export type MaterialWriteOutcome =
-  | { kind: 'saved'; project: Project }
-  | { kind: 'rejected' | 'conflict' | 'uncertain' | 'storage'; error: unknown }
+  | { kind: 'saved'; project: Project; operation: MaterialOperation }
+  | { kind: 'rejected' | 'conflict' | 'uncertain' | 'storage'; error: unknown; operation?: MaterialOperation }
   | { kind: 'blocked' }
 
+export function onlyMaterialParseProgress(before: Project, after: Project) {
+  if (after.id !== before.id || after.revision <= before.revision || after.audit.length <= before.audit.length
+    || !sameJsonValue(before.audit, after.audit.slice(0, before.audit.length))) return false
+  const ids = new Set(before.production?.materials?.map(material => material.id))
+  const parserEvents = new Set(['material.parse.started', 'material.parse.succeeded', 'material.parse.failed', 'material.parse.interrupted'])
+  if (!after.audit.slice(before.audit.length).every(event => event.actor === 'material-parser' && parserEvents.has(event.type)
+    && typeof event.data.materialId === 'string' && ids.has(event.data.materialId)
+    && event.revision > before.revision && event.revision <= after.revision)) return false
+  const comparable = (project: Project) => ({ ...project, revision: 0, audit: [],
+    production: project.production ? { ...project.production, materials: project.production.materials?.map(material => ({ ...material,
+      detectedMimeType: undefined, blocks: [],
+      // The parser may advance execution, but its identity and original dependency stay fixed.
+      parse: { id: material.parse.id, parserVersion: material.parse.parserVersion, sourceSha256: material.parse.sourceSha256 },
+    })) } : undefined,
+  })
+  return sameJsonValue(comparable(before), comparable(after))
+}
+
 // The durable boundary is before HTTP. Settlement removes the file and pending request atomically.
-export async function executeMaterialOperation(operation: MaterialOperation, api: Pick<StageAApi, 'executePrepared'>, storage: MaterialIntakeStorage,
-  receiveSnapshot: (project: Project) => void, replay = false): Promise<MaterialWriteOutcome> {
+export async function executeMaterialOperation(operation: MaterialOperation, api: Pick<StageAApi, 'executePrepared' | 'get'>, storage: MaterialIntakeStorage,
+  receiveSnapshot: (project: Project) => void, replay = false, onRebased?: (operation: MaterialOperation) => void): Promise<MaterialWriteOutcome> {
   try { await storage.savePending(operation) }
-  catch { return { kind: replay ? 'uncertain' : 'storage', error: new ApiError(replay ? 'LOCAL_RECOVERY_SETTLE_FAILED' : 'LOCAL_RECOVERY_SAVE_FAILED', 0) } }
-  let next: Project
-  try {
-    next = await api.executePrepared(operation.prepared)
-    if (next.id !== operation.prepared.projectId) throw new ApiError('INVALID_RESPONSE', 502)
-    if (operation.kind === 'upload') receivedMaterial(next)
-    receiveSnapshot(next)
-  } catch (error) {
-    const kind = writeFailureKind(error)
-    if (kind === 'uncertain') {
-      await storage.markUncertain(operation, errorMessage(error)).catch(() => undefined)
-      return { kind, error }
-    }
-    try { await storage.settle(operation, kind, errorMessage(error)) }
-    catch { return { kind: 'uncertain', error: new ApiError('LOCAL_RECOVERY_SETTLE_FAILED', 0) } }
-    return { kind, error }
+  catch { return { kind: replay ? 'uncertain' : 'storage', error: new ApiError(replay ? 'LOCAL_RECOVERY_SETTLE_FAILED' : 'LOCAL_RECOVERY_SAVE_FAILED', 0), operation } }
+  let current = operation
+  const uncertain = async (error: unknown): Promise<MaterialWriteOutcome> => {
+    await storage.markUncertain(current, errorMessage(error)).catch(() => undefined)
+    return { kind: 'uncertain', error, operation: current }
   }
-  try { await storage.settle(operation, 'saved') }
-  catch { return { kind: 'uncertain', error: new ApiError('LOCAL_RECOVERY_SETTLE_FAILED', 0) } }
-  return { kind: 'saved', project: next }
+  for (;;) {
+    let next: Project
+    try {
+      next = await api.executePrepared(current.prepared)
+      if (next.id !== current.prepared.projectId) throw new ApiError('INVALID_RESPONSE', 502)
+      if (current.kind === 'upload') receivedMaterial(next)
+      receiveSnapshot(next)
+    } catch (error) {
+      const kind = writeFailureKind(error)
+      if (kind === 'uncertain') return uncertain(error)
+      if (!replay && current.kind === 'upload' && error instanceof ApiError && error.status === 409 && error.code === 'REVISION_CONFLICT'
+        && (current.parseProgressRebases ?? 0) < 1) {
+        let latest: Project
+        try {
+          latest = await api.get(current.before.id)
+          if (latest.id !== current.before.id) throw new ApiError('INVALID_RESPONSE', 502)
+          receiveSnapshot(latest)
+        } catch (readError) { return uncertain(readError) }
+        if (onlyMaterialParseProgress(current.before, latest)) {
+          const rebased: MaterialOperation = { ...current, before: structuredClone(latest), parseProgressRebases: 1,
+            prepared: prepareProjectWrite(latest, current.prepared.suffix, JSON.parse(current.prepared.body) as Record<string, unknown>),
+          }
+          // Replace body/key and its used budget together before the next HTTP request.
+          try { await storage.replacePending(current, rebased) }
+          catch { return uncertain(new ApiError('LOCAL_RECOVERY_SETTLE_FAILED', 0)) }
+          current = rebased
+          onRebased?.(current)
+          continue
+        }
+      }
+      try { await storage.settle(current, kind, errorMessage(error)) }
+      catch { return uncertain(new ApiError('LOCAL_RECOVERY_SETTLE_FAILED', 0)) }
+      return { kind, error, operation: current }
+    }
+    try { await storage.settle(current, 'saved') }
+    catch { return uncertain(new ApiError('LOCAL_RECOVERY_SETTLE_FAILED', 0)) }
+    return { kind: 'saved', project: next, operation: current }
+  }
 }
 
 export function materialStatus(material: Material) {

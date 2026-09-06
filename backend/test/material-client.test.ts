@@ -3,12 +3,12 @@ import assert from 'node:assert/strict';
 import { createElement, useRef } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import sharp from 'sharp';
-import { fixture } from './helpers.js';
+import { command, fixture } from './helpers.js';
 import { IngestionWorker } from '../src/ingestion-worker.js';
 import type { MaterialSource } from '../src/production-materials.js';
 import { ApiError, StageAApi, prepareProjectWrite, type Project } from '../../src/pages/ArcaneWarriorPage/stage-a-api.js';
 import { compileMaterialSource, emptyMaterialSource, executeMaterialOperation, fileContentBase64, materialBlockLocation, materialStatus,
-  prepareMaterialRetry, prepareMaterialUpload, receivedMaterial, safeSourceUrl, verifyOriginal } from '../../src/pages/ArcaneWarriorPage/material-intake.js';
+  onlyMaterialParseProgress, prepareMaterialRetry, prepareMaterialUpload, receivedMaterial, safeSourceUrl, verifyOriginal } from '../../src/pages/ArcaneWarriorPage/material-intake.js';
 import { validateMaterialOperation, type MaterialIntakeStorage, type MaterialLocalEntry, type MaterialOperation } from '../../src/pages/ArcaneWarriorPage/material-storage.js';
 import { useProjectSnapshot } from '../../src/pages/ArcaneWarriorPage/useProjectSnapshot.js';
 import { useProjectSession } from '../../src/pages/ArcaneWarriorPage/useProjectSession.js';
@@ -19,8 +19,10 @@ import { useMaterialIntake } from '../../src/pages/ArcaneWarriorPage/useMaterial
 class MemoryMaterialStorage implements MaterialIntakeStorage {
   entries = new Map<string, MaterialLocalEntry>();
   pending: MaterialOperation | undefined;
+  replacements: MaterialOperation[] = [];
   failSave = false;
   failSettle = false;
+  failReplace = false;
   subscribe() { return () => undefined; }
   async list(projectId: string) { return structuredClone([...this.entries.values()].filter(entry => entry.projectId === projectId)); }
   async put(entry: MaterialLocalEntry) { this.entries.set(entry.id, structuredClone(entry)); }
@@ -30,6 +32,13 @@ class MemoryMaterialStorage implements MaterialIntakeStorage {
     if (this.failSave) throw new Error('Injected quota failure');
     if (this.pending && this.pending.prepared.body !== operation.prepared.body) throw new Error('Another unresolved operation exists');
     this.pending = structuredClone(operation);
+    if (operation.entryId) this.entries.get(operation.entryId)!.status = 'uploading';
+  }
+  async replacePending(previous: MaterialOperation, operation: MaterialOperation) {
+    if (this.failReplace) throw new Error('Injected replacement failure');
+    assert.equal(this.pending?.prepared.body, previous.prepared.body);
+    this.pending = structuredClone(operation);
+    this.replacements.push(structuredClone(operation));
     if (operation.entryId) this.entries.get(operation.entryId)!.status = 'uploading';
   }
   async settle(operation: MaterialOperation, result: 'saved' | 'rejected' | 'conflict', message?: string) {
@@ -203,6 +212,204 @@ test('real HTTP intake preserves mixed-file outcomes, candidate locators, origin
   } finally { await f.close(); }
 });
 
+test('a definite HTTP revision conflict caused only by an existing parser continues the next original with one new envelope', async () => {
+  const f = await fixture();
+  try {
+    const url = await f.app.listen({ port: 0, host: '127.0.0.1' });
+    const order: string[] = [];
+    const client = new StageAApi(f.headers.authorization.slice(7), async (path, options) => {
+      const response = await fetch(`${url}${path}`, options);
+      order.push(`${options?.method ?? 'GET'} ${response.status}`);
+      return response;
+    });
+    let project = await client.write(await client.create('Parser progress fixture'), 'production/initialize');
+    project = await client.write(project, 'production/materials', { fileName: 'sibling.txt', mimeType: 'text/plain', contentBase64: btoa('Sibling original'), source: { kind: 'local_upload' } });
+    const local = entry(project, 'next.csv', 'name,value\r\nfixture,10');
+    const storage = new MemoryMaterialStorage(); await storage.put(local);
+    const original = await prepareMaterialUpload(local, () => project);
+    await new IngestionWorker(f.store, f.objects).tick();
+    order.length = 0;
+    const outcome = await executeMaterialOperation(original, client, storage, next => { project = next; });
+    assert.equal(outcome.kind, 'saved');
+    assert.deepEqual(order, ['POST 409', 'GET 200', 'POST 200']);
+    assert.equal(storage.replacements.length, 1);
+    assert.equal(storage.replacements[0]!.parseProgressRebases, 1);
+    const firstBody = JSON.parse(original.prepared.body);
+    const nextBody = JSON.parse(storage.replacements[0]!.prepared.body);
+    assert.notEqual(firstBody.idempotencyKey, nextBody.idempotencyKey);
+    assert.ok(nextBody.expectedRevision > firstBody.expectedRevision);
+    assert.deepEqual({ ...nextBody, expectedRevision: firstBody.expectedRevision, idempotencyKey: firstBody.idempotencyKey }, firstBody);
+    assert.equal(project.production!.materials!.length, 2);
+    assert.equal(project.production!.materials![0]!.parse.runStatus, 'succeeded');
+    assert.deepEqual(await storage.list(project.id), []);
+    assert.equal(await storage.readPending(), undefined);
+  } finally { await f.close(); }
+});
+
+test('parser progress requires both an unchanged business projection and an exact append-only parser audit trail', async () => {
+  const f = await fixture();
+  try {
+    let before = await f.write(await f.create(), 'production/initialize');
+    before = await f.write(before, 'production/materials', { fileName: 'sibling.txt', mimeType: 'text/plain', contentBase64: btoa('Sibling original'), source: { kind: 'local_upload' } });
+    await new IngestionWorker(f.store, f.objects).tick();
+    const after = await f.store.get(before.id);
+    assert.equal(onlyMaterialParseProgress(before, after), true);
+    const mutations: ((project: Project) => void)[] = [
+      p => { p.version++; },
+      p => { p.inputRevision = (p.inputRevision ?? 0) + 1; },
+      p => { p.identity = { productName: 'Changed identity', confirmedBy: 'human', confirmedAt: new Date().toISOString() }; },
+      p => { p.production!.context = { versions: [], draft: { productBrief: { productName: 'Changed context' } } }; },
+      p => { p.production!.materials![0]!.usage.hint = 'reference'; },
+      p => { p.production!.materials![0]!.source.locator = 'Changed source'; },
+      p => { p.production!.materials![0]!.origins[0]!.source.revision = 'Changed origin'; },
+      p => { p.production!.materials![0]!.sha256 = '0'.repeat(64); },
+      p => { p.production!.materials![0]!.objectKey = 'Changed original object'; },
+      p => { p.production!.materials![0]!.parse.id = crypto.randomUUID(); },
+      p => { p.production!.materials![0]!.parse.sourceSha256 = '0'.repeat(64); },
+      p => { p.production!.materials!.push({ ...structuredClone(p.production!.materials![0]!), id: crypto.randomUUID() }); },
+      p => { p.audit[before.audit.length]!.actor = 'human'; },
+      p => { p.audit[before.audit.length]!.type = 'material.usage.reviewed'; },
+      p => { p.audit[before.audit.length]!.data.materialId = crypto.randomUUID(); },
+      p => { p.audit[0]!.actor = 'Changed historical actor'; },
+      p => { p.audit = p.audit.slice(0, before.audit.length); },
+    ];
+    for (const [index, mutate] of mutations.entries()) {
+      const changed = structuredClone(after); mutate(changed);
+      assert.equal(onlyMaterialParseProgress(before, changed), false, `unexpected automatic update for changed dimension ${index}`);
+    }
+  } finally { await f.close(); }
+});
+
+test('real HTTP identity, context and usage changes remain manual conflicts even when a parser also finishes', async t => {
+  for (const change of ['identity', 'context', 'usage'] as const) await t.test(change, async () => {
+    const f = await fixture();
+    try {
+      const url = await f.app.listen({ port: 0, host: '127.0.0.1' });
+      const order: string[] = [];
+      const client = new StageAApi(f.headers.authorization.slice(7), async (path, options) => {
+        const response = await fetch(`${url}${path}`, options); order.push(`${options?.method ?? 'GET'} ${response.status}`); return response;
+      });
+      let before = await client.write(await client.create(`Business ${change} fixture`), 'production/initialize');
+      before = await client.write(before, 'production/materials', { fileName: 'sibling.txt', mimeType: 'text/plain', contentBase64: btoa('Sibling original'), source: { kind: 'local_upload' } });
+      const local = entry(before, 'waiting.txt', 'Not accepted yet');
+      const storage = new MemoryMaterialStorage(); await storage.put(local);
+      const operation = await prepareMaterialUpload(local, () => before);
+      await new IngestionWorker(f.store, f.objects).tick();
+      const latest = await client.get(before.id);
+      if (change === 'identity') await client.write(latest, 'identity/confirm', { productName: 'External product identity' });
+      else if (change === 'context') await client.write(latest, 'production/context/draft', { context: { productBrief: { productName: 'External context draft' } } });
+      else await f.store.command(latest.id, command(latest), 'material.usage.reviewed', 'external-reviewer', current => {
+        // The usage-review route belongs to 2D2. Persist its distinct business effect in this 2D1 fixture.
+        current!.production!.materials![0]!.usage.hint = 'reference'; return current!;
+      }, { preserveStageAInput: true });
+      order.length = 0;
+      const outcome = await executeMaterialOperation(operation, client, storage, () => undefined);
+      assert.equal(outcome.kind, 'conflict');
+      assert.deepEqual(order, change === 'identity' ? ['POST 409'] : ['POST 409', 'GET 200']);
+      if (change === 'identity') assert.ok(outcome.error instanceof ApiError && outcome.error.code === 'VERSION_CONFLICT');
+      assert.equal(storage.replacements.length, 0);
+      assert.equal(storage.entries.get(local.id)!.status, 'conflict');
+      assert.equal(await storage.readPending(), undefined);
+      assert.equal((await client.get(before.id)).production!.materials!.length, 1);
+    } finally { await f.close(); }
+  });
+});
+
+test('a second parser race exhausts the persisted one-update budget and pauses the unaccepted file', async () => {
+  const f = await fixture();
+  try {
+    const url = await f.app.listen({ port: 0, host: '127.0.0.1' });
+    const worker = new IngestionWorker(f.store, f.objects);
+    const order: string[] = [];
+    const client = new StageAApi(f.headers.authorization.slice(7), async (path, options) => {
+      if (options?.method === 'POST' && JSON.parse(options.body as string).fileName === 'waiting.txt') assert.equal(await worker.tick(), true);
+      const response = await fetch(`${url}${path}`, options); order.push(`${options?.method ?? 'GET'} ${response.status}`); return response;
+    });
+    let before = await client.write(await client.create('Bounded parser race fixture'), 'production/initialize');
+    for (let index = 0; index < 2; index++) before = await client.write(before, 'production/materials', { fileName: `sibling-${index}.txt`, mimeType: 'text/plain', contentBase64: btoa(`Sibling ${index}`), source: { kind: 'local_upload' } });
+    const local = entry(before, 'waiting.txt', 'Still unaccepted');
+    const storage = new MemoryMaterialStorage(); await storage.put(local);
+    order.length = 0;
+    const outcome = await executeMaterialOperation(await prepareMaterialUpload(local, () => before), client, storage, () => undefined);
+    assert.equal(outcome.kind, 'conflict');
+    assert.deepEqual(order, ['POST 409', 'GET 200', 'POST 409']);
+    assert.equal(storage.replacements.length, 1);
+    assert.equal(storage.replacements[0]!.parseProgressRebases, 1);
+    assert.equal(outcome.operation?.parseProgressRebases, 1);
+    assert.equal(storage.entries.get(local.id)!.status, 'conflict');
+    assert.equal(await storage.readPending(), undefined);
+  } finally { await f.close(); }
+});
+
+test('a replaced operation whose second POST commits but loses its response restores and replays the new body and key', async () => {
+  const f = await fixture();
+  try {
+    const url = await f.app.listen({ port: 0, host: '127.0.0.1' });
+    const bodies: string[] = [];
+    let memoryPending: MaterialOperation | undefined;
+    const client = new StageAApi(f.headers.authorization.slice(7), async (path, options) => {
+      const target = options?.method === 'POST' && JSON.parse(options.body as string).fileName === 'waiting.txt';
+      if (target) {
+        bodies.push(options.body as string);
+        if (bodies.length === 2) assert.equal(memoryPending?.prepared.body, options.body, 'memory must switch before the second HTTP request');
+      }
+      const response = await fetch(`${url}${path}`, options);
+      if (target && bodies.length === 2) { assert.equal(response.status, 200); throw new Error('Lost second response after commit'); }
+      return response;
+    });
+    let before = await client.write(await client.create('Rebased response loss fixture'), 'production/initialize');
+    before = await client.write(before, 'production/materials', { fileName: 'sibling.txt', mimeType: 'text/plain', contentBase64: btoa('Sibling original'), source: { kind: 'local_upload' } });
+    const local = entry(before, 'waiting.txt', 'Durable new request original');
+    const storage = new MemoryMaterialStorage(); await storage.put(local);
+    const initial = await prepareMaterialUpload(local, () => before); memoryPending = initial;
+    await new IngestionWorker(f.store, f.objects).tick();
+    const outcome = await executeMaterialOperation(initial, client, storage, () => undefined, false, next => { memoryPending = next; });
+    assert.equal(outcome.kind, 'uncertain');
+    assert.equal(bodies.length, 2); assert.notEqual(bodies[0], bodies[1]);
+    const restored = validateMaterialOperation(structuredClone(await storage.readPending()));
+    assert.equal(restored.prepared.body, bodies[1]); assert.equal(restored.parseProgressRebases, 1);
+    assert.equal(memoryPending!.prepared.body, restored.prepared.body);
+    const checked = await client.get(before.id); assert.equal(checked.production!.materials!.length, 2);
+    const replay = await executeMaterialOperation(restored, client, storage, () => undefined, true, () => assert.fail('restored requests cannot automatically update'));
+    assert.equal(replay.kind, 'saved');
+    assert.deepEqual(bodies, [initial.prepared.body, restored.prepared.body, restored.prepared.body]);
+    assert.equal((await client.get(before.id)).production!.materials!.length, 2);
+    assert.equal(storage.replacements.length, 1); assert.equal(await storage.readPending(), undefined);
+  } finally { await f.close(); }
+});
+
+test('a failed conflict GET or atomic replacement keeps the original request, and a restored conflict never starts an automatic update', async t => {
+  for (const failure of ['read-401', 'replace'] as const) await t.test(failure, async () => {
+    const f = await fixture();
+    try {
+      const url = await f.app.listen({ port: 0, host: '127.0.0.1' });
+      const storage = new MemoryMaterialStorage();
+      const bodies: string[] = [];
+      let failRead = false;
+      const client = new StageAApi(f.headers.authorization.slice(7), async (path, options) => {
+        if (failRead && options?.method === 'GET') return Response.json({ error: { code: 'UNAUTHORIZED' } }, { status: 401 });
+        if (options?.method === 'POST' && JSON.parse(options.body as string).fileName === 'waiting.txt') bodies.push(options.body as string);
+        return fetch(`${url}${path}`, options);
+      });
+      let before = await client.write(await client.create(`Recovery ${failure} fixture`), 'production/initialize');
+      before = await client.write(before, 'production/materials', { fileName: 'sibling.txt', mimeType: 'text/plain', contentBase64: btoa('Sibling original'), source: { kind: 'local_upload' } });
+      const local = entry(before, 'waiting.txt', 'Unaccepted original'); await storage.put(local);
+      const initial = await prepareMaterialUpload(local, () => before);
+      await new IngestionWorker(f.store, f.objects).tick();
+      failRead = failure === 'read-401'; storage.failReplace = failure === 'replace';
+      const outcome = await executeMaterialOperation(initial, client, storage, () => undefined);
+      assert.equal(outcome.kind, 'uncertain'); assert.deepEqual(bodies, [initial.prepared.body]);
+      const restored = (await storage.readPending())!; assert.equal(restored.prepared.body, initial.prepared.body);
+      failRead = false; storage.failReplace = false;
+      await client.get(before.id);
+      const replay = await executeMaterialOperation(restored, client, storage, () => undefined, true);
+      assert.equal(replay.kind, 'conflict'); assert.equal(storage.replacements.length, 0);
+      assert.deepEqual(bodies, [initial.prepared.body, initial.prepared.body]);
+      assert.equal(await storage.readPending(), undefined);
+    } finally { await f.close(); }
+  });
+});
+
 test('a committed upload with a lost response restores the exact body and key, reads first, and only explicitly replays once', async () => {
   const f = await fixture();
   try {
@@ -307,7 +514,7 @@ test('background parsing causes a definite revision conflict and only an explici
     const stale = await prepareMaterialUpload(local, () => before);
     await client.write(before, 'production/materials', { fileName: 'sibling.txt', mimeType: 'text/plain', contentBase64: btoa('Sibling original'), source: { kind: 'local_upload' } });
     await new IngestionWorker(f.store, f.objects).tick();
-    const conflict = await executeMaterialOperation(stale, client, storage, () => assert.fail('a conflict is not an upload receipt'));
+    const conflict = await executeMaterialOperation(stale, client, storage, next => { assert.equal(next.production!.materials!.length, 1, 'a conflict may read the external sibling but never report the unaccepted upload'); });
     assert.equal(conflict.kind, 'conflict'); assert.equal(await storage.readPending(), undefined);
     assert.equal(storage.entries.get(local.id)!.status, 'conflict');
     const checked = await client.get(before.id); assert.equal(checked.production!.materials!.length, 1);
@@ -327,6 +534,7 @@ test('original downloads require authentication and verify bytes; invalid restor
     const operation = await prepareMaterialUpload(local, () => project);
     assert.throws(() => validateMaterialOperation({ ...operation, prepared: { ...operation.prepared, suffix: '../identity/confirm' } }));
     assert.throws(() => validateMaterialOperation({ ...operation, prepared: prepareProjectWrite({ ...project, revision: project.revision + 1 }, 'production/materials', {}) }));
+    assert.throws(() => validateMaterialOperation({ ...operation, parseProgressRebases: 2 }));
     await assert.rejects(new StageAApi('expired', async () => Response.json({ error: { code: 'UNAUTHORIZED' } }, { status: 401 })).original(project.id, crypto.randomUUID()),
       (error: unknown) => error instanceof ApiError && error.status === 401);
     await assert.rejects(verifyOriginal(new Blob(['altered']), { sizeBytes: 7, sha256: '0'.repeat(64) }),

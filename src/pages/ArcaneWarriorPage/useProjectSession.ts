@@ -196,13 +196,16 @@ export function useProjectSession() {
       const operation = await prepare()
       setMaterialActivity({ entryId: operation.entryId, phase: 'sending' })
       setPending({ kind: 'material', operation, label: operation.label })
-      const outcome = await executeMaterialOperation(operation, api(), materialIntakeStorage, next => receiveSnapshot(next, operation.before.id), replay)
+      const outcome = await executeMaterialOperation(operation, api(), materialIntakeStorage, next => receiveSnapshot(next, operation.before.id), replay,
+        rebased => { setPending({ kind: 'material', operation: rebased, label: rebased.label }); setNotice('已同步后台解析进度，正在继续上传此文件（自动更新 1 / 1 次）。') })
       if (outcome.kind === 'saved') {
-        accept(outcome.project); setPending(null); setConflictBefore(null); setAuthExpired(false); setNotice(operation.label); setRecoveryNeedsCheck(false)
+        accept(outcome.project); setPending(null); setConflictBefore(null); setAuthExpired(false)
+        setNotice(`${outcome.operation.parseProgressRebases ? '已同步后台解析进度。' : ''}${operation.label}`); setRecoveryNeedsCheck(false)
       } else if (outcome.kind !== 'blocked') {
-        setError(errorMessage(outcome.error))
+        setError(errorMessage(outcome.error)); setNotice('')
+        if (outcome.kind === 'uncertain' && outcome.operation) setPending({ kind: 'material', operation: outcome.operation, label: outcome.operation.label })
         if (outcome.error instanceof ApiError && outcome.error.status === 401) { setAuthExpired(true); setRunConsent(false) }
-        if (outcome.kind === 'conflict') setConflictBefore(operation.before)
+        if (outcome.kind === 'conflict') setConflictBefore(outcome.operation?.before ?? operation.before)
         if (outcome.kind !== 'uncertain') { setPending(null); setRecoveryNeedsCheck(false) }
       }
       return outcome

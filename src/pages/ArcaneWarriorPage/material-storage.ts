@@ -8,6 +8,7 @@ export type MaterialLocalEntry = {
 }
 export type MaterialOperation = {
   id: 'active'; kind: 'upload' | 'parse-retry'; prepared: PreparedProjectWrite; before: Project; label: string; entryId?: string;
+  parseProgressRebases?: number;
 }
 export interface MaterialIntakeStorage {
   list(projectId: string): Promise<MaterialLocalEntry[]>
@@ -15,6 +16,7 @@ export interface MaterialIntakeStorage {
   remove(id: string): Promise<void>
   readPending(): Promise<MaterialOperation | undefined>
   savePending(operation: MaterialOperation): Promise<void>
+  replacePending(previous: MaterialOperation, operation: MaterialOperation): Promise<void>
   settle(operation: MaterialOperation, result: 'saved' | 'rejected' | 'conflict', message?: string): Promise<void>
   markUncertain(operation: MaterialOperation, message: string): Promise<void>
   subscribe(listener: () => void): () => void
@@ -28,6 +30,7 @@ export function validateMaterialOperation(value: unknown): MaterialOperation {
     !p || p.contractVersion !== 'stage-a.1' || typeof p.id !== 'string' || !Number.isInteger(p.revision) || !Number.isInteger(p.version) ||
     !Array.isArray(p.facts) || !Array.isArray(p.evidence) || !Array.isArray(p.runs) || !Array.isArray(p.sections) || !Array.isArray(p.audit) ||
     op.prepared.projectId !== p.id ||
+    (op.parseProgressRebases !== undefined && (!Number.isInteger(op.parseProgressRebases) || op.parseProgressRebases < 0 || op.parseProgressRebases > 1)) ||
     !(op.kind === 'upload' && op.prepared.suffix === 'production/materials' && typeof op.entryId === 'string') &&
     !(op.kind === 'parse-retry' && /^production\/materials\/[a-f\d-]+\/parse\/retry$/i.test(op.prepared.suffix))) throw new ApiError('INVALID_MATERIAL_RECOVERY', 0)
   let body: Record<string, unknown>
@@ -105,10 +108,18 @@ class IndexedMaterialStorage implements MaterialIntakeStorage {
     return pending === undefined ? undefined : validateMaterialOperation(pending)
   }
   savePending(operation: MaterialOperation) {
+    return this.writePending(operation)
+  }
+  replacePending(previous: MaterialOperation, operation: MaterialOperation) {
+    return this.writePending(operation, previous)
+  }
+  private writePending(operation: MaterialOperation, previous?: MaterialOperation) {
     return this.transaction<void>(['pending', 'entries'], 'readwrite', tx => {
       const request = tx.objectStore('pending').get('active')
       request.onsuccess = () => {
-        if (request.result && !sameOperation(request.result as MaterialOperation, operation)) { tx.abort(); return }
+        if (previous ? !request.result || !sameOperation(request.result as MaterialOperation, previous)
+          || previous.entryId !== operation.entryId || previous.before.id !== operation.before.id
+          : request.result && !sameOperation(request.result as MaterialOperation, operation)) { tx.abort(); return }
         tx.objectStore('pending').put(operation)
         if (operation.entryId) {
           const entry = tx.objectStore('entries').get(operation.entryId)

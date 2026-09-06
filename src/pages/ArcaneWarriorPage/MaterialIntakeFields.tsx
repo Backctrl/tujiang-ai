@@ -54,7 +54,7 @@ export function MaterialUploadFields({ intake, session, surface }: Props & { sur
     {intake.error && <div role="alert"><p>{intake.error}</p><Button disabled={session.busy || intake.loading} onClick={intake.reload}>重新读取本地队列</Button></div>}
     {!!intake.entries.length && <>
       <div className="connection-actions"><Button tone="violet" disabled={!session.canWrite || intake.loading || intake.running || !intake.entries.some(entry => entry.status === 'waiting')} onClick={intake.start}>开始上传等待的文件</Button>{intake.running && <Button onClick={intake.pause}>暂停后续文件</Button>}</div>
-      <p className="hint">文件依次提交；格式拒绝只影响该份。版本冲突或结果未确认会暂停，已接收文件不会重新加入队列。</p>
+      <p className="hint">文件依次提交；格式拒绝只影响该份。只有后台解析进度变化时，每份最多自动同步一次再提交；其他版本冲突或结果未确认会暂停。</p>
       <div className={surface === 'setup' ? 'setup-source-list' : 'rail-list'}>{intake.entries.map(entry => {
         const active = session.materialActivity?.entryId === entry.id
         const pending = session.pending?.kind === 'material' && session.pending.operation.entryId === entry.id
