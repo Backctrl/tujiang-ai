@@ -8,8 +8,9 @@ import type { RulePack } from '../../../backend/src/production-context.js'
 import type { Material } from '../../../backend/src/production-materials.js'
 import { executeMaterialOperation, prepareMaterialRetry, prepareMaterialUpload, verifyOriginal, type MaterialWriteOutcome } from './material-intake.js'
 import { materialIntakeStorage, type MaterialLocalEntry, type MaterialOperation } from './material-storage.js'
+import { prepareReviewWrite, type ReviewKind } from './review-requests.js'
 
-type SessionPending = { kind: 'standard'; run: () => Promise<Project>; label: string } | { kind: 'material'; operation: MaterialOperation; label: string }
+type SessionPending = { kind: 'standard'; run: () => Promise<Project>; label: string } | { kind: 'material'; operation: MaterialOperation; label: string; onSaved?: (project: Project) => void }
 
 const projectStorageKey = 'tujiang_stage_a_project_id'
 function previousProjectId() {
@@ -47,7 +48,11 @@ export function useProjectSession() {
   const setPending = useCallback((value: SessionPending | null) => { pendingRef.current = value; updatePending(value) }, [])
   const [conflictBefore, updateConflictBefore] = useState<Project | null>(null)
   const conflictRef = useRef<Project | null>(null)
-  const setConflictBefore = useCallback((value: Project | null) => { conflictRef.current = value; updateConflictBefore(value) }, [])
+  const [conflictAllowsSameRevision, setConflictAllowsSameRevision] = useState(false)
+  const [conflictChecked, setConflictChecked] = useState(false)
+  const setConflictBefore = useCallback((value: Project | null, allowSameRevision = false) => {
+    conflictRef.current = value; updateConflictBefore(value); setConflictAllowsSameRevision(allowSameRevision); setConflictChecked(false)
+  }, [])
   const [recoveryLoading, setRecoveryLoading] = useState(true)
   const [recoveryError, setRecoveryError] = useState('')
   const [recoveryRequest, setRecoveryRequest] = useState(0)
@@ -73,7 +78,7 @@ export function useProjectSession() {
         accept(operation.before)
         setPending({ kind: 'material', operation, label: operation.label })
         setRecoveryNeedsCheck(true)
-        setNotice('已恢复一份结果未确认的材料请求。请输入凭据并读取最新项目核对，再使用原操作重试；不会自动上传。')
+        setNotice(`已恢复一份结果未确认的${operation.kind === 'review' ? '审核' : '材料'}请求。请输入凭据并读取最新项目核对，再使用原操作重试；不会自动提交。`)
       }
       recoveryReady.current = true
     }).catch(err => {
@@ -187,25 +192,47 @@ export function useProjectSession() {
     if (!token.trim() || !id || (pending && !project) || busyRef.current) return
     const next = await perform(() => api().get(id), '已读取最新服务端数据。未保存修改仍保留。', false)
     if (next && pendingRef.current?.kind === 'material' && pendingRef.current.operation.before.id === next.id) setRecoveryNeedsCheck(false)
+    if (next && conflictRef.current?.id === next.id && next.revision >= conflictRef.current.revision) setConflictChecked(true)
     return next
   }
-  const materialAttempt = async (prepare: () => MaterialOperation | Promise<MaterialOperation>, replay = false, entryId?: string): Promise<MaterialWriteOutcome> => {
+  const readMaterialReviews = useCallback(async () => {
+    const before = getLatestProject()
+    const requestedToken = tokenRef.current
+    if (!before || !requestedToken.trim()) throw new ApiError('UNAUTHORIZED', 401)
+    try {
+      const client = new StageAApi(requestedToken)
+      const center = await client.materialReviews(before.id)
+      const latest = getLatestProject()
+      // A newer list must have its corresponding project snapshot before the UI can act on it.
+      if (latest?.id === before.id && center.revision > latest.revision) {
+        const next = await client.get(before.id)
+        if (getLatestProject()?.id === before.id) receiveSnapshot(next, before.id)
+      }
+      return center
+    } catch (err) {
+      if (getLatestProject()?.id === before.id && tokenRef.current === requestedToken && err instanceof ApiError && err.status === 401) { setAuthExpired(true); setRunConsent(false); setError(errorMessage(err)) }
+      throw err
+    }
+  }, [getLatestProject, receiveSnapshot, setAuthExpired])
+  const materialAttempt = async (prepare: () => MaterialOperation | Promise<MaterialOperation>, replay = false, entryId?: string, onSaved?: (project: Project) => void): Promise<MaterialWriteOutcome> => {
     if (busyRef.current) return { kind: 'blocked' }
     busyRef.current = true; setBusy(true); setError(''); setNotice(''); setMaterialActivity({ entryId, phase: 'reading' })
     try {
       const operation = await prepare()
       setMaterialActivity({ entryId: operation.entryId, phase: 'sending' })
-      setPending({ kind: 'material', operation, label: operation.label })
+      setPending({ kind: 'material', operation, label: operation.label, onSaved })
       const outcome = await executeMaterialOperation(operation, api(), materialIntakeStorage, next => receiveSnapshot(next, operation.before.id), replay,
-        rebased => { setPending({ kind: 'material', operation: rebased, label: rebased.label }); setNotice('已同步后台解析进度，正在继续上传此文件（自动更新 1 / 1 次）。') })
+        rebased => { setPending({ kind: 'material', operation: rebased, label: rebased.label, onSaved }); setNotice('已同步后台解析进度，正在继续上传此文件（自动更新 1 / 1 次）。') })
       if (outcome.kind === 'saved') {
         accept(outcome.project); setPending(null); setConflictBefore(null); setAuthExpired(false)
         setNotice(`${outcome.operation.parseProgressRebases ? '已同步后台解析进度。' : ''}${operation.label}`); setRecoveryNeedsCheck(false)
+        onSaved?.(outcome.project)
       } else if (outcome.kind !== 'blocked') {
         setError(errorMessage(outcome.error)); setNotice('')
-        if (outcome.kind === 'uncertain' && outcome.operation) setPending({ kind: 'material', operation: outcome.operation, label: outcome.operation.label })
+        if (outcome.kind === 'uncertain' && outcome.operation) setPending({ kind: 'material', operation: outcome.operation, label: outcome.operation.label, onSaved })
         if (outcome.error instanceof ApiError && outcome.error.status === 401) { setAuthExpired(true); setRunConsent(false) }
-        if (outcome.kind === 'conflict') setConflictBefore(outcome.operation?.before ?? operation.before)
+        if (outcome.kind === 'conflict') setConflictBefore(outcome.operation?.before ?? operation.before,
+          operation.kind === 'review' && outcome.error instanceof ApiError && !['VERSION_CONFLICT', 'REVISION_CONFLICT'].includes(outcome.error.code))
         if (outcome.kind !== 'uncertain') { setPending(null); setRecoveryNeedsCheck(false) }
       }
       return outcome
@@ -223,13 +250,18 @@ export function useProjectSession() {
     if (!before || !canWriteNow()) return Promise.resolve({ kind: 'blocked' })
     return materialAttempt(() => prepareMaterialRetry(before, materialId))
   }
+  const reviewWrite = (kind: ReviewKind, path: string, body: Record<string, unknown>, label: string, onSaved?: (next: Project) => void): Promise<MaterialWriteOutcome> => {
+    const before = getLatestProject()
+    if (!before || !canWriteNow() || before.id !== project?.id) return Promise.resolve({ kind: 'blocked' })
+    return materialAttempt(() => prepareReviewWrite(before, kind, path, body, label), false, undefined, onSaved)
+  }
   const canRetry = !!pending && !!token.trim() && !busy && !(pending.kind === 'material' && recoveryNeedsCheck)
   const retry = () => {
     const current = pendingRef.current
     if (!current || busyRef.current || !tokenRef.current.trim()) return
     if (current.kind === 'material') {
       if (recoveryCheckRef.current) return
-      return materialAttempt(() => current.operation, true, current.operation.entryId)
+      return materialAttempt(() => current.operation, true, current.operation.entryId, current.onSaved)
     }
     return perform(current.run, current.label)
   }
@@ -244,8 +276,10 @@ export function useProjectSession() {
       throw err
     }
   }
+  const canResolveConflict = !busy && !!project && !!conflictBefore && (project.revision > conflictBefore.revision
+    || (conflictAllowsSameRevision && conflictChecked && project.revision === conflictBefore.revision))
   const resolveConflict = () => {
-    if (busyRef.current || !project || !conflictRef.current || project.revision <= conflictRef.current.revision) return
+    if (busyRef.current || !canResolveConflict || !conflictRef.current) return
     setConflictBefore(null); setError(''); setNotice('差异已复核。请检查保留的修改，再重新提交。')
   }
   const confirmed = project?.facts.filter(f => f.status === 'confirmed') ?? []
@@ -253,7 +287,7 @@ export function useProjectSession() {
   const canPlan = canWrite && !!project?.identity && confirmed.some(f => f.role === 'core') && !hasConflict
   return { project, getLatestProject, projectId, setProjectId, token, setToken, authExpired, busy, error, notice, pending, conflictBefore, projects, listProjects, selectProject, canSwitch, eventsStatus,
     catalog, catalogLoading, catalogError, reloadCatalog,
-    canWrite, write, create, refresh, retry, canRetry, resolveConflict, confirmed, hasConflict, canPlan,
+    canWrite, write, reviewWrite, readMaterialReviews, create, refresh, retry, canRetry, resolveConflict, canResolveConflict, confirmed, hasConflict, canPlan,
     recoveryLoading, recoveryError, reloadMaterialRecovery, recoveryNeedsCheck, materialActivity, uploadMaterial, retryMaterialParse, originalMaterial,
     reason, setReason, reasonValid: !!reason.trim() && reason.length <= 1000, runConsent, setRunConsent }
 }
