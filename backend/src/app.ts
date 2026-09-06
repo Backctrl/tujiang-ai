@@ -10,6 +10,8 @@ import { initializeProduction, requireProduction, PRODUCTION_CONTRACT_VERSION } 
 import { activateContext, bindRulePackVersion, contextDraftSchema, productionCatalogSchema, saveContextDraft, type ProductionCatalog } from './production-context.js';
 import { materialUploadSchema, uploadLimitDetails } from './production-materials.js';
 import { MATERIAL_UPLOAD_PATH, registerMaterialRoutes } from './material-routes.js';
+import { registerProductionRuleRoutes } from './production-rule-routes.js';
+import { ruleCheckSchema, scopedRulePackSchema } from './production-rules.js';
 import { registerMaterialUsageRoutes } from './material-usage-routes.js';
 import { materialUsageSchema, factSourceReconfirmSchema } from './production-material-usage.js';
 
@@ -39,11 +41,12 @@ export function buildApp(store: Store, objects: LocalObjects, options: { token: 
   app.get('/ready', async () => { await store.db.query('SELECT 1'); return { status: 'ready' }; });
   app.get('/api/contracts', async () => ({ version: CONTRACT_VERSION,
     productionVersion: PRODUCTION_CONTRACT_VERSION,
-    requests: Object.fromEntries(Object.entries({ materialUsage: materialUsageSchema, factSourceReconfirm: factSourceReconfirmSchema, materialUpload: materialUploadSchema, materialParseRetry: writeSchema.strict(), productionContextDraft: contextWriteSchema, productionContextActivate: writeSchema.strict(), productionInitialize: writeSchema.strict(), create: createSchema, identity: identitySchema, evidence: evidenceSchema,
+    requests: Object.fromEntries(Object.entries({ productionRuleCheck: ruleCheckSchema, materialUsage: materialUsageSchema, factSourceReconfirm: factSourceReconfirmSchema, materialUpload: materialUploadSchema, materialParseRetry: writeSchema.strict(), productionContextDraft: contextWriteSchema, productionContextActivate: writeSchema.strict(), productionInitialize: writeSchema.strict(), create: createSchema, identity: identitySchema, evidence: evidenceSchema,
       factReview: reasonSchema, factCandidate: candidateSchema, identityCorrection: identityCorrectionSchema,
       storyboardEdit: storyboardEditSchema, sectionEdit: sectionEditSchema, candidateApply: reasonSchema, sectionSelect: reasonSchema,
       run: runSchema, write: writeSchema.strict() }).map(([name, schema]) => [name, z.toJSONSchema(schema)])),
     skillOutputs: { 'extract-facts': z.toJSONSchema(extractionSchema), 'plan-section': z.toJSONSchema(planSchema) },
+    rulePackModels: { 'scoped-rules.1': z.toJSONSchema(scopedRulePackSchema) },
   }));
   app.post('/api/projects', async (request, reply) => {
     const body = createSchema.parse(request.body);
@@ -52,6 +55,7 @@ export function buildApp(store: Store, objects: LocalObjects, options: { token: 
   });
   app.get('/api/projects', async () => ({ projects: await store.list() }));
   registerMaterialRoutes(app, store, objects, options.actor);
+  registerProductionRuleRoutes(app, store);
   registerMaterialUsageRoutes(app, store, objects, options.actor);
   app.get('/api/production/catalog', async () => ({ contractVersion: PRODUCTION_CONTRACT_VERSION, ...productionCatalog }));
   app.post('/api/projects/:id/production/context/draft', async request => {

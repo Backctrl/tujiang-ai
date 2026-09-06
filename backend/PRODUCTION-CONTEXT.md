@@ -8,13 +8,14 @@
 
 | 方法与路径 | 输入及行为 |
 | --- | --- |
-| `GET /api/production/catalog` | 返回 `{ contractVersion: 'production.1', rulePacks: [...] }`，不写项目 |
+| `GET /api/production/catalog` | 返回 `{ contractVersion: 'production.1', rulePacks: [...], scopedRulePacks?: [...] }`，不写项目 |
 | `POST /api/projects/:id/production/initialize` | 既有初始化命令；用户明确选择开始配置生产项目后调用 |
 | `POST /api/projects/:id/production/context/draft` | 写入信封加 `{ context: ContextDraft }`；必须已初始化 |
 | `POST /api/projects/:id/production/context/activate` | 只接收写入信封；验证当前服务端草稿，生成下一个 P 版本并消耗该草稿 |
+| `POST /api/projects/:id/production/rules/check` | 只读检查指定 P 版本的范围输入；不接收写入信封、不改变修订或批准状态，详见 [范围规则契约](SCOPED-RULES.md) |
 | `GET /api/projects/:id` | 从 `production.context` 读取草稿、版本历史及当前激活版本 |
 
-`GET /api/contracts` 的 `requests.productionContextDraft` 和 `requests.productionContextActivate` 给出请求 JSON Schema。所有新增类型从 `src/production-context.ts` 导出，根 Project 的 `contractVersion` 仍为 `stage-a.1`。
+`GET /api/contracts` 的 `requests.productionContextDraft`、`requests.productionContextActivate` 和 `requests.productionRuleCheck` 给出请求 JSON Schema。上下文类型从 `src/production-context.ts` 导出；范围约束和输入检查类型在 `src/production-rules.ts`，根 Project 的 `contractVersion` 仍为 `stage-a.1`。
 
 ```ts
 interface ProjectContext {
@@ -26,7 +27,7 @@ interface ProjectContextVersion {
   version: number;                 // 1、2……，单独的业务版本
   label: string;                   // P1、P2……
   context: CompleteContext;
-  rulePack: RulePack;               // 激活时的完整规则快照
+  rulePack: StoredRulePack;         // LegacyRulePack | ScopedRulePack，激活时完整冻结
   rulePackSha256: string;           // 排序键后的 JSON SHA-256
   activatedBy: string;
   activatedAt: string;
@@ -38,25 +39,29 @@ interface ProjectContextVersion {
 | 对象 | 完整激活所需字段 |
 | --- | --- |
 | `productBrief` | `productName`、`internalCode`、`category`、`stage`（非空文字，各最多 200 字符）；`introduction`（最多 10000 字符）；`commercialIntent`（最多 2000 字符） |
-| `primaryTarget` | `platform`、`site`；`country`（2 位大写）；`language`（语言标签）；`currency`（3 位大写）；`unitSystem`（`metric` 或 `imperial`） |
-| `canvasProfile` | `widthPx`（1—20000 的整数）；`format`（`png`、`jpeg` 或 `webp`） |
+| `primaryTarget` | `platform`、`site`；`country`（2 位大写）；`language`（语言标签）；`currency`（3 位大写）；`unitSystem`（`metric` 或 `imperial`）；新规则模型还须 `contentType` |
+| `canvasProfile` | `widthPx`（1—20000 的整数）；`format`（`png`、`jpeg` 或 `webp`）；新规则模型还须 `selectionBasis: 'local_production_policy'` |
 | `rulePackRef` | `id`、`version`（非空文字，各最多 200 字符） |
 
-激活要求精确匹配 RulePack 的全部六个目标字段；画布宽度与图片格式必须在该规则允许列表内。这里的 `format` 是画布目标图片编码，不限定 M6 的 HTML/PDF 等交付容器。规则的 `requiredFacts` 会随 P 版本冻结，事实是否满足它们由后续 M3 Facts 基线功能验证，本包的激活不表示事实放行。
+激活要求精确匹配规则的全部目标字段。旧 `LegacyRulePack` 保留六字段匹配和画布精确允许列表；新 `ScopedRulePack` 还匹配 contentType，画布只按 localProductionPolicy 检查，平台尺寸、数量、格式和文本规则另按模块、槽或字段检查。图片槽 minimum 使用 `>=`，不能作为画布精确宽度列表；Basic A+ 模块数量不会限制产品内部 Section/Frame 数量。
+
+这里的 `format` 是员工本地画布目标编码。HTML/PDF/WebP 本地制作或交付能力不证明平台上传允许这些格式。规则的 `requiredFacts` 会随 P 版本冻结，事实是否满足它们由后续 M3 Facts 基线功能验证，本包的激活不表示事实放行。
 
 ## 人工核验规则目录
 
 默认不配置 `PRODUCTION_CATALOG_PATH`，目录为 `{ "rulePacks": [] }`。因此可以保存待补齐草稿，但没有已核验规则时无法激活。没有内置平台规则，也没有合成规则回退。
 
-管理员完成来源核对后，在本地 JSON 文件中填写规则，并用 `PRODUCTION_CATALOG_PATH` 指向它；相对路径以服务启动目录为准，重启服务后加载。目录顶层只允许 `rulePacks`。显式配置文件丢失、JSON 无效或 Schema 校验失败时服务启动失败，不静默改用空目录。
+管理员完成来源核对后，在本地 JSON 文件中填写规则，并用 `PRODUCTION_CATALOG_PATH` 指向它；相对路径以服务启动目录为准，重启服务后加载。目录顶层允许旧 `rulePacks` 及可选 `scopedRulePacks`；两个数组共享 id/version 唯一约束。显式配置文件丢失、JSON 无效或 Schema 校验失败时服务启动失败，不静默改用空目录。
 
-每个 RulePack 必须包含：
+旧目录 `rulePacks` 保留以下形状，以读取既有配置和快照；`RulePack` 导出名仍是此旧类型。它的语义明确为 `legacy-canvas.1`，历史对象不添加 schemaVersion 或重新计算哈希。每个旧规则包含：
 
 - `id`、`version`；目录内二者组合唯一。规则内容修改必须使用新版本。
 - `officialUrl`（HTTPS 来源地址）、`verifiedBy`（实际核验者）、`verifiedAt`（非未来的 UTC ISO 时间）。这些是人工核验声明，Schema 不能代替业务人员确认来源权威性或规则准确性。
 - `target`（上述完整 PrimaryTarget），不使用通配目标或按其他站点兜底。
 - `allowedWidthsPx` 和 `allowedFormats`（非空、无重复）。
 - `requiredFacts`：显式数组，每项含唯一 `key`、`description`、`allowUnknown`、`allowNotApplicable`；后两项必须明确为布尔值。若核验结果确实没有额外必需事实，可显式提供空数组。
+
+新目标使用 `scopedRulePacks` 中的 `scoped-rules.1`：范围约束、min/max/exact、出处、核验记录引用、严重度、未知规则恢复入口，以及独立 localProductionPolicy，完整形状见 [范围规则契约](SCOPED-RULES.md)。明确提供 contentType 或 selectionBasis 的草稿不能改选旧目录绕过新模型。publication 只引用真实管理员核验记录，URL、verifiedBy 与声明字符串本身不能作为人工审批凭证。
 
 目录由服务启动配置提供，不开放浏览器写规则或伪造核验者的接口。激活快照保留规则本体和内容哈希；数据库 `production_rule_packs` 以 id/version 为唯一键绑定完整规则及哈希，所有项目共享。不同服务实例使用不同本地目录并发激活时，只允许一个内容首次注册；同内容可以复用，不同内容返回 `RULE_PACK_VERSION_CHANGED`。注册、上下文版本、审计和回执在同一事务中提交，重启后约束仍然有效。
 
@@ -72,6 +77,11 @@ interface ProjectContextVersion {
 | 409 `RULE_PACK_UNAVAILABLE` | 草稿绑定规则不在当前目录中；补齐经核验目录或更换绑定 |
 | 409 `RULE_PACK_TARGET_MISMATCH` | 精确目标不一致；`error.details.fields` 给出不同目标字段 |
 | 409 `CANVAS_OUTSIDE_RULE_PACK` | 宽度或格式不允许；`error.details.fields` 给出对应画布字段 |
+| 409 `SCOPED_RULE_PACK_REQUIRED` | 明确内容类型的目标或范围检查必须选新规则模型；旧 P 版本仍可原样读取 |
+| 409 `SCOPED_CONTENT_TYPE_REQUIRED` | 新规则目标须明确 contentType，不能按旧字段推断 |
+| 409 `LOCAL_PRODUCTION_SELECTION_REQUIRED` | 画布须明确 selectionBasis 为 local_production_policy |
+| 409 `RULE_PACK_INCOMPLETE` | 当前内容类型/品类无适用启用规则，或必需约束未知；按 `error.details.blockers` 的规则与恢复说明补齐核验 |
+| 409 `CANVAS_OUTSIDE_LOCAL_PRODUCTION_POLICY` | 员工画布选择超出本地制作策略；不要改用平台图片槽 minimum 推导画布选项 |
 | 409 `RULE_PACK_VERSION_CHANGED` | 同一数据库已绑定相同 id/version 的其他内容；恢复规则或以新版本核验 |
 | 409 `VERSION_CONFLICT` / `REVISION_CONFLICT` | 读取最新项目，保留并比较本地草稿后显式重提，不自动覆盖 |
 | 409 `IDEMPOTENCY_CONFLICT` | 同 key 被用于不同意图；未决请求先按原内容查询/重试，不用该 key 发送修改后的正文 |
@@ -86,6 +96,6 @@ interface ProjectContextVersion {
 
 本包不把上下文加入旧 `extract-facts` / `plan-section` 的输入，因此这些配置操作保留阶段 A `version`、`inputRevision` 和 QA，不让不相关的在途事实任务失效。未来正式 Skills 和对象必须显式引用 P 版本及依赖，再处理上下文变更带来的失效；本包没有宣称已完成该后续关联。
 
-`test/production-context.test.ts` 覆盖空目录与配置失败、规则 Schema、鉴权、显式初始化、部分草稿、整体替换、目标与画布阻断、P1/P2 不变性、历史读取、幂等重放、并发写入、全局规则绑定、旧数据回填和旧事实任务并行。`test/postgres.integration.ts` 另覆盖独立连接的跨项目复用、同版本异内容并发竞争及连接池重启。测试 RulePack 与产品均明确为合成数据，只存在于测试目录中。
+`test/production-context.test.ts` 覆盖既有上下文契约。`test/scoped-rules.test.ts` 补充范围隔离、min/max/exact、官方与本地格式区分、Unicode 文本长度、未知规则阻断、HTTP 只读检查和双模型历史兼容。`test/postgres.integration.ts` 另覆盖独立连接的跨项目复用、同版本异内容并发竞争、双模型幂等回填及连接池重启。测试 RulePack、核验记录与产品均明确为合成数据，只存在于测试目录中。
 
 运行 `npm run typecheck`、`npm test`、`npm run build`。默认测试是 PGlite 与模型替身；真实 PostgreSQL 组合验收和业务黄金样本签收由主 Agent 记录，不由合成测试代替。
