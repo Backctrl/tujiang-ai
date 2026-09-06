@@ -4,6 +4,8 @@
 
 完整 MVP 正在以可选 `production.1` 生产域扩展。M1 提供显式初始化与项目列表；M2 提供项目上下文草稿、经人工核验的本地规则目录及不可变 P 版本，接口与边界见 [项目上下文契约](PRODUCTION-CONTEXT.md)。这些扩展不把旧诊断稿变为正式章节。
 
+M2 资料底座支持 TXT/Markdown/CSV/JSON/PNG/JPEG/WebP 原件接收、认证下载、持久解析任务及待审核候选。原件和解析输出可追溯，图片未执行 OCR，用途审核和候选进入正式事实/素材库的入口在后续子包接入。接口、限制与恢复见 [资料接收契约](MATERIAL-INGESTION.md)。
+
 ## 基线与工程选择
 
 - [端到端流程 v1，revision 15](https://oriniture.feishu.cn/docx/XHktdDPkKoTPbvxytjKcEfCanPg)

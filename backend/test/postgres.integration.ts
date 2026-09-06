@@ -10,6 +10,13 @@ import type { Project } from '../src/contracts.js';
 import { initializeProduction } from '../src/production.js';
 import { activateContext, bindRulePackVersion, saveContextDraft, type RulePack } from '../src/production-context.js';
 import { context, rule } from './fixtures/production-context.js';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { buildApp } from '../src/app.js';
+import { LocalObjects } from '../src/objects.js';
+import { IngestionWorker } from '../src/ingestion-worker.js';
+import { parseMaterial } from '../src/material-parser.js';
 
 const configuredUrl = process.env.TEST_DATABASE_URL;
 if (!configuredUrl) throw new Error('TEST_DATABASE_URL is required: real PostgreSQL integration tests cannot be skipped.');
@@ -284,5 +291,65 @@ test('real PostgreSQL: concurrent services cannot bind different hashes to the s
     assert.deepEqual(await stores[loserIndex]!.get(drafts[loserIndex]!.id), drafts[loserIndex]);
     assert.equal((await db.query('SELECT id FROM production_rule_packs')).rows.length, 1);
     assert.equal((await db.query('SELECT key FROM command_receipts')).rows.length, receipts + 1);
+  });
+});
+
+test('real PostgreSQL: file jobs have exclusive claims, do not block sibling files and survive a service restart', async () => {
+  await isolated(async (db, peer, reconnect) => {
+    await migrate(db);
+    const directory = await mkdtemp(join(tmpdir(), 'tujiang-pg-materials-'));
+    const objects = new LocalObjects(directory);
+    const stores = [new Store(db), new Store(peer)];
+    const apps = stores.map(store => buildApp(store, objects, { actor: 'pg-material-test', token: 'pg-material-test-token' }));
+    let appsClosed = false;
+    try {
+      let p = await stagedContext(stores[0]!);
+      const payload = { ...command(p), fileName: 'first.txt', mimeType: 'text/plain', contentBase64: Buffer.from('first file').toString('base64'), source: { kind: 'local_upload' } };
+      const url = `/api/projects/${p.id}/production/materials`;
+      const uploaded = await Promise.all(apps.map(app => app.inject({ method: 'POST', url, headers: { authorization: 'Bearer pg-material-test-token' }, payload })));
+      assert.equal(uploaded[0]!.statusCode, 200);
+      assert.deepEqual(uploaded[0]!.json(), uploaded[1]!.json());
+      let release!: () => void; let entered!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const started = new Promise<void>(resolve => { entered = resolve; });
+      const worker = new IngestionWorker(stores[0]!, objects, async (material, bytes) => { entered(); await gate; return parseMaterial(material, bytes); });
+      const peerWorker = new IngestionWorker(stores[1]!, objects);
+      const first = worker.tick();
+      try {
+        await Promise.race([started, first.then(() => { throw new Error('first parser did not start'); })]);
+        assert.equal(await peerWorker.tick(), false);
+        p = await stores[1]!.get(p.id);
+        const second = await apps[1]!.inject({ method: 'POST', url, headers: { authorization: 'Bearer pg-material-test-token' },
+          payload: { ...payload, ...command(p), fileName: 'second.txt', contentBase64: Buffer.from('second file').toString('base64') } });
+        assert.equal(second.statusCode, 200);
+        assert.equal(await peerWorker.tick(), true);
+        p = await stores[1]!.get(p.id);
+        assert.equal(p.production!.materials![0]!.parse.runStatus, 'running');
+        assert.equal(p.production!.materials![1]!.parse.runStatus, 'succeeded');
+      } finally { release(); await first; }
+      p = await stores[0]!.get(p.id);
+      const queued = await apps[0]!.inject({ method: 'POST', url, headers: { authorization: 'Bearer pg-material-test-token' },
+        payload: { ...payload, ...command(p), fileName: 'after-restart.txt', contentBase64: Buffer.from('restart source').toString('base64') } });
+      assert.equal(queued.statusCode, 200);
+      const queuedSnapshot = queued.json<Project>();
+      await Promise.all(apps.map(app => app.close())); appsClosed = true;
+      await Promise.all([db.close(), peer.close()]); db.close = peer.close = async () => {};
+      const fresh = await reconnect();
+      await migrate(fresh);
+      const store = new Store(fresh);
+      assert.deepEqual(await store.get(p.id), queuedSnapshot);
+      assert.equal(await new IngestionWorker(store, new LocalObjects(directory)).tick(), true);
+      p = await store.get(p.id);
+      assert.ok(p.production!.materials!.every(item => item.parse.runStatus === 'succeeded' && item.parse.attempt === 1));
+      const restored = p.production!.materials![2]!;
+      assert.equal((await objects.readBinary(restored.objectKey, restored.sizeBytes)).toString(), 'restart source');
+      assert.equal(restored.blocks.length, 1);
+      assert.equal(restored.blocks[0]!.text, 'restart source');
+      assert.equal(p.evidence.length, 0);
+      assert.equal(p.facts.length, 0);
+    } finally {
+      if (!appsClosed) await Promise.all(apps.map(app => app.close()));
+      await rm(directory, { recursive: true });
+    }
   });
 });

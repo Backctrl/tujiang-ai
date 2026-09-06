@@ -23,7 +23,8 @@ export async function fixture(productionCatalog?: ProductionCatalog) {
   const dir = await mkdtemp(join(tmpdir(), 'tujiang-backend-'));
   const store = new Store(db);
   const token = randomUUID();
-  const app = buildApp(store, new LocalObjects(dir), { token, actor: 'test-human', productionCatalog });
+  const objects = new LocalObjects(dir);
+  const app = buildApp(store, objects, { token, actor: 'test-human', productionCatalog });
   const headers = { authorization: `Bearer ${token}` };
   async function post(url: string, payload: unknown) { return app.inject({ method: 'POST', url, headers, payload: payload as Record<string, unknown> }); }
   async function create() {
@@ -36,7 +37,7 @@ export async function fixture(productionCatalog?: ProductionCatalog) {
     if (result.statusCode >= 400) throw new Error(result.body);
     return result.json<Project>();
   }
-  return { db, store, app, headers, post, create, write,
+  return { db, store, objects, objectDirectory: dir, app, headers, post, create, write,
     async close() { await app.close(); await db.close(); await rm(dir, { recursive: true }); } };
 }
 export function command(p: Project, body: Record<string, unknown> = {}) {
