@@ -36,7 +36,7 @@
 每个 `Material` 包含：
 
 - `id`、`fileName`、`format`、`declaredMimeType`、已识别时的 `detectedMimeType`；`sha256`、`objectKey`、`sizeBytes`；来源、上传者与时间。
-- `origins[]` 保留导入来源。同项目相同 SHA-256 与解析格式复用一个 Material、任务与候选；不同来源导入追加来源记录，不再次解析。同字节不同格式可形成不同解析记录，底层只保存一个内容文件。
+- `origins[]` 保留导入来源。同项目相同 SHA-256 与解析格式复用一个 Material、任务与候选；相同来源按字段值去重，不受 JSONB 属性排序影响；不同来源导入追加来源记录，不再次解析。同字节不同格式可形成不同解析记录，底层只保存一个内容文件。
 - `usage: { status: 'pending', hint }`：上传/解析不会改变 pending。未知或混合文本产生 `unclassified_block`，只有来源线索明确时产生相应的 evidence/reference 候选；图片产生资产候选。
 - `parse` 的持久状态，以及 `blocks[]` 候选内容。新文件返回时 `blocks=[]`，由后台解析任务写入。
 
@@ -64,7 +64,7 @@
 
 文本只接受 UTF-8；可去除开头 UTF-8 BOM。字符位置按 BOM 去除后的 JavaScript UTF-16 字符索引计算，`startOffset` 包含、`endOffset` 不包含。CSV 行号同时包含表头和空行；JSON Pointer 对 `/`、`~` 转义。原始文件字节始终保留，可以下载核对。
 
-图片候选明确标记 `textRecognition='not_performed'` 和 `semanticAnalysis='not_performed'`，没有 OCR、图片文案或产品事实。动态图不会静默取第一帧，而是要求用户提供所需静态帧。
+图片候选明确标记 `textRecognition='not_performed'` 和 `semanticAnalysis='not_performed'`，没有 OCR、图片文案或产品事实。动态图不会静默取第一帧，而是要求用户提供所需静态帧。PNG 按 [PNG 规范的 acTL 动画控制块](https://www.w3.org/TR/png-3/#acTL-chunk) 独立识别 APNG，不依赖图片解码器是否报告帧数；普通文本块中的 `acTL` 字样不会被当作动画。
 
 ## 限制与恢复
 

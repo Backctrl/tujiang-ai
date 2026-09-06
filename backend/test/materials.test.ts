@@ -5,6 +5,7 @@ import { readdir, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import sharp from 'sharp';
 import { fixture, command, extraction } from './helpers.js';
+import { pngChunk, twoFrameApng } from './fixtures/material-images.js';
 import type { Project } from '../src/contracts.js';
 import { IngestionWorker } from '../src/ingestion-worker.js';
 import { MaterialQueue } from '../src/material-queue.js';
@@ -68,6 +69,38 @@ test('binary originals are byte-exact, content-addressed, authenticated and dedu
     assert.deepEqual(material(p).blocks, blocks);
     assert.equal(material(p).parse.attempt, 1);
     assert.deepEqual(await readdir(f.objectDirectory), [material(p).objectKey]);
+  } finally { await f.close(); }
+});
+
+test('Feishu source origins deduplicate after JSONB and HTTP round trips with fresh idempotency keys', async () => {
+  const f = await fixture();
+  try {
+    let p = await initialized(f);
+    const source: MaterialSource = { kind: 'feishu_export', url: 'https://example.feishu.cn/docx/roundtrip',
+      title: 'Synthetic source', revision: '15', locator: 'block 1' };
+    const input = upload('source.txt', 'original source content', 'text/plain', source);
+    p = await f.write(p, 'production/materials', input);
+    const original = structuredClone(material(p));
+    const get = async () => {
+      const response = await f.app.inject({ method: 'GET', url: `/api/projects/${p.id}`, headers: f.headers });
+      assert.equal(response.statusCode, 200); return response.json<Project>();
+    };
+    p = await get();
+    assert.deepEqual(material(p).source, source);
+    p = await f.write(p, 'production/materials', input);
+    assert.equal(p.production!.materials!.length, 1);
+    assert.deepEqual(material(p).origins, original.origins);
+    p = await get();
+    const reordered: MaterialSource = { locator: source.locator, revision: source.revision,
+      title: source.title, url: source.url, kind: source.kind };
+    p = await f.write(p, 'production/materials', { ...input, source: reordered });
+    assert.deepEqual(material(p).origins, original.origins);
+    assert.equal(material(p).id, original.id);
+    assert.deepEqual(material(p).parse, original.parse);
+    p = await get();
+    p = await f.write(p, 'production/materials', { ...input, source: { ...source, locator: 'block 2' } });
+    assert.equal(material(p).origins.length, 2);
+    assert.equal(material(p).origins[1]!.source.locator, 'block 2');
   } finally { await f.close(); }
 });
 
@@ -212,6 +245,31 @@ test('PNG, JPEG and WebP decode fully; corrupt images and disguised image types 
       assert.equal(material(p, i).parse.errorCode, 'INVALID_IMAGE');
       assert.deepEqual(material(p, i).blocks, []);
     }
+  } finally { await f.close(); }
+});
+
+test('APNG is rejected without a first-frame asset while static PNG text containing acTL remains valid', async () => {
+  const f = await fixture();
+  try {
+    let p = await initialized(f);
+    const animated = twoFrameApng();
+    const metadata = await sharp(animated, { animated: true }).metadata();
+    assert.equal(metadata.width, 2); assert.equal(metadata.height, 1);
+    const png = await sharp({ create: { width: 2, height: 1, channels: 4, background: '#ff0000ff' } }).png().toBuffer();
+    const staticPng = Buffer.concat([png.subarray(0, 33), pngChunk('tEXt', Buffer.from('Comment\0acTL is ordinary text')), png.subarray(33)]);
+    p = await f.write(p, 'production/materials', upload('animated.png', animated, 'image/png'));
+    p = await f.write(p, 'production/materials', upload('static.png', staticPng, 'image/png'));
+    const worker = new IngestionWorker(f.store, f.objects);
+    await worker.tick(); await worker.tick();
+    p = await f.store.get(p.id);
+    assert.equal(material(p).parse.runStatus, 'failed');
+    assert.equal(material(p).parse.errorCode, 'ANIMATED_IMAGE_UNSUPPORTED');
+    assert.deepEqual(material(p).blocks, []);
+    assert.equal(material(p, 1).parse.runStatus, 'succeeded');
+    assert.equal(material(p, 1).blocks[0]!.kind, 'asset');
+    const original = await f.app.inject({ method: 'GET', url: `/api/projects/${p.id}/production/materials/${material(p).id}/original`, headers: f.headers });
+    assert.equal(original.statusCode, 200);
+    assert.deepEqual(original.rawPayload, animated);
   } finally { await f.close(); }
 });
 
