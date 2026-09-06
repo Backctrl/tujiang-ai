@@ -16,15 +16,15 @@
 | 1B | B | 已完成 | [PR #8](https://github.com/Backctrl/tujiang-ai/pull/8)；项目切换、SSE、草稿隔离和恢复；[M1 验收记录](verification/m1.md) | D4–D10 |
 | 2A | A | 已完成 | [PR #9](https://github.com/Backctrl/tujiang-ai/pull/9)；部分配置草稿、不可变上下文及跨项目规则版本；M2 整体尚未验收 | D11–D20 |
 | 2B1 | A | 已完成 | [PR #11](https://github.com/Backctrl/tujiang-ai/pull/11)；原件、确定性解析、定位与单文件恢复；[M2 分包记录](verification/m2.md) | D11–D20 |
-| 2B2 | A | 进行中 | 用途审核、纠正与来源重确认；接口已冻结，领域／API 实现中 | D11–D20 |
+| 2B2 | A | 已完成 | [PR #14](https://github.com/Backctrl/tujiang-ai/pull/14)；用途纠正、来源追溯与重确认，114 项后端／13 项真实 PostgreSQL 及独立审查通过 | D11–D20 |
 | 2C | B | 已完成 | [PR #12](https://github.com/Backctrl/tujiang-ai/pull/12)；原设置五区、P 版本、草稿恢复与目标页头，独立审查和真实 PostgreSQL 浏览器通过 | D11–D20 |
-| 2D1 | B | 进行中 | 原件上传队列、解析进度、来源与持久恢复 | D11–D20 |
-| 2D2 | B | 待开始 | 原产品事实待处理中心接用途审核与纠正 | D11–D20 |
-| 2A2 | A | 待开始 | 区分官方模块约束与本地制作选择，完善 RulePack 表达 | D11–D20 |
+| 2D1 | B | 已完成 | [PR #15](https://github.com/Backctrl/tujiang-ai/pull/15)、[窄栏修复 #16](https://github.com/Backctrl/tujiang-ai/pull/16)；真实上传、持久恢复、AW 原件与 Facts 窄栏操作均通过独立验收 | D11–D20 |
+| 2D2 | B | 进行中 | 原待处理中心接四类用途／提取／事实／来源重确认任务；接口与布局已映射 | D11–D20 |
+| 2A2 | A | 进行中 | 范围化规则与本地制作选择已冻结接口，领域／只读检查与真实 PostgreSQL 验证中 | D11–D20 |
 | 3A/3B | A | 待开始 | Facts 基线、正式动态故事结构与批准 | D21–D29 |
 | 3C/3D | B | 待开始 | 缺口闭环、章节规格、事实与素材绑定 | D21–D29 |
 | 4A/4B | A | 待开始 | 章节命令、锁、布局候选与母版批准 | D30–D44 |
-| 4C1 | C | 进行中 | 受控共享 HTML Renderer、代表合成章节、三次确定性与溢出验证 | 可提前并行；原 D30–D44 |
+| 4C1 | C | 进行中 | 共享编译器和合成资源已提交检查点；固定 Chromium 已安装，正在执行真实浏览器渲染与确定性验证 | 可提前并行；原 D30–D44 |
 | 4C2 | C | 待开始 | 接正式章节、完整样本与预览流程 | D30–D44 |
 | 4D | B | 待开始 | 原画布接编辑、锁定、布局差异和确认 | D30–D44 |
 | 5A/5B | A、B | 待开始 | 一个不同语言市场的派生版本与批准 | D45–D52 |
@@ -43,6 +43,9 @@
 | 2C | `codex/mvp-2c-project-setup`，`F:/Project/tujiang-mvp-setup` | 原设置区、客户端会话与相关测试 | 真实后端浏览器、冲突恢复、历史只读；独立 PR |
 | 2B2 | `codex/mvp-2b2-material-usage`，`F:/Project/tujiang-mvp-usage` | 后端用途审核、来源状态与相关影响 | 合同 `backend/MATERIAL-USAGE.md`；独立 PR |
 | 2D1 | `codex/mvp-2d1-material-upload`，`F:/Project/tujiang-mvp-materialsui` | 原资料区域、上传队列与持久恢复 | 真实原件、断连／重开／401／409；独立 PR |
+| 2D1 窄栏修复 | `codex/mvp-2d1-facts-material-layout`，`F:/Project/tujiang-mvp-materialsui-fix` | Facts 资料列表局部排版 | 多卡、展开来源／候选、下载／分页；独立修复 PR |
+| 2D2 | `codex/mvp-2d2-material-review`，`F:/Project/tujiang-mvp-usageui` | 原待处理中心、用途与来源审核、有限持久请求 | 真实后端、来源约束、409／重开恢复；独立 PR |
+| 2A2 | `codex/mvp-2a2-scoped-rules`，`F:/Project/tujiang-mvp-rules` | ScopedRulePack、兼容快照、只读范围检查 | min/max/exact、范围隔离、版本不可变与真实 PostgreSQL；独立 PR |
 | 4C1 | `codex/mvp-4c1-renderer-foundation`，`F:/Project/tujiang-mvp-renderer` | 独立 Renderer 与测量；不改业务批准和原工作台 | 合成章节、固定字体／素材、连续三次渲染；独立 PR |
 
 所有 Agent 不回退其他人的修改，不修改其他目录。公共契约由 A 维护、前端 API 与会话由 B 维护、共享 Renderer 由 C 维护。Q 不实现后再自审；C/Q 轮换第三个执行席位。每次合并前记录最终提交、审查结论和对应验证；不强制覆盖未提交文件。
@@ -51,4 +54,4 @@
 
 本轮使用真实 PostgreSQL、本地文件存储和单操作者认证，提供可重复启动与恢复。公网部署、多用户成员授权、自动发布和完整品牌治理不属于本轮。真实模型和图片调用需先形成具体配置、调用量及预算方案，取得授权后执行。
 
-已收到 AW FLEX 系列资料；已确定淘宝中国中文母版及 Amazon 美国站英文 A+ 商品详情内容，初期采用 Basic A+ 制作范围。用户选择先验收一个 SKU，待补具体型号、预期事实、部分平台规则及人工签收，详见 [业务输入清单](business-inputs.md)。[规则核对记录](platform-rules.md)已整理；[模型试验方案](model-evaluation-proposal.md)已获最多 12 次文本、2 次图片及 1 USD 本地估算门授权，当前仍为 0 次模型 POST。M1 工程验收已完成；M0、M2 及最终业务验收仍保持开放。不依赖缺失输入的开发继续推进。
+AW FLEX 的四份上游原件、两份逐字 CSV 导出及父子哈希清单已在真实本地后端完成接收与哈希核对；其中原始画板 JSON 明确超出解析块上限，原件保留，逐字 CSV 的 475 个文字节点完整解析。已确定淘宝中国中文母版及 Amazon 美国站英文 A+ 商品详情内容，初期采用 Basic A+ 制作范围。用户选择先验收一个 SKU，待补具体型号、预期事实、部分平台规则及人工签收，详见 [业务输入清单](business-inputs.md)。[规则核对记录](platform-rules.md)已整理；[模型试验方案](model-evaluation-proposal.md)已获最多 12 次文本、2 次图片及 1 USD 本地估算门授权，当前仍为 0 次模型 POST。M1 工程验收已完成；M0、M2 及最终业务验收仍保持开放。不依赖缺失输入的开发继续推进。
