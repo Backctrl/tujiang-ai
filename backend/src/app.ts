@@ -6,11 +6,14 @@ import { createProject, enqueue, preflight, retryRun, reviewFact, addCandidate, 
 import { AppError } from './errors.js';
 import { LocalObjects } from './objects.js';
 import { Store, audit } from './store.js';
-import { initializeProduction, PRODUCTION_CONTRACT_VERSION } from './production.js';
+import { initializeProduction, requireProduction, PRODUCTION_CONTRACT_VERSION } from './production.js';
+import { activateContext, contextDraftSchema, productionCatalogSchema, saveContextDraft, type ProductionCatalog } from './production-context.js';
 
 const projectParams = z.object({ id: z.string().uuid() });
 const factParams = projectParams.extend({ factId: z.string().uuid(), action: z.enum(['confirm', 'reject', 'retract']) });
-export function buildApp(store: Store, objects: LocalObjects, options: { token: string; actor: string }) {
+export function buildApp(store: Store, objects: LocalObjects, options: { token: string; actor: string; productionCatalog?: ProductionCatalog }) {
+  const productionCatalog = productionCatalogSchema.parse(options.productionCatalog ?? { rulePacks: [] });
+  const contextWriteSchema = writeSchema.extend({ context: contextDraftSchema }).strict();
   const app = Fastify({ bodyLimit: 512_000, logger: false, forceCloseConnections: true });
   const digest = (value: string) => createHash('sha256').update(value).digest();
   const streams = new Set<() => void>();
@@ -31,7 +34,7 @@ export function buildApp(store: Store, objects: LocalObjects, options: { token: 
   app.get('/ready', async () => { await store.db.query('SELECT 1'); return { status: 'ready' }; });
   app.get('/api/contracts', async () => ({ version: CONTRACT_VERSION,
     productionVersion: PRODUCTION_CONTRACT_VERSION,
-    requests: Object.fromEntries(Object.entries({ productionInitialize: writeSchema.strict(), create: createSchema, identity: identitySchema, evidence: evidenceSchema,
+    requests: Object.fromEntries(Object.entries({ productionContextDraft: contextWriteSchema, productionContextActivate: writeSchema.strict(), productionInitialize: writeSchema.strict(), create: createSchema, identity: identitySchema, evidence: evidenceSchema,
       factReview: reasonSchema, factCandidate: candidateSchema, identityCorrection: identityCorrectionSchema,
       storyboardEdit: storyboardEditSchema, sectionEdit: sectionEditSchema, candidateApply: reasonSchema, sectionSelect: reasonSchema,
       run: runSchema, write: writeSchema.strict() }).map(([name, schema]) => [name, z.toJSONSchema(schema)])),
@@ -43,6 +46,21 @@ export function buildApp(store: Store, objects: LocalObjects, options: { token: 
     return reply.code(201).send(p);
   });
   app.get('/api/projects', async () => ({ projects: await store.list() }));
+  app.get('/api/production/catalog', async () => ({ contractVersion: PRODUCTION_CONTRACT_VERSION, ...productionCatalog }));
+  app.post('/api/projects/:id/production/context/draft', async request => {
+    const { id } = projectParams.parse(request.params);
+    const body = contextWriteSchema.parse(request.body);
+    return store.command(id, body, 'production.context.draft', options.actor, p => {
+      saveContextDraft(requireProduction(p!), body.context); return p!;
+    }, { preserveStageAInput: true });
+  });
+  app.post('/api/projects/:id/production/context/activate', async request => {
+    const { id } = projectParams.parse(request.params);
+    const body = writeSchema.strict().parse(request.body);
+    return store.command(id, body, 'production.context.activated', options.actor, p => {
+      activateContext(requireProduction(p!), productionCatalog, options.actor); return p!;
+    }, { preserveStageAInput: true });
+  });
   app.post('/api/projects/:id/production/initialize', async request => {
     const { id } = projectParams.parse(request.params);
     const body = writeSchema.strict().parse(request.body);

@@ -1,11 +1,12 @@
 import { AppError } from './errors.js';
+import type { ProjectContext } from './production-context.js';
 export const PRODUCTION_CONTRACT_VERSION = 'production.1';
 export interface ProductionObject {
   id: string; kind: 'facts' | 'storyboard' | 'section' | 'market' | 'export'; revision: number;
   dependencies: { id: string; revision: number }[];
   freshness: 'current' | 'stale'; approvalStatus: 'draft' | 'in_review' | 'approved';
 }
-export interface Production { contractVersion: typeof PRODUCTION_CONTRACT_VERSION; objects: ProductionObject[] }
+export interface Production { contractVersion: typeof PRODUCTION_CONTRACT_VERSION; objects: ProductionObject[]; context?: ProjectContext }
 export function initializeProduction(project: { production?: Production }): boolean {
   if (project.production) {
     if (project.production.contractVersion !== PRODUCTION_CONTRACT_VERSION) throw new AppError('UNSUPPORTED_PRODUCTION_CONTRACT', 409);
@@ -13,6 +14,11 @@ export function initializeProduction(project: { production?: Production }): bool
   }
   project.production = { contractVersion: PRODUCTION_CONTRACT_VERSION, objects: [] };
   return true;
+}
+export function requireProduction(project: { production?: Production }): Production {
+  if (!project.production) throw new AppError('PRODUCTION_NOT_INITIALIZED', 409);
+  if (project.production.contractVersion !== PRODUCTION_CONTRACT_VERSION) throw new AppError('UNSUPPORTED_PRODUCTION_CONTRACT', 409);
+  return project.production;
 }
 /** Future typed business commands invoke this; audit and queue changes do not. */
 export function reviseProductionObject(production: Production, id: string, expectedRevision: number): void {
