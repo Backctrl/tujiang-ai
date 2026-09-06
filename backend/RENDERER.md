@@ -2,7 +2,7 @@
 
 本叶子提供独立的审核样稿 Renderer，没有接入业务批准、生产页面或正式 Export。`compileReviewHtml` 只得到 `compiled-unmeasured` HTML；真实浏览器资源与布局检查通过之后，`renderReviewSample` 才会产生 `measured-review-sample` PNG。两种结果的 `purpose` 恒为 `review-sample`。
 
-当前检查点：共享编译器、浏览器测量模块、服务端截图模块、合成样本及测试已实现；纯编译测试通过。固定 Chromium 下载较慢，真实浏览器测试、连续三次像素一致性与 PNG 视觉检查仍待执行，**本检查点不是 4C1 验收通过**。恢复命令见下文。
+本地验证已完成：真实浏览器与 Node 执行同一个编译器得到完全相同的 HTML/输入哈希；固定 Chromium 连续三轮生成一章两 Frame 的中文/英文、图片、正文和参数样稿，HTML、布局、解码像素及 PNG 字节均相同。两个 PNG 已逐张查看，无缺字或截断。独立 Q 验收由主 Agent 安排；这里的合成通过不代表真实产品、AI 图片质量或完整章节制作能力通过。
 
 ## 冻结输入
 
@@ -88,6 +88,24 @@ npx tsx src/renderer/review-samples.ts
 `review-samples.ts` 固定使用合成输入，连续启动三次独立浏览器并输出到 `backend/.data/renderer-review-samples/`：`input.json`、每轮 HTML/JSON、每轮两个 Frame PNG、`consistency.json`。它断言 HTML/hash、布局/hash、每帧解码 RGBA 像素与 PNG 字节一致。像素 hash 包含宽、高、通道数和 raw RGBA hash，避免把 PNG 元数据或压缩方式当作像素一致性的证据。
 
 负面覆盖：缺图、缺字体、字节 hash 不符、坏字体、缺字、浏览器拒绝字体、图片 decode 失败、非法布局、前景遮挡、越框、文字溢出、raw CSS/HTML 注入与局部 width 覆盖。失败码及定位存于 `issues`，包含稳定 Section/Frame/blockId。
+
+## 2026-09-07 本地验证记录
+
+后端 `npm run typecheck`、`npm run build` 和完整 `npm test`（149 tests）通过，其中 Renderer 专项 `14/14` 通过。浏览器负面测试实际执行了 cmap 有效但 `head` 表损坏的字体、截断图片、正文槽位过短、恶意产品文字、缺图和 raw HTML/CSS 输入：分别返回对应 blocked issue 或在开启 JavaScript 的浏览器中保持纯文字且无任何外网请求。测量失败的服务调用不返回 PNG。
+
+首轮实际测量发现 Noto 标题字符的 61px 字框超出了合成样本的 58px 行高。样本将 heading 行高改为 64px、第一帧标题槽位高度改为 136px 后通过；未放松字体、溢出门或隐藏任何内容。
+
+本次三轮结果的完整环境和哈希见 [consistency.json](src/renderer/fixtures/review/consistency.json)，输入见 [input.json](src/renderer/fixtures/review/input.json)，可直接打开 [HTML 审核样稿](src/renderer/fixtures/review/review.html)。PNG 为 [产品概览](src/renderer/fixtures/review/frame-carry.png)（720 × 880）和 [参数](src/renderer/fixtures/review/frame-specification.png)（720 × 680）。版本库仅保留第一轮两帧样稿及一致性记录；CLI 运行目录保留全部三轮。
+
+| 校验对象 | SHA-256 |
+| --- | --- |
+| 输入 | `6767200ab9c0d87c08d0b2f0dff3ac117ec454399bd786ca6ea3c9c85cc781df` |
+| HTML | `80ecd3f2f3f36c0bd6e42e06190b84537e15e4fb42de870f6c5c78ef24dcee4c` |
+| 规范化布局 | `87e338d3ef40ca5e80781e13aeaafdd37a8b07bf2dda356f2a0433bcfab22cc5` |
+| 产品概览解码像素 | `fd21a5d0c9f33607da0e73d3cb1cd39919cff7c7f99d40357df079a83f4bc507` |
+| 参数解码像素 | `4038cc669ef3fe1bdfb7636879dd63a29f50d9560e325e37986128d1aed66ae7` |
+
+环境为 Windows `10.0.22631` / x64、Node `v22.23.2`，浏览器、字体和资源版本如上。没有在其他 OS 或引擎上声明相同像素。
 
 ## 本叶子尚未覆盖
 

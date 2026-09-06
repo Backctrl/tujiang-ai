@@ -23,7 +23,7 @@ export async function syntheticInput(): Promise<RendererInput> {
         { id: 'block-note', kind: 'Disclaimer', text: '审核样稿 · Synthetic fixture · 不代表真实产品', sourceRefs },
       ],
       layout: [
-        { blockId: 'block-title', layer: 'foreground', x: 48, y: 36, width: 624, height: 126, padding: 0 },
+        { blockId: 'block-title', layer: 'foreground', x: 48, y: 36, width: 624, height: 136, padding: 0 },
         { blockId: 'block-photo', layer: 'foreground', x: 48, y: 188, width: 624, height: 416, padding: 0 },
         { blockId: 'block-copy', layer: 'foreground', x: 48, y: 632, width: 624, height: 170, padding: 0 },
         { blockId: 'block-note', layer: 'foreground', x: 48, y: 828, width: 624, height: 30, padding: 0 },
@@ -46,7 +46,7 @@ export async function syntheticInput(): Promise<RendererInput> {
   }];
   const tokens = {
     fontId: 'fixture-sans',
-    heading: { fontSize: 42, lineHeight: 58, letterSpacing: 0 },
+    heading: { fontSize: 42, lineHeight: 64, letterSpacing: 0 },
     body: { fontSize: 24, lineHeight: 38, letterSpacing: 0 },
     caption: { fontSize: 16, lineHeight: 26, letterSpacing: 0 },
     colors: { background: '#fcfbf7', foreground: '#26382f', muted: '#657368', accent: '#526d5c', border: '#d7ddd4' },

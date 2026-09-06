@@ -98,3 +98,38 @@ test('truncated image with an updated hash fails decoding and produces no review
   assert.equal(result.ok, false);
   if (!result.ok) assert.ok(result.issues.some((i) => i.code === 'IMAGE_DECODE_FAILED'), JSON.stringify(result.issues));
 });
+
+test('escaped hostile product text remains text in a real browser without executable elements or network requests', { timeout: 30000 }, async () => {
+  const input = await syntheticInput();
+  const hostile = '</style><script>globalThis.rendererAttack=1</script><img src="https://example.invalid/exfil" onerror="globalThis.rendererAttack=2">';
+  input.sections = [{ id: 'section-hostile', frames: [{ id: 'frame-hostile', height: 500, blocks: [{ id: 'block-hostile', kind: 'Copy', text: hostile, sourceRefs: [] }], layout: [{ blockId: 'block-hostile', layer: 'foreground', x: 32, y: 32, width: 656, height: 420, padding: 0 }] }] }];
+  const compiled = await compileReviewHtml(input, await syntheticResources());
+  assert.ok(compiled.ok);
+  const browser = await chromium.launch({ headless: true });
+  try {
+    // JavaScript is enabled here to test the document's escaping/CSP independently of the server setting.
+    const context = await browser.newContext();
+    const attempts: string[] = [];
+    await context.route('**/*', async (route) => { attempts.push(route.request().url()); await route.abort(); });
+    const page = await context.newPage();
+    await page.setContent(compiled.html);
+    assert.equal(await page.locator('[data-content]').textContent(), hostile);
+    assert.equal(await page.locator('script, img, iframe, link, object, embed').count(), 0);
+    assert.equal(await page.evaluate(() => 'rendererAttack' in globalThis), false);
+    assert.deepEqual(attempts, []);
+  } finally { await browser.close(); }
+});
+
+test('service rejects missing images and raw layout code with no review artifact', async () => {
+  const input = await syntheticInput();
+  const resources = await syntheticResources();
+  for (const [candidate, bundle, code] of [
+    [input, { 'fixture-sans': resources['fixture-sans']! }, 'ASSET_MISSING'],
+    [{ ...input, html: '<script>alert(1)</script>', css: 'display:none' }, resources, 'INVALID_INPUT'],
+  ] as const) {
+    const result = await renderReviewSample(candidate, bundle);
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.ok(result.issues.some((i) => i.code === code), JSON.stringify(result.issues));
+    assert.equal('frames' in result, false);
+  }
+});
