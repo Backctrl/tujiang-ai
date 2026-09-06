@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { Production } from './production.js';
 import type { FactSourceReconfirmation, FactSourceReview, MaterialProvenance, MaterialWithdrawal } from './production-material-usage.js';
+import type { StartupRunInput } from './production-startup.js';
 
 export const CONTRACT_VERSION = 'stage-a.1';
 export const writeSchema = z.object({
@@ -95,6 +96,7 @@ export interface AgentRun extends StateAxes {
   output?: unknown; errorCode?: string;
   modelId?: string;
   observations?: ModelObservation[];
+  startupInput?: StartupRunInput;
 }
 export interface Audit {
   id: string; projectVersion: number; revision: number; type: string; actor: string; at: string;

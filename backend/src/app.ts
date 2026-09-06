@@ -14,11 +14,14 @@ import { registerProductionRuleRoutes } from './production-rule-routes.js';
 import { ruleCheckSchema, scopedRulePackSchema } from './production-rules.js';
 import { registerMaterialUsageRoutes } from './material-usage-routes.js';
 import { materialUsageSchema, factSourceReconfirmSchema } from './production-material-usage.js';
+import { registerStartupRoutes } from './startup-routes.js';
+import { STARTUP_CONTRACT_VERSION, startupCheckSchema, startupExecutionCapability, startupScopeRefreshSchema, startupStartSchema, type StartupExecutionConfig } from './production-startup.js';
 
 const projectParams = z.object({ id: z.string().uuid() });
 const factParams = projectParams.extend({ factId: z.string().uuid(), action: z.enum(['confirm', 'reject', 'retract']) });
-export function buildApp(store: Store, objects: LocalObjects, options: { token: string; actor: string; productionCatalog?: ProductionCatalog }) {
+export function buildApp(store: Store, objects: LocalObjects, options: { token: string; actor: string; productionCatalog?: ProductionCatalog; startupExecution?: StartupExecutionConfig }) {
   const productionCatalog = productionCatalogSchema.parse(options.productionCatalog ?? { rulePacks: [] });
+  const startupExecution = startupExecutionCapability(options.startupExecution);
   const contextWriteSchema = writeSchema.extend({ context: contextDraftSchema }).strict();
   const app = Fastify({ bodyLimit: 512_000, logger: false, forceCloseConnections: true });
   const digest = (value: string) => createHash('sha256').update(value).digest();
@@ -41,7 +44,9 @@ export function buildApp(store: Store, objects: LocalObjects, options: { token: 
   app.get('/ready', async () => { await store.db.query('SELECT 1'); return { status: 'ready' }; });
   app.get('/api/contracts', async () => ({ version: CONTRACT_VERSION,
     productionVersion: PRODUCTION_CONTRACT_VERSION,
-    requests: Object.fromEntries(Object.entries({ productionRuleCheck: ruleCheckSchema, materialUsage: materialUsageSchema, factSourceReconfirm: factSourceReconfirmSchema, materialUpload: materialUploadSchema, materialParseRetry: writeSchema.strict(), productionContextDraft: contextWriteSchema, productionContextActivate: writeSchema.strict(), productionInitialize: writeSchema.strict(), create: createSchema, identity: identitySchema, evidence: evidenceSchema,
+    startupVersion: STARTUP_CONTRACT_VERSION,
+    requests: Object.fromEntries(Object.entries({ startupCheck: startupCheckSchema, startupStart: startupStartSchema, startupContinueExtraction: writeSchema.strict(), startupScopeRefresh: startupScopeRefreshSchema,
+      productionRuleCheck: ruleCheckSchema, materialUsage: materialUsageSchema, factSourceReconfirm: factSourceReconfirmSchema, materialUpload: materialUploadSchema, materialParseRetry: writeSchema.strict(), productionContextDraft: contextWriteSchema, productionContextActivate: writeSchema.strict(), productionInitialize: writeSchema.strict(), create: createSchema, identity: identitySchema, evidence: evidenceSchema,
       factReview: reasonSchema, factCandidate: candidateSchema, identityCorrection: identityCorrectionSchema,
       storyboardEdit: storyboardEditSchema, sectionEdit: sectionEditSchema, candidateApply: reasonSchema, sectionSelect: reasonSchema,
       run: runSchema, write: writeSchema.strict() }).map(([name, schema]) => [name, z.toJSONSchema(schema)])),
@@ -57,6 +62,7 @@ export function buildApp(store: Store, objects: LocalObjects, options: { token: 
   registerMaterialRoutes(app, store, objects, options.actor);
   registerProductionRuleRoutes(app, store);
   registerMaterialUsageRoutes(app, store, objects, options.actor);
+  registerStartupRoutes(app, store, options.actor, productionCatalog, startupExecution);
   app.get('/api/production/catalog', async () => ({ contractVersion: PRODUCTION_CONTRACT_VERSION, ...productionCatalog }));
   app.post('/api/projects/:id/production/context/draft', async request => {
     const { id } = projectParams.parse(request.params);
@@ -155,7 +161,11 @@ export function buildApp(store: Store, objects: LocalObjects, options: { token: 
   app.post('/api/projects/:id/runs/:runId/retry', async (request, reply) => {
     const { id, runId } = projectParams.extend({ runId: z.string().uuid() }).parse(request.params);
     const body = writeSchema.strict().parse(request.body);
-    const p = await store.command(id, body, `run.${runId}.retry`, options.actor, p => { retryRun(p!, runId); return p!; });
+    const p = await store.command(id, body, `run.${runId}.retry`, options.actor, p => {
+      if (p!.runs.find(run => run.id === runId)?.startupInput && startupExecution.status === 'unavailable')
+        throw new AppError(startupExecution.code, 503, { recovery: startupExecution.message });
+      retryRun(p!, runId); return p!;
+    });
     return reply.code(202).send(p);
   });
   app.post('/api/projects/:id/qa/preflight', async request => {
