@@ -22,7 +22,7 @@ export function ProjectSetup({ session: s, onStage, intake }: Props) {
   const [documentName, setDocumentName] = useProjectDraft(s.project?.id, 'documentName', '')
   const [locator, setLocator] = useProjectDraft(s.project?.id, 'locator', '')
   const [text, setText] = useProjectDraft(s.project?.id, 'evidenceText', '')
-  const sources = s.project?.evidence ?? []
+  const manualSources = s.project?.evidence.filter(source => !source.materialSource) ?? []
   const identityValue = productName ?? s.project?.identity?.productName ?? ''
   return <div className="setup-workbench">
     <aside className="rail setup-steps"><PanelTitle eyebrow="PROJECT SETUP" title="项目设置" />{['产品基础信息', '产品资料', '平台与站点', '本地化配置', '页面尺寸'].map((item, index) => <button key={item} onClick={() => document.getElementById(`setup-${index}`)?.scrollIntoView({ block: 'nearest' })}><span>{String(index + 1).padStart(2, '0')}</span><b>{item}</b></button>)}</aside>
@@ -48,10 +48,10 @@ export function ProjectSetup({ session: s, onStage, intake }: Props) {
       <div className="form-panel setup-section setup-sources" id="setup-1"><PanelTitle eyebrow="02 / SOURCE INTAKE" title="产品资料" action={<span className="hint">已接收 {intake.materials.length} 份原件</span>} />
         <MaterialUploadFields intake={intake} session={s} surface="setup" />
         <div className="setup-source-list material-list"><MaterialList intake={intake} session={s} /></div>
-        <details className="inspector-block"><summary>原有文字证据录入 · {sources.length} 份</summary><p className="integration-note">可继续人工粘贴文字证据。这里的记录与上方原件候选分开保存，不会自动把上传资料转成证据。</p>
+        <details className="inspector-block"><summary>原有文字证据录入 · {manualSources.length} 份</summary><p className="integration-note">可继续人工粘贴文字证据。这里的记录与上方原件候选分开保存，不会自动把上传资料转成证据。</p>
           <div className="form-grid"><label>资料名称<input maxLength={200} value={documentName} disabled={!s.canWrite} onChange={e => setDocumentName(e.target.value)} /></label><label>原文位置<input maxLength={300} value={locator} disabled={!s.canWrite} onChange={e => setLocator(e.target.value)} placeholder="例如：规格说明第 2 段" /></label><label className="wide">资料原文<textarea rows={5} maxLength={80000} value={text} disabled={!s.canWrite} onChange={e => setText(e.target.value)} placeholder="粘贴产品资料原文" /></label></div>
-          <Button tone="violet" disabled={!s.canWrite || !documentName.trim() || !locator.trim() || !text.trim() || text.includes('\0') || sources.length >= 10} onClick={() => void s.write('evidence', { documentName, locator, text, usage: 'product_evidence' }, '文字证据已保存。', () => { setDocumentName(''); setLocator(''); setText('') })}>保存文字证据</Button><p className="hint">最多 10 份。点击保存后才写入后端。</p>
-          <div className="setup-source-list">{sources.map(source => <SourceCard key={source.id} source={source} facts={s.project?.facts ?? []} />)}</div>
+          <Button tone="violet" disabled={!s.canWrite || !documentName.trim() || !locator.trim() || !text.trim() || text.includes('\0') || manualSources.length >= 10} onClick={() => void s.write('evidence', { documentName, locator, text, usage: 'product_evidence' }, '文字证据已保存。', () => { setDocumentName(''); setLocator(''); setText('') })}>保存文字证据</Button><p className="hint">手工文字证据最多 10 份。点击保存后才写入后端。</p>
+          <div className="setup-source-list">{manualSources.map(source => <SourceCard key={source.id} source={source} facts={s.project?.facts ?? []} />)}</div>
         </details>
       </div>
       <div className="form-panel setup-section compact-section" id="setup-2"><PanelTitle eyebrow="03 / CHANNEL" title="平台与站点" /><TargetFields context={context} session={s} /></div>

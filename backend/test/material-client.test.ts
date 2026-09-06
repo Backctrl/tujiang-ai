@@ -1,5 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { fileURLToPath } from 'node:url';
+import { registerHooks } from 'node:module';
+import { tsImport } from 'tsx/esm/api';
 import { createElement, useRef } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import sharp from 'sharp';
@@ -84,6 +87,56 @@ test('the actual session and material hooks render a disconnected first screen w
   } finally {
     if (previous) Object.defineProperty(globalThis, 'localStorage', previous);
     else Reflect.deleteProperty(globalThis, 'localStorage');
+  }
+});
+
+test('the actual setup component limits only manual evidence, independently of twelve material-derived blocks', async () => {
+  const f = await fixture();
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  try {
+    let project = await f.write(await f.create(), 'production/initialize');
+    const text = Array.from({ length: 12 }, (_, index) => `Synthetic source line ${index + 1}`).join('\n');
+    project = await f.write(project, 'production/materials', { fileName: 'twelve-lines.txt', mimeType: 'text/plain', contentBase64: Buffer.from(text).toString('base64'), source: { kind: 'local_upload' } });
+    await new IngestionWorker(f.store, f.objects).tick(); project = await f.store.get(project.id);
+    const material = project.production!.materials![0]!;
+    assert.equal(material.blocks.length, 12);
+    project = await f.write(project, `production/materials/${material.id}/usage`, { reason: 'Check each source line', decisions: material.blocks.map(block => ({ blockId: block.id, usage: 'product_evidence' })) });
+    assert.equal(project.evidence.filter(evidence => !!evidence.materialSource).length, 12);
+    const drafts: Record<string, string> = { documentName: 'Independent manual source', locator: 'Manual paragraph', evidenceText: 'Independently entered text' };
+    Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: { getItem: (key: string) => {
+      for (const [field, value] of Object.entries(drafts)) if (key === `tujiang_draft_v1:${project.id}:${field}`) return JSON.stringify(value);
+      return null;
+    } } });
+    // Compile the actual UI with its JSX and alias configuration, independently from the Node backend compiler.
+    const componentPath = '../../src/pages/ArcaneWarriorPage/ProjectFactsStages.tsx';
+    const assets = registerHooks({ load(url, context, nextLoad) {
+      if (/\.(png|jpe?g|webp|svg)(?:\?|$)/.test(url)) return { format: 'module', source: `export default ${JSON.stringify(url)}`, shortCircuit: true };
+      return nextLoad(url, context);
+    } });
+    const { ProjectSetup } = await tsImport(componentPath, { parentURL: import.meta.url, tsconfig: fileURLToPath(new URL('../../tsconfig.app.json', import.meta.url)) }).finally(() => assets.deregister());
+    function Setup() {
+      const connected = useProjectSession();
+      const session = { ...connected, project, getLatestProject: () => project, canWrite: true, token: 'synthetic-session' };
+      return createElement(ProjectSetup, { session, intake: useMaterialIntake(session), onStage: () => undefined });
+    }
+    const render = () => {
+      const html = renderToStaticMarkup(createElement(Setup));
+      const attributes = html.match(/<button\b([^>]*)>保存文字证据<\/button>/)?.[1];
+      assert.ok(attributes !== undefined, 'the actual manual-evidence action must be present');
+      return { html, disabled: /\bdisabled(?:=|\s|$)/.test(attributes) };
+    };
+    const emptyManual = render();
+    assert.equal(emptyManual.disabled, false);
+    assert.match(emptyManual.html, /原有文字证据录入 · 0 份/);
+    for (let index = 0; index < 10; index++) project = await f.write(project, 'evidence', { documentName: `Manual source ${index}`, locator: `Paragraph ${index}`, text: `Independent statement ${index}`, usage: 'product_evidence' });
+    const fullManual = render();
+    assert.equal(fullManual.disabled, true);
+    assert.match(fullManual.html, /原有文字证据录入 · 10 份/);
+    assert.equal(project.evidence.length, 22, 'material evidence remains in the project for the facts stage');
+  } finally {
+    if (previous) Object.defineProperty(globalThis, 'localStorage', previous);
+    else Reflect.deleteProperty(globalThis, 'localStorage');
+    await f.close();
   }
 });
 
