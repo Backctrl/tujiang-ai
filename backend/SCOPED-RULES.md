@@ -138,6 +138,56 @@ subjects 1–100 项且 id 唯一；scope 不接受调用者自报 category，va
 
 运行 backend `npm run typecheck`、`npm test`、`npm run build`；真实 PostgreSQL 使用 `TEST_DATABASE_URL` 执行 `npm run test:postgres`，每项仅操作本次生成的独立 schema。此扩展未增加依赖，也不发起付费模型请求。
 
+## 原工作台浏览器复现
+
+测试专用 `test/fixtures/scoped-browser-fixture.ts` 使用内存 PGlite、合成规则及随机临时令牌，通过真实 loopback HTTP 创建四个项目。它不读取 `.env`、不连接已有数据库、不加载付费模型 Worker。这里的临时 UI 复现不替代上文真实 PostgreSQL 验证。
+
+在本包 backend 目录启动：
+
+```powershell
+node --import tsx test/fixtures/scoped-browser-fixture.ts
+```
+
+输出给出 baseUrl、临时 token、四个项目 id/name、规则输入检查路径与正文。默认自动选空闲端口；可通过 `SCOPED_FIXTURE_PORT` 指定本机端口。另一个终端在本包根目录启动原工作台，把下面的端口替换为输出值：
+
+```powershell
+$env:TUJIANG_API_TARGET = 'http://127.0.0.1:<fixture 输出端口>'
+npx vite --host 127.0.0.1 --port 5182 --strictPort
+```
+
+打开 `/arcane-warrior`，用临时 token 连接，在项目列表选择合成项目。无需在浏览器发送真实凭据或创建真实规则。按下列场景查看 Setup、Target、Canvas；结束后在两个终端按 Ctrl+C，fixture 关闭数据库并清理临时原件目录。
+
+| 输出 case | 可观察结果 |
+| --- | --- |
+| `scoped_active` | P1 冻结规则显示来源、管理员记录引用及本地策略；1200 WebP 是本地画布选择；编辑、复制、保存、启用禁用；平台图片槽 minimum 不进入画布精确宽度建议 |
+| `scoped_draft_over_legacy` | 显示名字为 “Scoped saved draft, not the legacy active product” 的服务端草稿，不能显示旧 P1 的规则为此草稿规则；四类写入操作禁用 |
+| `partial_scoped_draft` | 仅 contentType 已填写也足以阻止旧表单写入，保持草稿语义，不能假装已有已启用版本 |
+| `scoped_history_legacy_active` | 当前旧模型 P2 仍可复制为本地草稿并保存；历史新模型 P1 不可复制，方法守卫也会拒绝 |
+
+`node --import tsx test/fixtures/scoped-browser-fixture.ts --smoke` 完成创建、GET 与范围检查后自动关闭，可验证复现数据准备流程。
+
+fixture 的实际请求遵循同一公开 API。手工复现时，把 `<version>`/`<revision>` 取自上一条响应，每次写入生成新幂等键：
+
+```http
+POST /api/projects/:id/production/context/draft
+Authorization: Bearer <temporary fixture token>
+Content-Type: application/json
+
+{"expectedProjectVersion":<version>,"expectedRevision":<revision>,"idempotencyKey":"<new UUID>","context":{"productBrief":{"productName":"Partial scoped draft"},"primaryTarget":{"contentType":"amazon_basic_aplus"}}}
+```
+
+完整新模型草稿使用 `test/fixtures/scoped-rules.ts` 的 `scopedContext` 对象；必须同样提供六个精确目标字段、contentType、selectionBasis 和新规则引用。完成草稿保存后，启用请求只含写入信封：
+
+```http
+POST /api/projects/:id/production/context/activate
+Authorization: Bearer <temporary fixture token>
+Content-Type: application/json
+
+{"expectedProjectVersion":<version>,"expectedRevision":<revision>,"idempotencyKey":"<new UUID>"}
+```
+
+只读 `POST /api/projects/:id/production/rules/check` 使用 fixture 输出的 checkRequest（contextVersion 和 subjects），无需写入信封；返回 issueSeverity=none 也不产生正式 QA 或批准。
+
 ## 官方范围依据与首发边界
 
 Basic A+ 的五模块限制按 ASIN 生效；A+ 模块图片最低尺寸与文本 maxLength 按具体槽/字段解释。来源为 [Amazon 设计说明](https://sell.amazon.com/blog/a-plus-content-design-guide?mons_sel_locale=en_US)、[模块字段说明](https://developer-docs.amazon/sp-api/lang-en_US/docs/a-plus-content-examples) 和 [上传流程示例](https://developer-docs.amazon/sp-api/lang-en_US/docs/create-edit-publish-aplus-content)，本轮仅用于结构建模与测试依据。
