@@ -19,6 +19,7 @@ export function reviseProductionObject(production: Production, id: string, expec
   const object = production.objects.find(item => item.id === id);
   if (!object) throw new AppError('PRODUCTION_OBJECT_NOT_FOUND', 404);
   if (object.revision !== expectedRevision) throw new AppError('PRODUCTION_REVISION_CONFLICT', 409);
+  if (object.approvalStatus === 'approved') throw new AppError('APPROVED_PRODUCTION_OBJECT_IMMUTABLE', 409);
   object.revision++;
   object.approvalStatus = 'draft';
   refreshProductionDependencies(production);

@@ -49,11 +49,20 @@ test('business revision invalidates only transitive dependants and rejects stale
   const make = (id: string, deps: string[] = []): ProductionObject => ({ id, kind: 'section', revision: 1,
     dependencies: deps.map(id => ({ id, revision: 1 })), freshness: 'current', approvalStatus: 'approved' });
   const p: Production = { contractVersion: 'production.1', objects: [make('a'), make('b', ['a']), make('c', ['b']), make('other')] };
+  p.objects[0]!.approvalStatus = 'draft';
   reviseProductionObject(p, 'a', 1);
   assert.deepEqual(p.objects.map(o => o.freshness), ['current', 'stale', 'stale', 'current']);
   assert.equal(p.objects[0]!.approvalStatus, 'draft');
   const before = structuredClone(p);
   assert.throws(() => reviseProductionObject(p, 'a', 1), /PRODUCTION_REVISION_CONFLICT/);
+  assert.deepEqual(p, before);
+});
+
+test('approved production objects reject revisions without losing approved content', () => {
+  const p: Production = { contractVersion: 'production.1', objects: [{ id: 'approved', kind: 'section',
+    revision: 1, dependencies: [], freshness: 'current', approvalStatus: 'approved' }] };
+  const before = structuredClone(p);
+  assert.throws(() => reviseProductionObject(p, 'approved', 1), /APPROVED_PRODUCTION_OBJECT_IMMUTABLE/);
   assert.deepEqual(p, before);
 });
 
