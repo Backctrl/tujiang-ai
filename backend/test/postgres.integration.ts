@@ -17,6 +17,7 @@ import { context, rule } from './fixtures/production-context.js';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { IngestionWorker } from '../src/ingestion-worker.js';
 import { parseMaterial } from '../src/material-parser.js';
+import { availableConfirmedFacts, evidenceIsAvailable } from '../src/material-source-gates.js';
 
 const configuredUrl = process.env.TEST_DATABASE_URL;
 if (!configuredUrl) throw new Error('TEST_DATABASE_URL is required: real PostgreSQL integration tests cannot be skipped.');
@@ -390,5 +391,123 @@ test('real PostgreSQL: file jobs have exclusive claims, do not block sibling fil
       if (!appsClosed) await Promise.all(apps.map(app => app.close()));
       await rm(directory, { recursive: true });
     }
+  });
+});
+
+test('real PostgreSQL over HTTP: usage decisions are atomic across services, preserve no-op receipts and survive reconnect', async () => {
+  await isolated(async (db, peer, reconnect) => {
+    await migrate(db);
+    const directory = await mkdtemp(join(tmpdir(), 'tujiang-pg-usage-'));
+    const stores = [new Store(db), new Store(peer)]; const objects = new LocalObjects(directory);
+    const actor = 'pg-usage-human'; const token = randomUUID();
+    const apps = stores.map(store => buildApp(store, objects, { actor, token }));
+    const bases = await Promise.all(apps.map(app => app.listen({ port: 0, host: '127.0.0.1' })));
+    const request = async (service: number, path: string, payload?: unknown) => fetch(`${bases[service]}${path}`, {
+      method: payload ? 'POST' : 'GET', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      ...(payload ? { body: JSON.stringify(payload) } : {}),
+    });
+    const write = async (p: Project, route: string, body: Record<string, unknown> = {}) => {
+      const response = await request(0, `/api/projects/${p.id}/${route}`, { ...command(p), ...body });
+      assert.equal(response.status, 200, await response.clone().text()); return response.json() as Promise<Project>;
+    };
+    try {
+      let p = await (await request(0, '/api/projects', { ...command(), name: 'Postgres usage fixture' })).json() as Project;
+      p = await write(p, 'production/initialize');
+      p = await write(p, 'production/materials', { fileName: 'pg-source.txt', mimeType: 'text/plain',
+        contentBase64: Buffer.from('Capacity: 10 kg\nMaterial: steel').toString('base64'),
+        source: { kind: 'feishu_export', url: 'https://example.feishu.cn/docx/synthetic-pg', revision: '61', title: 'PG source' } });
+      await new IngestionWorker(stores[0]!, objects).tick(); p = await stores[1]!.get(p.id);
+      const material = p.production!.materials![0]!;
+      const route = `/api/projects/${p.id}/production/materials/${material.id}/usage`;
+      const body = { ...command(p), reason: 'first purpose', decisions: [{ blockId: material.blocks[0]!.id, usage: 'product_evidence' }] };
+      const results = await Promise.all([request(0, route, body), request(1, route, body)]);
+      assert.deepEqual(results.map(r => r.status), [200, 200]);
+      const first = await results[0]!.json() as Project;
+      assert.deepEqual(await results[1]!.json(), first);
+      assert.equal(first.production!.materials![0]!.usageReview!.history.length, 1);
+      assert.equal(evidenceIsAvailable(first, first.evidence[0]!), true, 'JSONB key reordering preserves source matching');
+      const repeated = await request(1, route, { ...body, ...command(first), reason: 'same effective purpose' });
+      assert.deepEqual(await repeated.json(), first);
+      const revisions = await db.query('SELECT revision FROM project_revisions WHERE project_id=$1', [p.id]);
+      assert.equal(revisions.rows.length, first.revision);
+      const receipts = (await db.query('SELECT key FROM command_receipts')).rows.length;
+      const invalid = await request(1, route, { ...command(first), reason: 'must validate whole batch', decisions: [
+        { blockId: material.blocks[0]!.id, usage: 'reference' }, { blockId: material.blocks[1]!.id, usage: 'asset' },
+      ] });
+      assert.equal(invalid.status, 409); assert.deepEqual(await stores[0]!.get(p.id), first);
+      assert.equal((await db.query('SELECT key FROM command_receipts')).rows.length, receipts);
+      const competing = await Promise.all(['product_evidence', 'reference'].map((usage, index) => request(index, route, {
+        ...command(first), reason: 'concurrent purposes', decisions: [{ blockId: material.blocks[1]!.id, usage }],
+      })));
+      assert.deepEqual(competing.map(r => r.status).sort(), [200, 409]);
+      p = await stores[0]!.get(p.id);
+      assert.equal(p.revision, first.revision + 1); assert.equal(p.production!.materials![0]!.usageReview!.history.length, 2);
+      const winner = structuredClone(p);
+      assert.deepEqual(await (await request(0, route, body)).json(), first);
+      await Promise.all(apps.map(app => app.close()));
+      await Promise.all([db.close(), peer.close()]); db.close = peer.close = async () => {};
+      const fresh = await reconnect(); await migrate(fresh);
+      const restored = await new Store(fresh).get(p.id);
+      assert.deepEqual(restored, winner);
+      assert.equal(evidenceIsAvailable(restored, restored.evidence[0]!), true);
+      const persistedReceipt = await fresh.query<{ response: Project }>('SELECT response FROM command_receipts WHERE key=$1', [`${actor}:${body.idempotencyKey}`]);
+      assert.deepEqual(persistedReceipt.rows[0]!.response, first);
+      assert.equal((await objects.readBinary(material.objectKey, material.sizeBytes)).toString(), 'Capacity: 10 kg\nMaterial: steel');
+    } finally {
+      await Promise.all(apps.map(app => app.close()));
+      await rm(directory, { recursive: true });
+    }
+  });
+});
+
+test('real PostgreSQL: concurrent source reconfirmation retains lock history and cannot automatically refresh stale drafts', async () => {
+  await isolated(async (db, peer) => {
+    await migrate(db);
+    const directory = await mkdtemp(join(tmpdir(), 'tujiang-pg-reconfirm-'));
+    const stores = [new Store(db), new Store(peer)]; const objects = new LocalObjects(directory);
+    const token = randomUUID(); const apps = stores.map(store => buildApp(store, objects, { actor: 'pg-reviewer', token }));
+    const post = (index: number, p: Project, route: string, body: Record<string, unknown> = {}) => apps[index]!.inject({
+      method: 'POST', url: `/api/projects/${p.id}/${route}`, headers: { authorization: `Bearer ${token}` }, payload: { ...command(p), ...body },
+    });
+    const write = async (p: Project, route: string, body: Record<string, unknown> = {}) => {
+      const response = await post(0, p, route, body); assert.ok(response.statusCode >= 200 && response.statusCode < 300, response.body); return response.json<Project>();
+    };
+    try {
+      let p = await stores[0]!.command(undefined, command(), 'created', 'pg-reviewer', () => createProject('PG locked source fixture'));
+      p = await write(p, 'production/initialize');
+      p = await write(p, 'production/materials', { fileName: 'locked.txt', mimeType: 'text/plain',
+        contentBase64: Buffer.from('Capacity: 10 kg').toString('base64'), source: { kind: 'local_upload' } });
+      await new IngestionWorker(stores[0]!, objects).tick(); p = await stores[0]!.get(p.id);
+      const material = p.production!.materials![0]!;
+      const usageRoute = `production/materials/${material.id}/usage`;
+      const decide = (p: Project, usage: string) => write(p, usageRoute, { reason: 'source purpose checked', decisions: [{ blockId: material.blocks[0]!.id, usage }] });
+      p = await decide(p, 'product_evidence');
+      p = await write(p, 'identity/confirm', { productName: 'PG fixture product' });
+      p = await write(p, 'facts/candidates', { attribute: 'capacity', role: 'core', value: '10 kg', quote: '10 kg', evidenceId: p.evidence[0]!.id, reason: 'checked source' });
+      p = await write(p, `facts/${p.facts[0]!.id}/confirm`, { reason: 'confirmed exact quote' });
+      const fact = structuredClone(p.facts[0]!);
+      p = await write(p, 'runs', { skill: 'plan-section' });
+      await new Worker(stores[0]!, { generate: async () => ({ chapters: [{ role: 'feature', purpose: 'capacity', factIds: [fact.id] }],
+        section: { purpose: 'capacity', factIds: [fact.id], missingInputs: [] } }) }).tick();
+      p = await stores[0]!.get(p.id); p = await write(p, 'qa/preflight'); const approvedSourceSnapshot = structuredClone(p);
+      p = await decide(p, 'reference');
+      assert.equal(p.facts[0]!.status, 'confirmed'); assert.equal(p.facts[0]!.locked, true);
+      assert.equal(p.facts[0]!.sourceReview!.status, 'reconfirmation_required'); assert.equal(p.qa, undefined);
+      assert.equal((await post(1, p, 'runs', { skill: 'plan-section' })).json().error.code, 'CONFIRMED_CORE_FACT_REQUIRED');
+      p = await decide(p, 'product_evidence');
+      assert.equal(availableConfirmedFacts(p).length, 0);
+      const replacement = p.evidence.at(-1)!;
+      const reconfirmRoute = `facts/${fact.id}/source/reconfirm`;
+      const results = await Promise.all([0, 1].map(index => post(index, p, reconfirmRoute, { reason: 'explicitly checked restored source', evidenceId: replacement.id })));
+      assert.deepEqual(results.map(r => r.statusCode).sort(), [200, 409]);
+      p = await stores[0]!.get(p.id);
+      assert.equal(p.facts[0]!.sourceReconfirmations!.length, 1); assert.equal(p.facts[0]!.confirmedAt, fact.confirmedAt);
+      assert.equal(p.facts[0]!.value, fact.value); assert.equal(p.facts[0]!.locked, true);
+      assert.equal(p.sections[0]!.freshness, 'stale'); assert.equal(p.storyboard!.freshness, 'stale');
+      assert.deepEqual(await write(p, reconfirmRoute, { reason: 'repeat restored source', evidenceId: replacement.id }), p);
+      const snapshot = await db.query<{ state: Project }>('SELECT state FROM project_revisions WHERE project_id=$1 AND revision=$2', [p.id, approvedSourceSnapshot.revision]);
+      assert.deepEqual(snapshot.rows[0]!.state, approvedSourceSnapshot);
+      p = await write(p, 'qa/preflight'); assert.equal(p.qa!.issueSeverity, 'blocker'); assert.equal(p.qa!.exportAllowed, false);
+    } finally { await Promise.all(apps.map(app => app.close())); await rm(directory, { recursive: true }); }
   });
 });
