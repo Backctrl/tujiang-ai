@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createElement, useRef } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { draftKey, useReviewedDraft } from '../../src/pages/ArcaneWarriorPage/project-drafts.js';
+import { draftKey, sameJsonValue, useReviewedDraft } from '../../src/pages/ArcaneWarriorPage/project-drafts.js';
 
 type IdentityBase = { revision: number; name: string };
 type DraftState<T, B> = ReturnType<typeof useReviewedDraft<T, B>>;
@@ -105,4 +105,21 @@ test('replacement confirmation preserves the dependency captured before an exter
   assert.deepEqual(replaced.originalBase, before, 'replacement must keep the basis shown when the correction was requested');
   assert.deepEqual(replaced.currentBase, after);
   assert.equal(replaced.needsReview, true, 'accepting replacement cannot acknowledge an unseen identity or fact change');
+}));
+
+test('reviewed JSON bases ignore nested object key order while preserving array order and changed values', () => withStorage(() => {
+  const before = { product: { name: 'Product', code: 'A' }, facts: [{ id: 'one', value: '1' }, { id: 'two', value: '2' }] };
+  const reordered = { facts: [{ value: '1', id: 'one' }, { value: '2', id: 'two' }], product: { code: 'A', name: 'Product' } };
+  assert.equal(sameJsonValue(before, reordered), true);
+  renderDraft('a', 'ordered-base', '', () => before, draft => draft.setValue('Local input'));
+  assert.equal(renderDraft('a', 'ordered-base', '', () => reordered).needsReview, false);
+  assert.equal(renderDraft('a', 'ordered-base', '', () => ({ ...reordered, facts: [...reordered.facts].reverse() })).needsReview, true);
+  assert.equal(renderDraft('a', 'ordered-base', '', () => ({ ...reordered, product: { ...reordered.product, code: 'B' } })).needsReview, true);
+}));
+
+test('a legacy JSON value identical to the server except for key ordering does not become an active draft', () => withStorage(values => {
+  values.set(draftKey('a', 'legacy-object'), JSON.stringify({ nested: { name: 'Product', code: 'A' } }));
+  const result = renderDraft('a', 'legacy-object', { nested: { code: 'A', name: 'Product' } }, () => ({ revision: 1 }));
+  assert.equal(result.active, false);
+  assert.equal(result.needsReview, false);
 }));
