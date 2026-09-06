@@ -1,4 +1,4 @@
-import { useProjectDraft } from './project-drafts'
+import { useProjectDraft, useReviewedDraft } from './project-drafts'
 import { useRef, useState } from 'react'
 import { ArrowLeft, ArrowRight, CheckCircle2, Circle, FileText, Info, Layers3, Lock, Plus, RefreshCw, ShieldCheck, Upload } from 'lucide-react'
 import type { StageId } from './domain'
@@ -11,7 +11,9 @@ const statusLabel: Record<Fact['status'], string> = { candidate: '待确认', co
 
 export function ProjectSetup({ session: s, onStage }: Props) {
   const [name, setName] = useState('')
-  const [productName, setProductName] = useProjectDraft<string | null>(s.project?.id, 'productName', null)
+  const identityDraft = useReviewedDraft<string | null, { revision: number; name: string }>(s.project?.id, 'productName', null, () => ({ revision: s.project?.identityRevision ?? 0, name: s.project?.identity?.productName ?? '未确认' }))
+  const productName = identityDraft.value
+  const setProductName = identityDraft.setValue
   const [documentName, setDocumentName] = useProjectDraft(s.project?.id, 'documentName', '')
   const [locator, setLocator] = useProjectDraft(s.project?.id, 'locator', '')
   const [text, setText] = useProjectDraft(s.project?.id, 'evidenceText', '')
@@ -47,7 +49,8 @@ export function ProjectSetup({ session: s, onStage }: Props) {
           <label>产品名称<input maxLength={150} disabled={!s.canWrite} value={identityValue} onChange={e => setProductName(e.target.value)} /></label><label>内部代号<input disabled value="" placeholder="后端尚未支持" /></label>
           <label>产品品类<select disabled><option>尚未接入</option></select></label><label>产品阶段<select disabled><option>尚未接入</option></select></label><label className="wide">一句话介绍<input disabled value="" placeholder="后端尚未支持" /></label>
           {s.project?.identity && <label className="wide">修改原因<textarea maxLength={1000} value={s.reason} onChange={e => s.setReason(e.target.value)} disabled={!s.canWrite} /></label>}
-          <Button tone="primary" disabled={!s.canWrite || !identityValue.trim() || (!!s.project?.identity && (!s.reasonValid || identityValue.trim() === s.project.identity.productName))} onClick={() => void s.write(s.project?.identity ? 'identity/correct' : 'identity/confirm', { productName: identityValue, ...(s.project?.identity ? { reason: s.reason } : {}) }, '产品身份已保存。', () => setProductName(null))}>{s.project?.identity ? '保存身份纠正' : '确认产品身份'}</Button>
+          {identityDraft.needsReview && <div className="wide inspector-block" role="alert"><b>身份草稿需要复核</b><p>草稿依据：{identityDraft.originalBase?.name ?? '旧草稿未记录身份版本'}；当前产品：{identityDraft.currentBase.name}。保留的输入为：{productName}</p><Button disabled={!s.canWrite} onClick={identityDraft.acknowledge}>已比较身份，保留草稿继续</Button><Button disabled={!s.canWrite} onClick={identityDraft.discard}>放弃身份草稿，使用当前身份</Button></div>}
+          <Button tone="primary" disabled={!s.canWrite || identityDraft.needsReview || !identityValue.trim() || (!!s.project?.identity && (!s.reasonValid || identityValue.trim() === s.project.identity.productName))} onClick={() => { if (identityDraft.needsReview) return; void s.write(s.project?.identity ? 'identity/correct' : 'identity/confirm', { productName: identityValue, ...(s.project?.identity ? { reason: s.reason } : {}) }, '产品身份已保存。', () => identityDraft.discard()) }}>{s.project?.identity ? '保存身份纠正' : '确认产品身份'}</Button>
         </div>
       </div>
       <div className="form-panel setup-section setup-sources" id="setup-1"><PanelTitle eyebrow="02 / SOURCE INTAKE" title="产品资料" action={<span className="hint">已保存 {sources.length} 份文字证据</span>} />
@@ -77,9 +80,11 @@ export function FactsStage({ session: s, onStage }: Props) {
   const [filter, setFilter] = useState('all')
   const [sourceFilter, setSourceFilter] = useState('')
   const [query, setQuery] = useState('')
-  const [draft, setDraft] = useProjectDraft<Candidate>(s.project?.id, 'factCandidate', emptyCandidate)
+  const candidateDraft = useReviewedDraft(s.project?.id, 'factCandidate', emptyCandidate, (value: Candidate) => ({ identityRevision: s.project?.identityRevision ?? 0, identityName: s.project?.identity?.productName ?? '未确认', correctedFact: s.project?.facts.find(f => f.id === value.correctsFactId) ?? null }))
+  const draft = candidateDraft.value
+  const setDraft = candidateDraft.setValue
   const [editing, setEditing] = useProjectDraft(s.project?.id, 'factEditing', false)
-  const [replacement, setReplacement] = useState<Candidate | null>(null)
+  const [replacement, setReplacement] = useState<ReturnType<typeof candidateDraft.prepareReplacement> | null>(null)
   const facts = s.project?.facts ?? []
   const sources = s.project?.evidence ?? []
   const selected = facts.find(f => f.id === selectedId)
@@ -93,8 +98,9 @@ export function FactsStage({ session: s, onStage }: Props) {
   const hasDraft = !!(draft.attribute || draft.value || draft.evidenceId || draft.quote || draft.correctsFactId || draft.role !== 'core')
   const edit = (f?: Fact) => {
     const next: Candidate = f ? { attribute: f.attribute, value: f.value, role: f.role, evidenceId: f.evidenceId, quote: f.quote, correctsFactId: f.id } : emptyCandidate
-    if (hasDraft) { setReplacement(next); return }
-    setDraft(next); setEditing(true)
+    const prepared = candidateDraft.prepareReplacement(next)
+    if (hasDraft) { setReplacement(prepared); return }
+    candidateDraft.replace(prepared); setEditing(true)
   }
   const review = (action: 'confirm' | 'reject' | 'retract') => { if (selected) void s.write(`facts/${selected.id}/${action}`, { reason: s.reason }, '人工审核已保存。') }
   return <div className="three-column facts-layout">
@@ -108,8 +114,9 @@ export function FactsStage({ session: s, onStage }: Props) {
       {selected ? <><div className="meta-grid"><span>事实 ID<b>{selected.id}</b></span><span>类型<b>{selected.role === 'core' ? '核心' : '辅助'}</b></span><span>置信度<b>后端未提供</b></span></div><div className="inspector-block"><label>事实断言</label><p className="assertion">{selected.value}</p></div><div className="inspector-block"><label>证据摘录</label><p>{selected.quote}</p><span className="source-link"><FileText size={14} />{sources.find(e => e.id === selected.evidenceId)?.documentName ?? '来源不可用'}</span></div></> : <p>选择事实查看证据，或补充人工候选。</p>}
       <Button disabled={!s.canWrite} onClick={() => edit()}>补充人工候选</Button>{selected && <Button disabled={!s.canWrite} onClick={() => edit(selected)}>纠错为新候选</Button>}
       {hasDraft && !editing && <Button onClick={() => setEditing(true)}>继续编辑候选</Button>}
-      {replacement && <div className="inspector-block" role="alert"><p>已有未保存候选。替换将放弃其内容。</p><Button disabled={!s.canWrite} onClick={() => { setDraft(replacement); setReplacement(null); setEditing(true) }}>放弃原草稿并替换</Button><Button onClick={() => { setReplacement(null); setEditing(true) }}>保留并继续编辑</Button></div>}
-      {editing && <div className="agent-draft"><b>人工候选草稿</b><div className="form-grid"><label className="wide">属性<input maxLength={100} value={draft.attribute} disabled={!s.canWrite} onChange={e => setDraft({ ...draft, attribute: e.target.value })} /></label><label className="wide">事实表述<textarea maxLength={1000} value={draft.value} disabled={!s.canWrite} onChange={e => setDraft({ ...draft, value: e.target.value })} /></label><label>角色<select value={draft.role} disabled={!s.canWrite} onChange={e => setDraft({ ...draft, role: e.target.value as Candidate['role'] })}><option value="core">核心</option><option value="supporting">辅助</option></select></label><label>来源<select value={draft.evidenceId} disabled={!s.canWrite} onChange={e => setDraft({ ...draft, evidenceId: e.target.value })}><option value="">选择来源</option>{sources.map(e => <option key={e.id} value={e.id}>{e.documentName}</option>)}</select></label><label className="wide">连续原文摘录<textarea maxLength={2000} value={draft.quote} disabled={!s.canWrite} onChange={e => setDraft({ ...draft, quote: e.target.value })} /></label></div><p className="hint">摘录必须与所选资料原文完全一致；纠错只创建候选，不自动撤回原事实。</p><Button tone="violet" disabled={!s.canWrite || !valid || !s.reasonValid} onClick={() => void s.write('facts/candidates', { ...draft, reason: s.reason }, '人工候选已保存，仍需明确确认。', next => { setSelectedId(next.facts.at(-1)?.id ?? ''); setEditing(false); setDraft(emptyCandidate); setReplacement(null) })}>保存候选</Button><Button onClick={() => setEditing(false)}>收起草稿</Button></div>}
+      {replacement && <div className="inspector-block" role="alert"><p>已有未保存候选。替换将放弃其内容。</p><Button disabled={!s.canWrite} onClick={() => { candidateDraft.replace(replacement); setReplacement(null); setEditing(true) }}>放弃原草稿并替换</Button><Button onClick={() => { setReplacement(null); setEditing(true) }}>保留并继续编辑</Button></div>}
+      {hasDraft && candidateDraft.needsReview && <div className="inspector-block" role="alert"><b>候选草稿需要复核</b><p>产品身份：{candidateDraft.originalBase?.identityName ?? '旧草稿未记录身份版本'} → {candidateDraft.currentBase.identityName}</p>{draft.correctsFactId && <><p>原纠错依据：{candidateDraft.originalBase?.correctedFact ? `${candidateDraft.originalBase.correctedFact.attribute}：${candidateDraft.originalBase.correctedFact.value}（${statusLabel[candidateDraft.originalBase.correctedFact.status]}）` : '未记录或不存在'}</p><p>当前事实：{candidateDraft.currentBase.correctedFact ? `${candidateDraft.currentBase.correctedFact.attribute}：${candidateDraft.currentBase.correctedFact.value}（${statusLabel[candidateDraft.currentBase.correctedFact.status]}）` : '已不存在'}</p></>}<Button disabled={!s.canWrite} onClick={candidateDraft.acknowledge}>已比较候选依据，保留草稿继续</Button><Button disabled={!s.canWrite} onClick={() => { candidateDraft.discard(); setEditing(false); setReplacement(null) }}>放弃候选草稿</Button></div>}
+      {editing && <div className="agent-draft"><b>人工候选草稿</b><div className="form-grid"><label className="wide">属性<input maxLength={100} value={draft.attribute} disabled={!s.canWrite} onChange={e => setDraft({ ...draft, attribute: e.target.value })} /></label><label className="wide">事实表述<textarea maxLength={1000} value={draft.value} disabled={!s.canWrite} onChange={e => setDraft({ ...draft, value: e.target.value })} /></label><label>角色<select value={draft.role} disabled={!s.canWrite} onChange={e => setDraft({ ...draft, role: e.target.value as Candidate['role'] })}><option value="core">核心</option><option value="supporting">辅助</option></select></label><label>来源<select value={draft.evidenceId} disabled={!s.canWrite} onChange={e => setDraft({ ...draft, evidenceId: e.target.value })}><option value="">选择来源</option>{sources.map(e => <option key={e.id} value={e.id}>{e.documentName}</option>)}</select></label><label className="wide">连续原文摘录<textarea maxLength={2000} value={draft.quote} disabled={!s.canWrite} onChange={e => setDraft({ ...draft, quote: e.target.value })} /></label></div><p className="hint">摘录必须与所选资料原文完全一致；纠错只创建候选，不自动撤回原事实。</p><Button tone="violet" disabled={!s.canWrite || candidateDraft.needsReview || !valid || !s.reasonValid} onClick={() => { if (candidateDraft.needsReview) return; void s.write('facts/candidates', { ...draft, reason: s.reason }, '人工候选已保存，仍需明确确认。', next => { setSelectedId(next.facts.at(-1)?.id ?? ''); setEditing(false); candidateDraft.discard(); setReplacement(null) }) }}>保存候选</Button><Button onClick={() => setEditing(false)}>收起草稿</Button></div>}
       <div className="inspector-block"><label>操作原因<textarea maxLength={1000} value={s.reason} disabled={!s.canWrite} onChange={e => s.setReason(e.target.value)} placeholder="说明确认、拒绝、撤回或补充的依据" /></label></div>
       {selected?.status === 'candidate' && <><Button tone="primary" className="full" disabled={!s.canWrite || !s.reasonValid || selected.issueSeverity === 'blocker'} onClick={() => review('confirm')}><Lock size={15} />确认事实</Button><Button disabled={!s.canWrite || !s.reasonValid} onClick={() => review('reject')}>拒绝候选</Button></>}{selected?.status === 'confirmed' && <Button disabled={!s.canWrite || !s.reasonValid} onClick={() => review('retract')}>撤回事实并标记影响</Button>}<p className="hint">候选需人工审核。正式事实基线批准尚未接入。</p>
     </aside>
