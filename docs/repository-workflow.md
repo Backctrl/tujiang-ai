@@ -33,7 +33,7 @@ GitHub Desktop 的 Repository → Show in Explorer 可以确认实际目录。�
 
 服务使用临时 PGlite 和合成 Worker，不加载 .env；关闭后不作为持久项目库。样例证据 `Capacity: 10 kg. Alternate: 20 kg.` 会产生待确认事实。真实数据库及网关配置见 backend/README.md，真实模型请求需单独授权。
 
-当前真实入口只覆盖项目、身份、文字证据、事实逐条审核、初步故事顺序及诊断预检。原 `/arcane-warrior` 为演示。正式章节制作、市场批准和文件导出尚未实现。
+当前真实入口覆盖项目、身份、文字证据、事实逐条审核、初步故事顺序、诊断章节稿编辑与历史恢复，以及诊断预检。原 `/arcane-warrior` 为演示。正式章节制作、市场批准和文件导出尚未实现。
 
 ## 历史验收资料
 

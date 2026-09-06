@@ -25,3 +25,9 @@
 .sa-shell summary { cursor: pointer; overflow-wrap: anywhere; }
 .sa-shell blockquote { border-left: 2px solid var(--yellow); padding-left: 14px; overflow-wrap: anywhere; }
 @media(max-width: 1100px) { .sa-shell .sa-columns { grid-template-columns: 200px minmax(320px, 1fr); } .sa-shell .sa-columns > aside:last-child { grid-column: 1 / -1; } }
+.sa-shell .sa-draft-history { max-height: 300px; overflow-y: auto; }
+.sa-shell .sa-draft-comparison { overflow-x: auto; margin: 16px 0; }
+.sa-shell .sa-draft-comparison table { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 12px; }
+.sa-shell .sa-draft-comparison th, .sa-shell .sa-draft-comparison td { padding: 10px; border: 1px solid var(--line); text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+.sa-shell .sa-draft-comparison caption { text-align: left; padding: 8px 0; }
+.sa-shell fieldset:disabled { opacity: 0.65; }

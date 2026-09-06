@@ -6,6 +6,7 @@ import { ApiError, errorMessage, StageAApi } from './stage-a-api'
 import type { Project, Fact, Storyboard } from './stage-a-api'
 import './arcane-warrior.css'
 import './stage-a.css'
+import SectionDraftEditor from './SectionDraftEditor'
 
 const stages = ['项目设置', '产品事实', '故事线', '章节制作', '市场适配', 'QA与导出']
 const factLabels = { candidate: '待确认', confirmed: '已确认', rejected: '已拒绝', retracted: '已撤回' }
@@ -58,6 +59,7 @@ export default function StageAWorkbench() {
     try {
       const next = await run(); accept(next); setNotice(label)
       if (write) { setPending(null); setConflict(false); setConflictBefore(null) }
+      return next
     } catch (err) {
       setError(errorMessage(err))
       if (err instanceof ApiError && (err.code === 'VERSION_CONFLICT' || err.code === 'REVISION_CONFLICT')) {
@@ -65,10 +67,10 @@ export default function StageAWorkbench() {
       } else if (err instanceof ApiError && err.status > 0 && err.code !== 'INVALID_RESPONSE') setPending(null)
     } finally { busyRef.current = false; setBusy(false) }
   }
-  const write = (path: string, fields: Record<string, unknown>, label: string) => {
+  const write = (path: string, fields: Record<string, unknown>, label: string, onSaved?: (next: Project) => void) => {
     if (!project || conflict || pending) return
     const key = crypto.randomUUID()
-    void perform(() => api.write(project, path, fields, key), label)
+    return perform(async () => { const next = await api.write(project, path, fields, key); onSaved?.(next); return next }, label)
   }
   const refresh = () => { if (pending && !project) return; void perform(() => api.get(project?.id ?? projectId.trim()), '已读取服务端当前快照；未保存的表单保留，请核对后提交。', false) }
   const disabled = busy || !token.trim() || conflict || !!pending
@@ -77,7 +79,6 @@ export default function StageAWorkbench() {
   const hasConflict = project?.facts.some(f => f.issueSeverity === 'blocker') ?? false
   const canPlan = canWrite && !!project?.identity && confirmed.some(f => f.role === 'core') && !hasConflict
   const selected = project?.facts.find(f => f.id === selectedFactId)
-  const currentSection = project?.sections.find(s => s.id === project.currentSectionId)
   const selectedEvidence = project?.evidence.find(e => e.id === evidenceId)
   const reasonValid = !!reason.trim() && reason.length <= 1000
   const updateChapter = (index: number, patch: Partial<Chapter>) => {
@@ -169,7 +170,7 @@ export default function StageAWorkbench() {
             <Action disabled={!canPlan || !reasonValid || !chapters.length || chapters.some(c => !c.purpose.trim() || !c.factIds.length || c.factIds.length > 20 || c.factIds.some(id => !confirmed.some(f => f.id === id)))} onClick={() => write('storyboard/draft', { chapters, reason }, '人工顺序已保存。旧章节草稿可能失效，请复核当前依赖。')}>保存人工顺序（保持草稿）</Action>
             <h2>候选顺序</h2>{project?.storyboardCandidates?.map((candidate, i) => <details key={candidate.id ?? i}><summary>{candidate.sourceRunId === 'human' ? '人工顺序历史' : '模型候选'} {i + 1} · {candidate.freshness}</summary><ol>{candidate.chapters.map((c, j) => <li key={j}>{roles[c.role]}：{c.purpose}（{c.factIds.join('、')}）</li>)}</ol><Action disabled={!canWrite || !reasonValid || !candidate.id || candidate.freshness !== 'current' || !project.sections.some(s => s.storyboardId === candidate.id && s.freshness === 'current')} onClick={() => write(`storyboard/candidates/${candidate.id}/apply`, { reason }, '已显式应用候选顺序及关联草稿。本地未保存编辑仍保留。')}>应用此候选，替换当前顺序和关联草稿</Action></details>)}
           </>}
-          {stage === 3 && <><p>阶段 A 仅提供诊断性 Section 草稿；HTML画布、SectionSpec、素材、Layout、设计批准与渲染属于待接入能力。</p><p>当前选择：{project?.currentSectionId ?? '未选择'}。不会用数组最后一项代替当前选择。</p>{currentSection && <pre>{JSON.stringify(currentSection, null, 2)}</pre>}<Action disabled onClick={() => {}}>确认本章设计（尚未实现）</Action></>}
+          <div hidden={stage !== 3}><SectionDraftEditor key={project?.id ?? 'disconnected'} project={project} canWrite={canWrite} busy={busy} reasonValid={reasonValid} reason={reason} write={write} onStory={() => setStage(2)} /></div>
           {stage === 4 && <><p>市场版本、RulePack、翻译、CanvasProfile覆盖和逐章批准尚未实现。当前没有可提交的真实市场版本。</p><Action disabled onClick={() => {}}>生成市场适配（尚未实现）</Action></>}
           {stage === 5 && <><p>阶段 A 只做诊断预检；不会生成文件或批准交付。预检通过也不代表可导出。</p><Action disabled={!canWrite} onClick={() => write('qa/preflight', {}, '预检已完成。请查看问题与未检查范围。')}>运行阶段 A 预检</Action>{project?.qa && <pre>{JSON.stringify(project.qa, null, 2)}</pre>}<Action disabled onClick={() => {}}>批准并下载（尚未实现）</Action></>}
         </section>
