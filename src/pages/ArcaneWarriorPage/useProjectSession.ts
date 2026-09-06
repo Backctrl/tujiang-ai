@@ -1,10 +1,15 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { readProjectEvents } from './project-events.js'
 import { readDraft, draftKey } from './project-drafts.js'
 import { useProjectSnapshot } from './useProjectSnapshot.js'
 import { ApiError, errorMessage, StageAApi } from './stage-a-api.js'
 import type { Project, ProjectSummary } from './stage-a-api.js'
 import type { RulePack } from '../../../backend/src/production-context.js'
+import type { Material } from '../../../backend/src/production-materials.js'
+import { executeMaterialOperation, prepareMaterialRetry, prepareMaterialUpload, verifyOriginal, type MaterialWriteOutcome } from './material-intake.js'
+import { materialIntakeStorage, type MaterialLocalEntry, type MaterialOperation } from './material-storage.js'
+
+type SessionPending = { kind: 'standard'; run: () => Promise<Project>; label: string } | { kind: 'material'; operation: MaterialOperation; label: string }
 
 const projectStorageKey = 'tujiang_stage_a_project_id'
 function previousProjectId() {
@@ -23,7 +28,9 @@ export function useProjectSession() {
   const [projectId, setProjectId] = useState(previousProjectId)
   const [token, updateToken] = useState('')
   const tokenRef = useRef('')
-  const [authExpired, setAuthExpired] = useState(false)
+  const [authExpired, updateAuthExpired] = useState(false)
+  const authExpiredRef = useRef(false)
+  const setAuthExpired = useCallback((value: boolean) => { authExpiredRef.current = value; updateAuthExpired(value) }, [])
   const setToken = (value: string) => { tokenRef.current = value; updateToken(value) }
   const [busy, setBusy] = useState(false)
   const busyRef = useRef(false)
@@ -35,20 +42,52 @@ export function useProjectSession() {
     if (currentId.current) try { localStorage.setItem(draftKey(currentId.current, 'reason'), JSON.stringify(value)) } catch { /* Optional draft persistence. */ }
   }
   const [runConsent, setRunConsent] = useState(false)
-  const [pending, setPending] = useState<null | { run: () => Promise<Project>; label: string }>(null)
-  const [conflictBefore, setConflictBefore] = useState<Project | null>(null)
+  const [pending, updatePending] = useState<SessionPending | null>(null)
+  const pendingRef = useRef<SessionPending | null>(null)
+  const setPending = useCallback((value: SessionPending | null) => { pendingRef.current = value; updatePending(value) }, [])
+  const [conflictBefore, updateConflictBefore] = useState<Project | null>(null)
+  const conflictRef = useRef<Project | null>(null)
+  const setConflictBefore = useCallback((value: Project | null) => { conflictRef.current = value; updateConflictBefore(value) }, [])
+  const [recoveryLoading, setRecoveryLoading] = useState(true)
+  const [recoveryError, setRecoveryError] = useState('')
+  const [recoveryRequest, setRecoveryRequest] = useState(0)
+  const recoveryReady = useRef(false)
+  const [recoveryNeedsCheck, updateRecoveryNeedsCheck] = useState(false)
+  const recoveryCheckRef = useRef(false)
+  const setRecoveryNeedsCheck = useCallback((value: boolean) => { recoveryCheckRef.current = value; updateRecoveryNeedsCheck(value) }, [])
+  const [materialActivity, setMaterialActivity] = useState<{ entryId?: string; phase: 'reading' | 'sending' } | null>(null)
   const api = () => new StageAApi(tokenRef.current)
-  const accept = (next: Project) => {
+  const accept = useCallback((next: Project) => {
     if (currentId.current !== next.id) { updateReason(readDraft(next.id, 'reason', '')); setRunConsent(false) }
     currentId.current = next.id
     receiveSnapshot(next)
     setProjectId(next.id)
     try { localStorage.setItem(projectStorageKey, next.id) } catch { /* Persistence is optional; the server snapshot remains authoritative. */ }
-  }
+  }, [receiveSnapshot])
+  useEffect(() => {
+    let disposed = false
+    recoveryReady.current = false; setRecoveryLoading(true); setRecoveryError('')
+    void materialIntakeStorage.readPending().then(operation => {
+      if (disposed) return
+      if (operation) {
+        accept(operation.before)
+        setPending({ kind: 'material', operation, label: operation.label })
+        setRecoveryNeedsCheck(true)
+        setNotice('已恢复一份结果未确认的材料请求。请输入凭据并读取最新项目核对，再使用原操作重试；不会自动上传。')
+      }
+      recoveryReady.current = true
+    }).catch(err => {
+      if (!disposed) setRecoveryError(errorMessage(err instanceof ApiError ? err : new ApiError('LOCAL_RECOVERY_READ_FAILED', 0)))
+    }).finally(() => { if (!disposed) setRecoveryLoading(false) })
+    return () => { disposed = true }
+  }, [recoveryRequest, accept, setPending, setRecoveryNeedsCheck])
+  const reloadMaterialRecovery = () => { if (!busyRef.current) setRecoveryRequest(value => value + 1) }
+  const canSwitchNow = () => recoveryReady.current && !busyRef.current && !pendingRef.current && !conflictRef.current
+  const canWriteNow = () => canSwitchNow() && !!getLatestProject() && !!tokenRef.current.trim() && !authExpiredRef.current
   const perform = async (run: () => Promise<Project>, label: string, isWrite = true) => {
     if (busyRef.current) return
     busyRef.current = true; setBusy(true); setError(''); setNotice('')
-    if (isWrite) setPending({ run, label })
+    if (isWrite) setPending({ kind: 'standard', run, label })
     try {
       const next = await run()
       accept(next); setNotice(label); setAuthExpired(false)
@@ -62,17 +101,17 @@ export function useProjectSession() {
       } else if (isWrite && err instanceof ApiError && err.status >= 400 && err.status < 500 && err.status !== 401 && err.code !== 'INVALID_RESPONSE') setPending(null)
     } finally { busyRef.current = false; setBusy(false) }
   }
-  const canWrite = !!project && !!token.trim() && !busy && !pending && !conflictBefore && !authExpired
-  const canSwitch = !busy && !pending && !conflictBefore
+  const canWrite = !!project && !!token.trim() && !busy && !pending && !conflictBefore && !authExpired && !recoveryLoading && !recoveryError
+  const canSwitch = !busy && !pending && !conflictBefore && !recoveryLoading && !recoveryError
   const listProjects = async () => {
-    if (!token.trim() || busyRef.current || pending) return
+    if (!tokenRef.current.trim() || !canSwitchNow()) return
     busyRef.current = true; setBusy(true); setError('')
     try { setProjects(await api().list()); setAuthExpired(false); setNotice('项目列表已更新，选择项目继续。') }
     catch (err) { setError(errorMessage(err)); if (err instanceof ApiError && err.status === 401) { setAuthExpired(true); setRunConsent(false) } }
     finally { busyRef.current = false; setBusy(false) }
   }
   const selectProject = async (id: string) => {
-    if (!canSwitch || busyRef.current || !token.trim() || !id) return
+    if (!canSwitchNow() || !tokenRef.current.trim() || !id) return
     await perform(() => api().get(id), '已打开项目，恢复该项目的本地草稿。', false)
   }
   useEffect(() => {
@@ -88,7 +127,7 @@ export function useProjectSession() {
       if (err instanceof ApiError && err.status === 401) { setAuthExpired(true); setRunConsent(false); setError(errorMessage(err)) }
     }).finally(() => { if (!disposed) setCatalogLoading(false) })
     return () => { disposed = true }
-  }, [project?.id, token, authExpired, catalogRequest])
+  }, [project?.id, token, authExpired, catalogRequest, setAuthExpired])
   const reloadCatalog = () => { if (!catalogLoading && token.trim() && !authExpired) setCatalogRequest(value => value + 1) }
   useEffect(() => {
     const id = project?.id
@@ -126,9 +165,9 @@ export function useProjectSession() {
     }
     void connect()
     return () => { disposed = true; controller.abort(); clearTimeout(timer); clearTimeout(snapshotTimer) }
-  }, [project?.id, token, authExpired, receiveSnapshot])
+  }, [project?.id, token, authExpired, receiveSnapshot, setAuthExpired])
   const write = (path: string, body: Record<string, unknown>, label: string, onSaved?: (next: Project) => void) => {
-    if (!project || !canWrite || busyRef.current) return
+    if (!project || !canWriteNow() || getLatestProject()?.id !== project.id) return
     const key = crypto.randomUUID()
     return perform(async () => {
       const next = await api().write(project, path, body, key)
@@ -138,19 +177,75 @@ export function useProjectSession() {
     }, label)
   }
   const create = (name: string) => {
-    if (!token.trim() || pending || conflictBefore || busyRef.current || !name.trim()) return
+    if (!tokenRef.current.trim() || !canSwitchNow() || !name.trim()) return
     const key = crypto.randomUUID()
     setRunConsent(false)
     return perform(() => api().create(name.trim(), key), '项目已创建，请确认产品身份并添加资料。')
   }
-  const refresh = () => {
+  const refresh = async () => {
     const id = project?.id ?? projectId.trim()
     if (!token.trim() || !id || (pending && !project) || busyRef.current) return
-    return perform(() => api().get(id), '已读取最新服务端数据。未保存修改仍保留。', false)
+    const next = await perform(() => api().get(id), '已读取最新服务端数据。未保存修改仍保留。', false)
+    if (next && pendingRef.current?.kind === 'material' && pendingRef.current.operation.before.id === next.id) setRecoveryNeedsCheck(false)
+    return next
   }
-  const retry = () => { if (pending) return perform(pending.run, pending.label) }
+  const materialAttempt = async (prepare: () => MaterialOperation | Promise<MaterialOperation>, replay = false, entryId?: string): Promise<MaterialWriteOutcome> => {
+    if (busyRef.current) return { kind: 'blocked' }
+    busyRef.current = true; setBusy(true); setError(''); setNotice(''); setMaterialActivity({ entryId, phase: 'reading' })
+    try {
+      const operation = await prepare()
+      setMaterialActivity({ entryId: operation.entryId, phase: 'sending' })
+      setPending({ kind: 'material', operation, label: operation.label })
+      const outcome = await executeMaterialOperation(operation, api(), materialIntakeStorage, next => receiveSnapshot(next, operation.before.id), replay,
+        rebased => { setPending({ kind: 'material', operation: rebased, label: rebased.label }); setNotice('已同步后台解析进度，正在继续上传此文件（自动更新 1 / 1 次）。') })
+      if (outcome.kind === 'saved') {
+        accept(outcome.project); setPending(null); setConflictBefore(null); setAuthExpired(false)
+        setNotice(`${outcome.operation.parseProgressRebases ? '已同步后台解析进度。' : ''}${operation.label}`); setRecoveryNeedsCheck(false)
+      } else if (outcome.kind !== 'blocked') {
+        setError(errorMessage(outcome.error)); setNotice('')
+        if (outcome.kind === 'uncertain' && outcome.operation) setPending({ kind: 'material', operation: outcome.operation, label: outcome.operation.label })
+        if (outcome.error instanceof ApiError && outcome.error.status === 401) { setAuthExpired(true); setRunConsent(false) }
+        if (outcome.kind === 'conflict') setConflictBefore(outcome.operation?.before ?? operation.before)
+        if (outcome.kind !== 'uncertain') { setPending(null); setRecoveryNeedsCheck(false) }
+      }
+      return outcome
+    } catch (err) {
+      // Preparation failed before HTTP; the original remains in the local queue.
+      setError(errorMessage(err)); return { kind: 'rejected', error: err }
+    } finally { busyRef.current = false; setBusy(false); setMaterialActivity(null) }
+  }
+  const uploadMaterial = (entry: MaterialLocalEntry): Promise<MaterialWriteOutcome> => {
+    if (!canWriteNow() || getLatestProject()?.id !== entry.projectId) return Promise.resolve({ kind: 'blocked' })
+    return materialAttempt(() => prepareMaterialUpload(entry, getLatestProject), false, entry.id)
+  }
+  const retryMaterialParse = (materialId: string): Promise<MaterialWriteOutcome> => {
+    const before = getLatestProject()
+    if (!before || !canWriteNow()) return Promise.resolve({ kind: 'blocked' })
+    return materialAttempt(() => prepareMaterialRetry(before, materialId))
+  }
+  const canRetry = !!pending && !!token.trim() && !busy && !(pending.kind === 'material' && recoveryNeedsCheck)
+  const retry = () => {
+    const current = pendingRef.current
+    if (!current || busyRef.current || !tokenRef.current.trim()) return
+    if (current.kind === 'material') {
+      if (recoveryCheckRef.current) return
+      return materialAttempt(() => current.operation, true, current.operation.entryId)
+    }
+    return perform(current.run, current.label)
+  }
+  const originalMaterial = async (material: Material) => {
+    if (!project || !tokenRef.current.trim()) throw new ApiError('UNAUTHORIZED', 401)
+    try {
+      const blob = await api().original(project.id, material.id)
+      await verifyOriginal(blob, material)
+      return blob
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) { setAuthExpired(true); setRunConsent(false); setError(errorMessage(err)) }
+      throw err
+    }
+  }
   const resolveConflict = () => {
-    if (busy || !project || !conflictBefore || project.revision <= conflictBefore.revision) return
+    if (busyRef.current || !project || !conflictRef.current || project.revision <= conflictRef.current.revision) return
     setConflictBefore(null); setError(''); setNotice('差异已复核。请检查保留的修改，再重新提交。')
   }
   const confirmed = project?.facts.filter(f => f.status === 'confirmed') ?? []
@@ -158,7 +253,8 @@ export function useProjectSession() {
   const canPlan = canWrite && !!project?.identity && confirmed.some(f => f.role === 'core') && !hasConflict
   return { project, getLatestProject, projectId, setProjectId, token, setToken, authExpired, busy, error, notice, pending, conflictBefore, projects, listProjects, selectProject, canSwitch, eventsStatus,
     catalog, catalogLoading, catalogError, reloadCatalog,
-    canWrite, write, create, refresh, retry, resolveConflict, confirmed, hasConflict, canPlan,
+    canWrite, write, create, refresh, retry, canRetry, resolveConflict, confirmed, hasConflict, canPlan,
+    recoveryLoading, recoveryError, reloadMaterialRecovery, recoveryNeedsCheck, materialActivity, uploadMaterial, retryMaterialParse, originalMaterial,
     reason, setReason, reasonValid: !!reason.trim() && reason.length <= 1000, runConsent, setRunConsent }
 }
 

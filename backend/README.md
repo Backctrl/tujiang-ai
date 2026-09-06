@@ -6,7 +6,7 @@
 
 M2 范围规则扩展区分官方内容/模块/图片槽/文本字段约束与员工本地画布策略，保留旧快照和哈希。新模型、只读规则输入检查及未知规则恢复见 [范围规则契约](SCOPED-RULES.md)。默认规则目录仍空；淘宝缺已核验规则时不能正式启用目标。
 
-M2 资料底座支持 TXT/Markdown/CSV/JSON/PNG/JPEG/WebP 原件接收、认证下载、持久解析任务及待审核候选。原件和解析输出可追溯，图片未执行 OCR，用途审核和候选进入正式事实/素材库的入口在后续子包接入。接口、限制与恢复见 [资料接收契约](MATERIAL-INGESTION.md)。
+M2 资料底座支持 TXT/Markdown/CSV/JSON/PNG/JPEG/WebP 原件接收、认证下载、持久解析任务及待审核候选。员工在事实待处理中心逐块确认用途，服务端派生可追溯的 Evidence、Asset 或 Reference。用途纠正保留旧来源和锁定事实，并要求受影响事实明确重确认；图片未执行 OCR。原件接口、限制与恢复见 [资料接收契约](MATERIAL-INGESTION.md)，用途接口与来源闸门见 [资料用途契约](MATERIAL-USAGE.md)。
 
 ## 基线与工程选择
 
@@ -116,7 +116,7 @@ npm run verify:local-runtime -- --restart
 ### 阶段 A 操作顺序
 
 1. 创建项目；项目名称属于背景，不自动成为产品事实。
-2. 上传规格书已提取文本，并填写 documentName、locator 和 usage。locator 是人工给出的页码／段落位置，不代表系统已验证 PDF 页码。当前不接收参考资料、用途待定资料或二进制文件。
+2. 员工独立补充原文时填写 documentName、locator 和 usage；locator 是人工给出的位置，不代表系统已验证 PDF 页码。原件上传使用 M2 资料接口，解析后按块明确用途；只有当前用途为产品证据的文本块能进入下游。
 3. 创建 `extract-facts` 运行。候选包含 core/supporting 分类、原文引用及字符区间；模型不能自动确认。空结果不会放行下一步。
 4. 人工核对候选值与证据，逐条 confirm；遇到同属性不同值，先明确 reject 错误候选或 retract 原事实，再确认正确值。自动冲突检查基于规范化属性文本，不承诺识别所有语义同义项。
 5. 人工执行 identity/confirm。产品身份来自员工明确回答，记录操作者与时间。
@@ -176,7 +176,7 @@ npm run evaluate:offline -- evaluation/fixtures/synthetic-extraction.json evalua
 当前工程刻意限于本地阶段 A 基础，仍需后续完成：
 
 - 实际 OpenRouter 模型及真实黄金样本的集成验证（PostgreSQL 本地集成已验证）。
-- PDF/OCR／文件解析、完整 FactCandidate 元数据、资料用途变更、父子章节与必须讲／不要讲偏好。
+- PDF/Office 扩展与 OCR、完整 FactCandidate 元数据、父子章节与必须讲／不要讲偏好。
 - 云对象存储、独立 Worker 部署、生产鉴权、备份与容量治理。当前 JSONB 聚合、完整快照及回执未设归档，适合小规模验证。
 - 阶段 B 的 SectionSpec 人工批准、HTML Renderer、一个市场的适配、文件级 QA 与正式导出。
 

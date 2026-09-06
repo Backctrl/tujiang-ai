@@ -12,6 +12,8 @@ import { materialUploadSchema, uploadLimitDetails } from './production-materials
 import { MATERIAL_UPLOAD_PATH, registerMaterialRoutes } from './material-routes.js';
 import { registerProductionRuleRoutes } from './production-rule-routes.js';
 import { ruleCheckSchema, scopedRulePackSchema } from './production-rules.js';
+import { registerMaterialUsageRoutes } from './material-usage-routes.js';
+import { materialUsageSchema, factSourceReconfirmSchema } from './production-material-usage.js';
 
 const projectParams = z.object({ id: z.string().uuid() });
 const factParams = projectParams.extend({ factId: z.string().uuid(), action: z.enum(['confirm', 'reject', 'retract']) });
@@ -39,7 +41,7 @@ export function buildApp(store: Store, objects: LocalObjects, options: { token: 
   app.get('/ready', async () => { await store.db.query('SELECT 1'); return { status: 'ready' }; });
   app.get('/api/contracts', async () => ({ version: CONTRACT_VERSION,
     productionVersion: PRODUCTION_CONTRACT_VERSION,
-    requests: Object.fromEntries(Object.entries({ productionRuleCheck: ruleCheckSchema, materialUpload: materialUploadSchema, materialParseRetry: writeSchema.strict(), productionContextDraft: contextWriteSchema, productionContextActivate: writeSchema.strict(), productionInitialize: writeSchema.strict(), create: createSchema, identity: identitySchema, evidence: evidenceSchema,
+    requests: Object.fromEntries(Object.entries({ productionRuleCheck: ruleCheckSchema, materialUsage: materialUsageSchema, factSourceReconfirm: factSourceReconfirmSchema, materialUpload: materialUploadSchema, materialParseRetry: writeSchema.strict(), productionContextDraft: contextWriteSchema, productionContextActivate: writeSchema.strict(), productionInitialize: writeSchema.strict(), create: createSchema, identity: identitySchema, evidence: evidenceSchema,
       factReview: reasonSchema, factCandidate: candidateSchema, identityCorrection: identityCorrectionSchema,
       storyboardEdit: storyboardEditSchema, sectionEdit: sectionEditSchema, candidateApply: reasonSchema, sectionSelect: reasonSchema,
       run: runSchema, write: writeSchema.strict() }).map(([name, schema]) => [name, z.toJSONSchema(schema)])),
@@ -54,6 +56,7 @@ export function buildApp(store: Store, objects: LocalObjects, options: { token: 
   app.get('/api/projects', async () => ({ projects: await store.list() }));
   registerMaterialRoutes(app, store, objects, options.actor);
   registerProductionRuleRoutes(app, store);
+  registerMaterialUsageRoutes(app, store, objects, options.actor);
   app.get('/api/production/catalog', async () => ({ contractVersion: PRODUCTION_CONTRACT_VERSION, ...productionCatalog }));
   app.post('/api/projects/:id/production/context/draft', async request => {
     const { id } = projectParams.parse(request.params);
@@ -129,10 +132,10 @@ export function buildApp(store: Store, objects: LocalObjects, options: { token: 
     const { id } = projectParams.parse(request.params);
     const body = evidenceSchema.parse(request.body);
     return store.command(id, body, 'evidence.added', options.actor, async p => {
-      if (p!.evidence.length >= 10) throw new AppError('EVIDENCE_LIMIT', 409);
+      if (p!.evidence.filter(e => !e.materialSource).length >= 10) throw new AppError('EVIDENCE_LIMIT', 409);
       const artifact = await objects.put(body.text);
       p!.evidence.push({ id: randomUUID(), documentName: body.documentName, locator: body.locator, text: body.text,
-        usage: body.usage, ...artifact, createdBy: options.actor });
+        usage: body.usage, ...artifact, createdBy: options.actor, createdAt: new Date().toISOString(), origin: 'manual_entry' });
       return p!;
     });
   });
