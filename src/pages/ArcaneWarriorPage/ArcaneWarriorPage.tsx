@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { projectDifferences } from './project-diff'
 import { ArrowLeft, ArrowRight, ChevronDown, Clock3, RefreshCw } from 'lucide-react'
 import { BrandMark, Button, StatusDot } from './WorkbenchUI'
 import { useProjectSession } from './useProjectSession'
@@ -32,7 +33,7 @@ export default function ArcaneWarriorPage() {
       <div className="context-item"><span>市场</span><strong>尚未配置</strong></div>
       <div className="context-item"><span>服务端快照</span><strong>{project ? `R${project.revision}` : '尚未读取'}</strong></div>
       <div className="topbar-spacer" />
-      <div className="sync-state">{session.busy ? '正在请求' : session.pending ? '结果待核对' : '修改需明确保存'}</div>
+      <div className="sync-state" role="status">{session.busy ? '正在请求' : session.pending ? '结果待核对' : session.eventsStatus}</div>
       <Button onClick={() => setStage('setup')}>{session.authExpired ? '更新连接凭据' : '项目设置'}</Button>
       <button type="button" className="icon-button" aria-label="刷新项目" disabled={!project || session.busy} onClick={() => void session.refresh()}><RefreshCw size={16} /></button>
     </header>
@@ -42,7 +43,7 @@ export default function ArcaneWarriorPage() {
         {session.error && <p role="alert">{session.error}</p>}
         {session.notice && <p role="status">{session.notice}</p>}
         {session.pending && !session.busy && <div className="connection-actions"><span>请求结果尚未确认，新的写入已暂停。</span><Button disabled={!project} onClick={() => void session.refresh()}>读取最新项目核对</Button><Button disabled={!session.token.trim()} onClick={() => void session.retry()}>使用原操作编号重试</Button></div>}
-        {conflictBefore && <div><p>版本冲突，本地修改已保留。读取最新项目并复核后恢复提交。</p><div className="connection-actions"><Button disabled={session.busy} onClick={() => void session.refresh()}>读取最新版本</Button><Button disabled={session.busy || !project || project.revision <= conflictBefore.revision} onClick={session.resolveConflict}>已复核差异，恢复提交</Button></div><details><summary>比较提交前与最新快照</summary><div className="snapshot-comparison"><pre>{JSON.stringify(conflictBefore, null, 2)}</pre><pre>{JSON.stringify(project, null, 2)}</pre></div></details></div>}
+        {conflictBefore && <div><p>版本冲突，本地修改已保留。读取最新项目并复核后恢复提交。</p><div className="connection-actions"><Button disabled={session.busy} onClick={() => void session.refresh()}>读取最新版本</Button><Button disabled={session.busy || !project || project.revision <= conflictBefore.revision} onClick={session.resolveConflict}>已复核差异，恢复提交</Button></div><ul>{project && projectDifferences(conflictBefore, project).map((change, index) => <li key={index}>{change}</li>)}</ul><details><summary>查看原始快照</summary><div className="snapshot-comparison"><pre>{JSON.stringify(conflictBefore, null, 2)}</pre><pre>{JSON.stringify(project, null, 2)}</pre></div></details></div>}
       </div>}
       <div className="stage-surfaces" key={project?.id ?? 'disconnected'}>{components.map((Component, i) => <div className="stage-surface" hidden={stageIndex !== i} key={stages[i].id} aria-label={stages[i].label}><Component session={session} onStage={setStage} /></div>)}</div>
     </main>
