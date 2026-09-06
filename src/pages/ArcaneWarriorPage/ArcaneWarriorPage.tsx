@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import { NavLink } from 'react-router-dom'
 import arcaneWarriorLogo from '@shared/static/images/arcane-warrior-brand-source.png'
 import './arcane-warrior.css'
 import {
@@ -204,7 +205,7 @@ function ArcaneWarriorPage() {
         <div className="context-item"><span>市场</span><strong>DE / AMAZON</strong></div>
         <div className="context-item"><span>工作副本</span><strong>R-013</strong></div>
         <div className="topbar-spacer" />
-        <div className="sync-state"><StatusDot tone="green" /> 数据已同步</div>
+        <div className="sync-state">模拟交互演示 · <NavLink to="/arcane-warrior/stage-a">进入阶段 A 真实联调</NavLink></div>
         <div className="autosave">自动保存 {audit[0]?.time}</div>
         <button className="icon-button" aria-label="更多操作"><MoreHorizontal size={18} /></button>
       </header>
