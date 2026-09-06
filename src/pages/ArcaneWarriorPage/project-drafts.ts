@@ -1,5 +1,16 @@
 import { useState } from 'react'
 
+function comparableJson(value: unknown) {
+  return JSON.stringify(value, (_key, nested: unknown) => {
+    if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
+      return Object.fromEntries(Object.entries(nested).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0))
+    }
+    return nested
+  })
+}
+// Storage and HTTP responses may order object keys differently. Array order remains meaningful.
+export function sameJsonValue(left: unknown, right: unknown) { return comparableJson(left) === comparableJson(right) }
+
 export function draftKey(projectId: string, field: string) { return `tujiang_draft_v1:${projectId}:${field}` }
 export function readDraft<T>(projectId: string | undefined, field: string, fallback: T): T {
   if (!projectId) return fallback
@@ -21,11 +32,11 @@ export function useProjectDraft<T>(projectId: string | undefined, field: string,
 export function useReviewedDraft<T, B>(projectId: string | undefined, field: string, fallback: T, baseFor: (value: T) => B) {
   const legacy = readDraft<T | undefined>(projectId, field, undefined)
   const [stored, store] = useProjectDraft<{ value: T; base: B | null; active: boolean }>(projectId, `${field}:reviewed`, {
-    value: legacy === undefined ? fallback : legacy, base: null, active: legacy !== undefined && JSON.stringify(legacy) !== JSON.stringify(fallback),
+    value: legacy === undefined ? fallback : legacy, base: null, active: legacy !== undefined && !sameJsonValue(legacy, fallback),
   })
   const currentBase = baseFor(stored.value)
   // A legacy draft has no dependency snapshot. Never silently bind it to the latest project.
-  const needsReview = stored.active && (stored.base === null || JSON.stringify(stored.base) !== JSON.stringify(currentBase))
+  const needsReview = stored.active && (stored.base === null || !sameJsonValue(stored.base, currentBase))
   // Further edits keep the original dependency until the user reviews or replaces the draft.
   const setValue = (value: T) => store(previous => ({ value, base: previous.active ? previous.base : baseFor(value), active: true }))
   // Capture before opening a replacement confirmation; accepting later must not rebase silently.
@@ -33,5 +44,5 @@ export function useReviewedDraft<T, B>(projectId: string | undefined, field: str
   const replace = (prepared: ReturnType<typeof prepareReplacement>) => store({ ...prepared, active: true })
   const discard = () => store({ value: fallback, base: null, active: false })
   const acknowledge = () => store(previous => ({ ...previous, base: baseFor(previous.value) }))
-  return { value: stored.value, setValue, prepareReplacement, replace, discard, acknowledge, needsReview, originalBase: stored.base, currentBase }
+  return { value: stored.value, active: stored.active, setValue, prepareReplacement, replace, discard, acknowledge, needsReview, originalBase: stored.base, currentBase }
 }
