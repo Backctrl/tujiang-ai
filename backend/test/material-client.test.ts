@@ -11,6 +11,8 @@ import { compileMaterialSource, emptyMaterialSource, executeMaterialOperation, f
   prepareMaterialRetry, prepareMaterialUpload, receivedMaterial, safeSourceUrl, verifyOriginal } from '../../src/pages/ArcaneWarriorPage/material-intake.js';
 import { validateMaterialOperation, type MaterialIntakeStorage, type MaterialLocalEntry, type MaterialOperation } from '../../src/pages/ArcaneWarriorPage/material-storage.js';
 import { useProjectSnapshot } from '../../src/pages/ArcaneWarriorPage/useProjectSnapshot.js';
+import { useProjectSession } from '../../src/pages/ArcaneWarriorPage/useProjectSession.js';
+import { useMaterialIntake } from '../../src/pages/ArcaneWarriorPage/useMaterialIntake.js';
 
 // Deterministic persistence fault injection for the actual write executor. IndexedDB and UI
 // interaction still require the separate real-browser acceptance; this is not a browser claim.
@@ -47,6 +49,34 @@ function entry(project: Project, fileName: string, bytes: Uint8Array | string, m
   const file = new File([content], fileName, { type: mimeType });
   return { id: crypto.randomUUID(), projectId: project.id, fileName, mimeType, sizeBytes: file.size, file, source, status: 'waiting', addedAt: new Date().toISOString() };
 }
+
+test('the actual session and material hooks render a disconnected first screen with no selection errors, including reload before a saved project is read', () => {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  try {
+    for (const savedProjectId of ['', crypto.randomUUID()]) {
+      Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: {
+        getItem: (key: string) => key === 'tujiang_stage_a_project_id' ? savedProjectId : null,
+      } });
+      function InitialScreen() {
+        const session = useProjectSession();
+        const intake = useMaterialIntake(session);
+        assert.equal(session.project, null);
+        assert.equal(session.projectId, savedProjectId);
+        assert.equal(session.canWrite, false);
+        assert.equal(intake.canSelect, false);
+        assert.equal(intake.running, false);
+        assert.deepEqual(intake.selectionErrors, []);
+        assert.deepEqual(intake.entries, []);
+        assert.deepEqual(intake.materials, []);
+        return createElement('p', null, '尚未连接项目');
+      }
+      assert.equal(renderToStaticMarkup(createElement(InitialScreen)), '<p>尚未连接项目</p>');
+    }
+  } finally {
+    if (previous) Object.defineProperty(globalThis, 'localStorage', previous);
+    else Reflect.deleteProperty(globalThis, 'localStorage');
+  }
+});
 
 test('browser File bytes become standard Base64 without text decoding, and source fields remain optional except an export URL', async () => {
   const bytes = Uint8Array.from({ length: 100_000 }, (_, index) => index % 256);

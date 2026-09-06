@@ -115,7 +115,7 @@ export function useMaterialIntake(session: ProjectSession) {
     setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
   return { entries: localEntries, materials, initialized, canSelect, adding, loading, error,
-    selectionErrors: selectionErrors?.projectId === projectId ? selectionErrors.messages : [], addFiles, start,
+    selectionErrors: selectionErrors && selectionErrors.projectId === projectId ? selectionErrors.messages : [], addFiles, start,
     retryLocal, remove, reload, running: runningProject === projectId && !!projectId, pause: () => setRunningProject(null), download }
 }
 export type MaterialIntakeController = ReturnType<typeof useMaterialIntake>
