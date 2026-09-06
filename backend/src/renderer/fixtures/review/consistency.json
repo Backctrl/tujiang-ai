@@ -1,0 +1,66 @@
+{
+  "purpose": "review-sample",
+  "passes": 3,
+  "inputHash": "6767200ab9c0d87c08d0b2f0dff3ac117ec454399bd786ca6ea3c9c85cc781df",
+  "htmlHash": "80ecd3f2f3f36c0bd6e42e06190b84537e15e4fb42de870f6c5c78ef24dcee4c",
+  "layoutHash": "87e338d3ef40ca5e80781e13aeaafdd37a8b07bf2dda356f2a0433bcfab22cc5",
+  "decodedPixelsEqual": true,
+  "pngBytesEqual": true,
+  "engine": {
+    "playwrightVersion": "1.58.2",
+    "browserVersion": "145.0.7632.6",
+    "browserRevision": "1208",
+    "browserName": "chromium-headless-shell",
+    "deviceScaleFactor": 1,
+    "locale": "en-US",
+    "timezoneId": "UTC",
+    "colorScheme": "light",
+    "os": "win32 10.0.22631",
+    "architecture": "x64",
+    "node": "v22.23.2",
+    "sharp": "0.35.4"
+  },
+  "frames": [
+    {
+      "frameId": "frame-carry",
+      "sectionId": "section-product-overview",
+      "width": 720,
+      "height": 880,
+      "sha256": "566debc9e05adee790c45177abdd9625c9c912aa3b56ebde90d6669ab96f8197",
+      "decodedPixelHash": "fd21a5d0c9f33607da0e73d3cb1cd39919cff7c7f99d40357df079a83f4bc507"
+    },
+    {
+      "frameId": "frame-specification",
+      "sectionId": "section-product-overview",
+      "width": 720,
+      "height": 680,
+      "sha256": "c52d24978a3f6c7e7f375decbb37c38dcc9f57f2e21d84d14aec1e7e2c184c63",
+      "decodedPixelHash": "4038cc669ef3fe1bdfb7636879dd63a29f50d9560e325e37986128d1aed66ae7"
+    }
+  ],
+  "dependencies": {
+    "fonts": [
+      {
+        "id": "fixture-sans",
+        "sha256": "84366fc4ae40fc5cad8e51ed43a567ae8c7ebef9d30096ceec1b024d2ea08939",
+        "mime": "font/ttf",
+        "weight": 400
+      }
+    ],
+    "assets": [
+      {
+        "id": "synthetic-bottle",
+        "sha256": "4a9571a85aef2652e5feb20096731a29192f8a3e03cc1a91ef06160e182246e4",
+        "mime": "image/png"
+      }
+    ]
+  },
+  "unverified": [
+    "cross-OS pixel equality",
+    "PDF",
+    "JPG",
+    "WebP output",
+    "formal Export",
+    "business approval"
+  ]
+}
