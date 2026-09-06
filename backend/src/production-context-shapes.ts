@@ -1,8 +1,8 @@
 import { z } from 'zod';
 
 export const label = z.string().trim().min(1).max(200);
-export const productBriefSchema = z.object({ productName: label, internalCode: label, category: label, stage: label,
-  introduction: z.string().trim().min(1).max(10000), commercialIntent: z.string().trim().min(1).max(2000) }).strict();
+export const productBriefSchema = z.object({ productName: label, internalCode: label.optional(), category: label, stage: label,
+  introduction: z.string().trim().min(1).max(10000), commercialIntent: z.string().trim().min(1).max(2000).optional() }).strict();
 // Keep the legacy rule shape byte-for-byte compatible with its registered JSON/hash.
 export const legacyPrimaryTargetSchema = z.object({ platform: label, site: label,
   country: z.string().regex(/^[A-Z]{2}$/), language: z.string().regex(/^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/),
