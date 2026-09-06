@@ -1,0 +1,2 @@
+# Preserve the compiled HTML bytes and its recorded SHA-256 across Git checkouts.
+review/*.html -text
