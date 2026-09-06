@@ -4,9 +4,10 @@ import { createElement, useRef, useState } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { fixture } from './helpers.js';
 import { contextDraftSchema, type ContextDraft, type RulePack } from '../src/production-context.js';
-import { ApiError, errorMessage, StageAApi } from '../../src/pages/ArcaneWarriorPage/stage-a-api.js';
+import { ApiError, errorMessage, StageAApi, type Project } from '../../src/pages/ArcaneWarriorPage/stage-a-api.js';
 import { compileContextForm, contextDifferences, contextForm, contextReadiness, isRuleCatalog, projectContextBase } from '../../src/pages/ArcaneWarriorPage/project-context.js';
 import { useProjectContext, type ContextSession, type ProjectContextController } from '../../src/pages/ArcaneWarriorPage/useProjectContext.js';
+import { useProjectSnapshot } from '../../src/pages/ArcaneWarriorPage/useProjectSnapshot.js';
 
 // Explicit synthetic fixtures; no platform defaults or production catalog fallback are created.
 const rule: RulePack = {
@@ -19,6 +20,54 @@ const complete: ContextDraft = {
   productBrief: { productName: 'Synthetic production product', internalCode: 'TEST-ONLY', category: 'Fixture', stage: 'test', introduction: 'Synthetic introduction', commercialIntent: 'Verify the client flow' },
   primaryTarget: rule.target, canvasProfile: { widthPx: 1000, format: 'png' }, rulePackRef: { id: rule.id, version: rule.version },
 };
+
+test('real HTTP JSONB key ordering does not invalidate continued, reopened or copied context drafts', async () => {
+  const f = await fixture({ rulePacks: [rule] });
+  try {
+    const url = await f.app.listen({ port: 0, host: '127.0.0.1' });
+    const client = new StageAApi(f.headers.authorization.slice(7), (path, options) => fetch(`${url}${path}`, options));
+    let saved = await client.write(await client.create('JSONB order regression'), 'production/initialize');
+    saved = await client.write(saved, 'production/context/draft', { context: complete });
+    const read = await client.get(saved.id);
+    assert.equal(read.revision, saved.revision);
+    assert.deepEqual(projectContextBase(saved), projectContextBase(read));
+    assert.notEqual(JSON.stringify(projectContextBase(saved)), JSON.stringify(projectContextBase(read)), 'exercise actual POST/JSONB ordering, not a synthetic reorder');
+    withStorage(() => {
+      const session: ContextSession = { project: saved, getLatestProject: () => saved, canWrite: true, catalog: [rule], write: () => undefined };
+      const continued = renderContextUpdates([
+        { session, update: context => context.setField('introduction', 'Local input kept') },
+        { session: { ...session, project: read }, update: context => context.setField('commercialIntent', 'Continue editing after GET') },
+        { session: { ...session, project: read } },
+      ]);
+      assert.deepEqual(continued.changes, []);
+      assert.equal(continued.local.needsReview, false);
+      assert.equal(continued.canSave, true);
+      const reopened = renderContext({ ...session, project: read });
+      assert.equal(reopened.local.needsReview, false);
+      assert.equal(reopened.form.introduction, 'Local input kept');
+    });
+    const activated = await client.write(saved, 'production/context/activate');
+    const activeRead = await client.get(activated.id);
+    assert.equal(activeRead.revision, activated.revision);
+    assert.deepEqual(projectContextBase(activated), projectContextBase(activeRead));
+    assert.notEqual(JSON.stringify(projectContextBase(activated)), JSON.stringify(projectContextBase(activeRead)));
+    withStorage(() => {
+      const session: ContextSession = { project: activated, getLatestProject: () => activated, canWrite: true, catalog: [rule], write: () => undefined };
+      const copied = renderContextUpdates([
+        { session, update: context => context.requestCopy(context.activeVersion!) },
+        { session: { ...session, project: activeRead }, update: context => context.setField('internalCode', 'LOCAL-P2') },
+        { session: { ...session, project: activeRead } },
+      ]);
+      assert.equal(copied.local.active, true);
+      assert.equal(copied.local.needsReview, false);
+      assert.equal(copied.canSave, true);
+      assert.deepEqual(copied.changes, []);
+      const reopened = renderContext({ ...session, project: activeRead });
+      assert.equal(reopened.form.internalCode, 'LOCAL-P2');
+      assert.equal(reopened.local.needsReview, false);
+    });
+  } finally { await f.close(); }
+});
 
 test('form compilation omits cleared fields and preserves partial drafts accepted by the server schema', () => {
   assert.deepEqual(compileContextForm(contextForm()).context, {});
@@ -140,7 +189,7 @@ test('context draft restoration gates saves after upstream changes and unsubmitt
     project = await f.write(project, 'production/context/draft', { context: complete });
     withStorage(() => {
       const calls: string[] = [];
-      const session: ContextSession = { project, canWrite: true, catalog: [rule], write: path => { calls.push(path); return undefined; } };
+      const session: ContextSession = { project, getLatestProject: () => project, canWrite: true, catalog: [rule], write: path => { calls.push(path); return undefined; } };
       const saved = renderContext(session);
       assert.equal(saved.canActivate, true); assert.equal(calls.length, 0);
       const edited = renderContext(session, context => context.setField('introduction', 'Local unsaved introduction'));
@@ -169,7 +218,7 @@ test('activated versions are read-only until explicitly copied, and project-loca
     project = await f.write(project, 'production/context/draft', { context: complete });
     project = await f.write(project, 'production/context/activate');
     withStorage(() => {
-      const session: ContextSession = { project, canWrite: true, catalog: [rule], write: () => undefined };
+      const session: ContextSession = { project, getLatestProject: () => project, canWrite: true, catalog: [rule], write: () => undefined };
       const active = renderContext(session);
       assert.equal(active.readOnly, true); assert.equal(active.canEdit, false); assert.equal(active.canSave, false);
       const changedCatalog = renderContext({ ...session, catalog: [{ ...rule, allowedWidthsPx: [999] }] });
@@ -195,7 +244,7 @@ test('confirming a prepared context copy does not silently accept a newer server
     project = await f.write(project, 'production/context/activate');
     project = await f.write(project, 'production/context/draft', { context: { productBrief: { productName: 'Existing server draft' } } });
     withStorage(() => {
-      const session: ContextSession = { project, canWrite: true, catalog: [rule], write: () => undefined };
+      const session: ContextSession = { project, getLatestProject: () => project, canWrite: true, catalog: [rule], write: () => undefined };
       const external = structuredClone(project); external.revision++;
       external.production!.context!.draft!.productBrief!.productName = 'External replacement';
       const result = renderContextUpdates([
@@ -211,28 +260,76 @@ test('confirming a prepared context copy does not silently accept a newer server
   } finally { await f.close(); }
 });
 
-test('an older successful save replay retains local context when a newer server context already arrived', async () => {
+// Use the actual session snapshot hook, including receipt before React commits the next render.
+function renderContextSaveReplay(project: Project, replay: Project, external: Project, sameBatch: boolean) {
+  let result: ProjectContextController | undefined;
+  let saved: ((next: Project) => void) | undefined;
+  function Probe() {
+    const [step, setStep] = useState(0);
+    const snapshot = useProjectSnapshot(project);
+    const context = useProjectContext({
+      project: snapshot.project, getLatestProject: snapshot.getLatestProject, canWrite: true, catalog: [rule],
+      write: (_path, _body, _label, callback) => { saved = callback; return undefined; },
+    });
+    result = context;
+    const finishSave = () => {
+      snapshot.receiveSnapshot(replay, project.id);
+      assert.equal(snapshot.getLatestProject()?.revision, external.revision, 'the older write response cannot replace the latest receipt');
+      assert.ok(saved); saved(replay);
+    };
+    if (step === 0) { context.setField('introduction', replay.production!.context!.draft!.productBrief!.introduction!); setStep(1); }
+    else if (step === 1) { context.save(); setStep(2); }
+    else if (step === 2) {
+      snapshot.receiveSnapshot(external, project.id);
+      if (sameBatch) finishSave();
+      setStep(3);
+    } else if (step === 3) {
+      if (!sameBatch) finishSave();
+      setStep(4);
+    }
+    return null;
+  }
+  renderToStaticMarkup(createElement(Probe)); assert.ok(result); return result;
+}
+
+test('an older successful save replay preserves local input when newer context arrives before or within the callback batch', async () => {
   const f = await fixture({ rulePacks: [rule] });
   try {
     let project = await f.write(await f.create(), 'production/initialize');
     project = await f.write(project, 'production/context/draft', { context: complete });
-    withStorage(() => {
-      let saved: ((next: typeof project) => void) | undefined;
-      const session: ContextSession = { project, canWrite: true, catalog: [rule], write: (_path, _body, _label, callback) => { saved = callback; return undefined; } };
+    for (const sameBatch of [false, true]) withStorage(() => {
       const replay = structuredClone(project); replay.revision++;
       replay.production!.context!.draft!.productBrief!.introduction = 'Local saved input';
       const external = structuredClone(replay); external.revision++;
       external.production!.context!.draft!.productBrief!.introduction = 'Newer external input';
-      const result = renderContextUpdates([
-        { session, update: context => context.setField('introduction', 'Local saved input') },
-        { session, update: context => context.save() },
-        { session: { ...session, project: external }, update: () => { assert.ok(saved); saved(replay); } },
-        { session: { ...session, project: external } },
-      ]);
+      const result = renderContextSaveReplay(project, replay, external, sameBatch);
       assert.equal(result.form.introduction, 'Local saved input');
       assert.equal(result.local.active, true);
       assert.equal(result.local.needsReview, true);
       assert.equal(result.canActivate, false);
+    });
+  } finally { await f.close(); }
+});
+
+test('a successful save clears the local draft when a newer HTTP snapshot has semantically identical context', async () => {
+  const f = await fixture({ rulePacks: [rule] });
+  try {
+    const url = await f.app.listen({ port: 0, host: '127.0.0.1' });
+    const client = new StageAApi(f.headers.authorization.slice(7), (path, options) => fetch(`${url}${path}`, options));
+    let project = await client.write(await client.create('Semantic save replay'), 'production/initialize');
+    project = await client.write(project, 'production/context/draft', { context: complete });
+    const replay = await client.write(project, 'production/context/draft', { context: { ...complete, productBrief: { ...complete.productBrief, introduction: 'Local saved input' } } });
+    await client.write(replay, 'identity/confirm', { productName: 'Unrelated extraction identity' });
+    const external = await client.get(project.id);
+    assert.ok(external.revision > replay.revision);
+    assert.deepEqual(projectContextBase(replay), projectContextBase(external));
+    assert.notEqual(JSON.stringify(projectContextBase(replay)), JSON.stringify(projectContextBase(external)));
+    for (const sameBatch of [false, true]) withStorage(() => {
+      const result = renderContextSaveReplay(project, replay, external, sameBatch);
+      assert.equal(result.form.introduction, 'Local saved input');
+      assert.equal(result.local.active, false);
+      assert.equal(result.local.needsReview, false);
+      assert.equal(result.canActivate, true);
     });
   } finally { await f.close(); }
 });

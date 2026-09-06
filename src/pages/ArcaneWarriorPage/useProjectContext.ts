@@ -1,11 +1,11 @@
-import { useRef, useState } from 'react'
+import { useState } from 'react'
 import type { ProjectContextVersion } from '../../../backend/src/production-context.js'
 import type { Project } from './stage-a-api.js'
 import type { ProjectSession } from './useProjectSession.js'
-import { useReviewedDraft } from './project-drafts.js'
+import { sameJsonValue, useReviewedDraft } from './project-drafts.js'
 import { compileContextForm, contextDifferences, contextForm, contextReadiness, projectContextBase, selectedRule, type ContextForm } from './project-context.js'
 
-export type ContextSession = Pick<ProjectSession, 'project' | 'canWrite' | 'catalog' | 'write'>
+export type ContextSession = Pick<ProjectSession, 'project' | 'getLatestProject' | 'canWrite' | 'catalog' | 'write'>
 export function useProjectContext(s: ContextSession) {
   const state = s.project?.production?.context
   const activeVersion = state?.versions.find(version => version.version === state.activeVersion)
@@ -13,8 +13,6 @@ export function useProjectContext(s: ContextSession) {
   const initialized = s.project?.production?.contractVersion === 'production.1'
   const serverForm = contextForm(serverDraft ?? activeVersion?.context)
   const local = useReviewedDraft(s.project?.id, 'productionContext', serverForm, () => projectContextBase(s.project))
-  const latestProject = useRef(s.project)
-  latestProject.current = s.project
   const [copyVersion, setCopyVersion] = useState('')
   const [pendingCopy, setPendingCopy] = useState<{ label: string; prepared: ReturnType<typeof local.prepareReplacement> } | null>(null)
   // An untouched form follows the current server snapshot. Active versions remain read-only.
@@ -48,10 +46,10 @@ export function useProjectContext(s: ContextSession) {
   }
   const discard = () => { if (s.canWrite) { local.discard(); setPendingCopy(null) } }
   const afterSave = (next: Project) => {
-    const latest = latestProject.current
+    const latest = s.getLatestProject()
     // A successful idempotent replay may be older than a snapshot already received through SSE.
     // Keep the local input for comparison when another context has superseded that saved result.
-    if (latest?.id === next.id && latest.revision > next.revision && JSON.stringify(projectContextBase(latest)) !== JSON.stringify(projectContextBase(next))) return
+    if (latest?.id === next.id && latest.revision > next.revision && !sameJsonValue(projectContextBase(latest), projectContextBase(next))) return
     local.discard(); setPendingCopy(null)
   }
   const save = () => {
