@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
-import { readProjectEvents } from './project-events'
-import { readDraft, draftKey } from './project-drafts'
-import { ApiError, errorMessage, StageAApi } from './stage-a-api'
-import type { Project, ProjectSummary } from './stage-a-api'
+import { readProjectEvents } from './project-events.js'
+import { readDraft, draftKey } from './project-drafts.js'
+import { ApiError, errorMessage, StageAApi } from './stage-a-api.js'
+import type { Project, ProjectSummary } from './stage-a-api.js'
+import type { RulePack } from '../../../backend/src/production-context.js'
 
 const projectStorageKey = 'tujiang_stage_a_project_id'
 function previousProjectId() {
@@ -13,6 +14,10 @@ export function useProjectSession() {
   const [project, setProject] = useState<Project | null>(null)
   const currentId = useRef<string | null>(null)
   const [projects, setProjects] = useState<ProjectSummary[]>([])
+  const [catalog, setCatalog] = useState<RulePack[] | null>(null)
+  const [catalogLoading, setCatalogLoading] = useState(false)
+  const [catalogError, setCatalogError] = useState('')
+  const [catalogRequest, setCatalogRequest] = useState(0)
   const [eventsStatus, setEventsStatus] = useState('尚未连接')
   const [projectId, setProjectId] = useState(previousProjectId)
   const [token, updateToken] = useState('')
@@ -69,6 +74,21 @@ export function useProjectSession() {
     if (!canSwitch || busyRef.current || !token.trim() || !id) return
     await perform(() => api().get(id), '已打开项目，恢复该项目的本地草稿。', false)
   }
+  useEffect(() => {
+    setCatalog(null); setCatalogError(''); setCatalogLoading(false)
+    if (!project?.id || !token.trim() || authExpired) return
+    let disposed = false
+    setCatalogLoading(true)
+    void new StageAApi(token).catalog().then(rules => {
+      if (!disposed) setCatalog(rules)
+    }).catch(err => {
+      if (disposed) return
+      setCatalogError(errorMessage(err))
+      if (err instanceof ApiError && err.status === 401) { setAuthExpired(true); setRunConsent(false); setError(errorMessage(err)) }
+    }).finally(() => { if (!disposed) setCatalogLoading(false) })
+    return () => { disposed = true }
+  }, [project?.id, token, authExpired, catalogRequest])
+  const reloadCatalog = () => { if (!catalogLoading && token.trim() && !authExpired) setCatalogRequest(value => value + 1) }
   useEffect(() => {
     const id = project?.id
     if (!id || !token || authExpired) return
@@ -135,6 +155,7 @@ export function useProjectSession() {
   const hasConflict = project?.facts.some(f => f.issueSeverity === 'blocker') ?? false
   const canPlan = canWrite && !!project?.identity && confirmed.some(f => f.role === 'core') && !hasConflict
   return { project, projectId, setProjectId, token, setToken, authExpired, busy, error, notice, pending, conflictBefore, projects, listProjects, selectProject, canSwitch, eventsStatus,
+    catalog, catalogLoading, catalogError, reloadCatalog,
     canWrite, write, create, refresh, retry, resolveConflict, confirmed, hasConflict, canPlan,
     reason, setReason, reasonValid: !!reason.trim() && reason.length <= 1000, runConsent, setRunConsent }
 }

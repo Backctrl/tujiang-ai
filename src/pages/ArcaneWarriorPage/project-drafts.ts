@@ -33,5 +33,5 @@ export function useReviewedDraft<T, B>(projectId: string | undefined, field: str
   const replace = (prepared: ReturnType<typeof prepareReplacement>) => store({ ...prepared, active: true })
   const discard = () => store({ value: fallback, base: null, active: false })
   const acknowledge = () => store(previous => ({ ...previous, base: baseFor(previous.value) }))
-  return { value: stored.value, setValue, prepareReplacement, replace, discard, acknowledge, needsReview, originalBase: stored.base, currentBase }
+  return { value: stored.value, active: stored.active, setValue, prepareReplacement, replace, discard, acknowledge, needsReview, originalBase: stored.base, currentBase }
 }
