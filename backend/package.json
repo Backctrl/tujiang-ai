@@ -1,0 +1,33 @@
+{
+  "name": "tujiang-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsx watch --env-file-if-exists=.env src/main.ts",
+    "start": "node --env-file-if-exists=.env dist/main.js",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "test:postgres": "tsx --env-file-if-exists=.env --test test/postgres.integration.ts",
+    "evaluate:offline": "tsx evaluation/cli.ts",
+    "evaluate:runner": "tsx evaluation/runner-cli.ts",
+    "verify:local-runtime": "node --env-file=.env scripts/verify-local-runtime.mjs",
+    "migrate": "tsx --env-file-if-exists=.env src/migrate.ts"
+  },
+  "dependencies": {
+    "fastify": "^5.6.0",
+    "pg": "^8.16.3",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.3.14",
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.15.5",
+    "tsx": "^4.20.0",
+    "typescript": "~5.9.3"
+  }
+}
