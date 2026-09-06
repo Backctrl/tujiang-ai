@@ -6,6 +6,7 @@ const envSchema = z.object({
   BACKEND_ACTOR_ID: z.string().trim().min(1).default('lishuo'),
   PORT: z.coerce.number().int().min(1).max(65535).default(3100),
   OBJECT_DIR: z.string().min(1).default('.data/objects'),
+  PRODUCTION_CATALOG_PATH: z.string().trim().min(1).optional(),
   OPENROUTER_API_KEY: z.string().optional(),
   OPENROUTER_MODEL: z.string().optional(),
   OPENROUTER_FACT_MODEL: z.string().optional(),
