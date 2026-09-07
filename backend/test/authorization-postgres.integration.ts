@@ -8,7 +8,9 @@ import { ArtifactCipher } from '../evaluation/authorization-artifacts.js';
 import { migrateAuthorizationLedger } from '../evaluation/authorization-database.js';
 import { AuthorizationLedger } from '../evaluation/authorization-ledger.js';
 import { AUTHORIZATION_POLICY, POLICY_SHA256 } from '../evaluation/authorization-contract.js';
-import { artifactKey, consume, corePayload, managementLedger, prepared, preparedCore, reviewedCommand } from './authorization-helpers.js';
+import { runEvaluation } from '../evaluation/runner.js';
+import { artifactKey, authorizedCapabilities, authorizedConfig, consume, corePayload, humanFixture,
+  managementLedger, prepared, preparedCore, reviewedCommand } from './authorization-helpers.js';
 
 const configured = process.env.TEST_DATABASE_URL;
 if (!configured) throw new Error('TEST_DATABASE_URL is required: evaluation PostgreSQL checks cannot be skipped.');
@@ -145,4 +147,54 @@ test('PostgreSQL evaluation: a failed batch blocks a pre-reserved item from anot
   assert.equal(result.code, 'BATCH_NOT_RUNNABLE');
   await assert.rejects(f.runner.beginDispatch(second.id, randomUUID()), /BATCH_NOT_RUNNABLE/);
   assert.equal((await f.runner.status()).modalities.text.consumedRequests, 1);
+}));
+
+for (const failure of ['input', 'capabilities', 'initial-secret', 'late-secret', 'reservation'] as const) {
+  test(`PostgreSQL evaluation: ${failure} invalidation commits before a new process reads the stopped batch`, () => isolated(async f => {
+    const secret = `SYNTHETIC_OLD_RUNTIME_${randomUUID()}`;
+    const input = failure.endsWith('secret') ? { ...humanFixture,
+      evidence: humanFixture.evidence.map((evidence: Record<string, unknown>, index: number) =>
+        index === 0 ? { ...evidence, text: `${evidence.text} ${secret}` } : evidence) } : humanFixture;
+    const batch = await prepared(f.manager, { fixtures: [input] });
+    let metadata = 0; let posts = 0;
+    if (failure === 'reservation') {
+      await assert.rejects(f.runner.reserve(batch.batchId, 'item-1', { ...batch.plan, estimatedMicros: batch.plan.estimatedMicros + 1 }),
+        /CAPABILITIES_CHANGED_REVIEW_REQUIRED/);
+    } else {
+      if (failure === 'initial-secret') f.runner.protectSecrets([secret]);
+      const capabilities = structuredClone(authorizedCapabilities);
+      if (failure === 'capabilities') capabilities.data.endpoints[0].pricing.prompt = '0.0000011';
+      const submitted = failure === 'input' ? { ...input, expectedFacts: [] } : input;
+      const report = await runEvaluation(authorizedConfig, [submitted], {
+        live: true, authorization: { ledger: f.runner, batchId: batch.batchId, sources: batch.sources },
+        environmentEnabled: () => true, getApiKey: () => secret, request: async (_url, init) => {
+          if (init?.method === 'POST') posts++; else metadata++;
+          return Response.json(capabilities);
+        },
+      });
+      assert.equal(report.code, failure === 'input' ? 'BATCH_INPUT_CHANGED' : failure === 'capabilities' ?
+        'CAPABILITIES_CHANGED_REVIEW_REQUIRED' : 'SENSITIVE_INPUT_DETECTED');
+      assert.equal(report.requestsAttempted, 0);
+      assert.equal(metadata, failure === 'capabilities' ? 1 : 0); assert.equal(posts, 0);
+    }
+    // Manager and runner use different PostgreSQL pools; this query can see only committed changes.
+    const row = await f.db.query<{ status: string }>('SELECT status FROM evaluation_batches WHERE id=$1', [batch.batchId]);
+    assert.equal(row.rows[0]!.status, 'stopped');
+    const child = f.start({ mode: 'runner', batchId: batch.batchId }); const repeat = await child.result;
+    assert.equal(repeat.code, 'BATCH_NOT_RUNNABLE');
+    assert.equal(child.messages.filter(message => ['synthetic-post', 'synthetic-metadata'].includes(message.event)).length, 0);
+    const events = await f.db.query("SELECT body FROM evaluation_events WHERE type='batch.review_invalidated'");
+    assert.equal(events.rows.length, 1); assert.ok(!JSON.stringify(events.rows).includes(secret));
+    assert.equal((await f.manager.status()).modalities.text.consumedRequests, 0);
+  }));
+}
+
+test('PostgreSQL evaluation: pre-existing purpose saturation blocks another process before metadata without stopping its batch', () => isolated(async f => {
+  const batch = await prepared(f.manager); const occupied = await preparedCore(f.manager, corePayload('fact_extraction', 1000, 3));
+  for (const item of occupied.payload.items) await f.runner.reserve(occupied.batchId, item.id, occupied.plan);
+  const child = f.start({ mode: 'runner', batchId: batch.batchId }); const result = await child.result;
+  assert.equal(result.report?.code, 'AUTHORIZATION_QUOTA_EXCEEDED');
+  assert.equal(result.report?.metadataRequests, 0); assert.equal(result.report?.requestsAttempted, 0);
+  assert.equal(child.messages.filter(message => ['synthetic-post', 'synthetic-metadata'].includes(message.event)).length, 0);
+  assert.equal((await f.manager.status()).batches.find(row => row.id === batch.batchId)?.status, 'approved');
 }));

@@ -1,14 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, symlink, unlink, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { executeManagement, runManagementCli } from '../evaluation/authorization-cli.js';
-import { POLICY_SHA256 } from '../evaluation/authorization-contract.js';
+import { join, toNamespacedPath } from 'node:path';
+import { executeManagement, exportArtifact, runManagementCli } from '../evaluation/authorization-cli.js';
+import { POLICY_SHA256, sha256 } from '../evaluation/authorization-contract.js';
 import { readRunInputs } from '../evaluation/authorization-input.js';
 import { runEvaluation } from '../evaluation/runner.js';
-import { authorizedCapabilities, authorizedConfig, decision, humanFixture, withLedger } from './authorization-helpers.js';
+import { authorizedCapabilities, authorizedConfig, decision, humanFixture, preparedCore, withLedger } from './authorization-helpers.js';
 
 test('management CLI policy is read-only and malformed initialization never opens a database', async () => {
   const policy = await runManagementCli(['policy']); assert.equal(policy.exitCode, 0);
@@ -51,4 +51,34 @@ test('management CLI prepares exact raw files and only explicit independent deci
     const changed = await runEvaluation(edited.config, edited.fixtures, { ...options, authorization: { ...options.authorization, sources: edited.sources } });
     assert.equal(changed.code, 'BATCH_INPUT_CHANGED'); assert.equal(accesses, 0);
   } finally { await rm(directory, { recursive: true }); }
+}));
+
+test('artifact export accepts native Windows path normalization and writes the verified bytes', () => withLedger(async f => {
+  const batch = await preparedCore(f.manager); const artifactId = await f.manager.inputArtifactId(batch.batchId);
+  const directory = await mkdtemp(join(await realpath(tmpdir()), 'tujiang-evaluation-native-path-'));
+  try {
+    const nativePath = toNamespacedPath(directory);
+    const exported = await exportArtifact(f.manager, artifactId, nativePath);
+    const bytes = await readFile(join(directory, exported.files[0]!));
+    assert.equal(sha256(bytes), exported.contentSha256); assert.equal(bytes.length, exported.byteLength);
+    const metadata = JSON.parse(await readFile(join(directory, exported.files[1]!), 'utf8'));
+    assert.equal(metadata.contentSha256, exported.contentSha256);
+  } finally { await rm(directory, { recursive: true }); }
+}));
+
+test('artifact export rejects existing and missing paths through a real parent junction before creating files', () => withLedger(async f => {
+  const batch = await preparedCore(f.manager); const artifactId = await f.manager.inputArtifactId(batch.batchId);
+  const directory = await mkdtemp(join(await realpath(tmpdir()), 'tujiang-evaluation-directory-link-'));
+  const target = join(directory, 'physical'); const link = join(directory, 'linked'); let linked = false;
+  try {
+    await mkdir(target); await symlink(target, link, process.platform === 'win32' ? 'junction' : 'dir'); linked = true;
+    for (const destination of [link, join(link, 'uncreated', 'review')]) {
+      await assert.rejects(exportArtifact(f.manager, artifactId, destination), /REVIEW_DIRECTORY_REDIRECTED/);
+      assert.deepEqual(await readdir(target), []);
+    }
+  } finally {
+    // Remove the owned link itself before recursively cleaning its owned temporary parent.
+    if (linked) await unlink(link);
+    await rm(directory, { recursive: true });
+  }
 }));

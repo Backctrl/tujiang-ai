@@ -16,10 +16,16 @@ export class ArtifactCipher {
     this.key = Buffer.from(encodedKey, 'base64');
     if (this.key.length !== 32 || this.key.toString('base64') !== encodedKey) fail('ARTIFACT_KEY_NOT_CONFIGURED');
     this.keyId = sha256(this.key);
+    this.protectSecrets([encodedKey, this.key.toString('hex')]);
   }
   protectSecrets(secrets: string[]) { this.secrets = [...new Set([...this.secrets, ...secrets.filter(Boolean)])]; }
   redact(bytes: Uint8Array): { bytes: Buffer; redacted: boolean } {
-    let value = Buffer.from(bytes).toString('utf8');
+    const source = Buffer.from(bytes); const chunks: Buffer[] = []; let offset = 0;
+    for (let index = source.indexOf(this.key); index !== -1; index = source.indexOf(this.key, offset)) {
+      chunks.push(source.subarray(offset, index), Buffer.from('[REDACTED]')); offset = index + this.key.length;
+    }
+    const input = chunks.length ? Buffer.concat([...chunks, source.subarray(offset)]) : source;
+    let value = input.toString('utf8');
     const original = value;
     for (const secret of this.secrets) {
       for (const encoding of [secret, JSON.stringify(secret).slice(1, -1), encodeURIComponent(secret)]) {
@@ -29,7 +35,7 @@ export class ArtifactCipher {
     value = value.replace(/\bsk-or-v1-[A-Za-z0-9_-]+\b/g, '[REDACTED]')
       .replace(/(authorization["']?\s*[:=]\s*["']?Bearer\s+)[^\s"',}]+/gi, '$1[REDACTED]');
     // Keep arbitrary raw bytes byte-identical when there was no textual redaction.
-    return { bytes: value === original ? Buffer.from(bytes) : Buffer.from(value), redacted: value !== original };
+    return { bytes: value === original ? input : Buffer.from(value), redacted: chunks.length > 0 || value !== original };
   }
   seal(bytes: Uint8Array, binding: ArtifactBinding): SealedArtifact {
     const protectedBytes = this.redact(bytes);

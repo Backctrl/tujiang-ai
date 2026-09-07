@@ -1,5 +1,5 @@
-import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
-import { resolve, join } from 'node:path';
+import { lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
+import { dirname, parse, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { RunnerError } from '../src/model-policy.js';
@@ -23,16 +23,35 @@ const readJson = async (path: string) => {
 };
 const reviewDirectory = fileURLToPath(new URL('../.data/evaluation-review/', import.meta.url));
 
+async function assertNoDirectoryLinks(directory: string, mustExist: boolean) {
+  const components = [directory];
+  for (let parent = dirname(directory); parent !== components.at(-1); parent = dirname(parent)) components.push(parent);
+  for (const component of components.reverse()) {
+    try {
+      // Node lstat needs the ordinary spelling for a namespaced Windows drive root.
+      const inspected = process.platform === 'win32' && component === parse(directory).root &&
+        component.startsWith('\\\\?\\') && /^[a-z]:\\$/i.test(component.slice(4)) ? component.slice(4) : component;
+      if ((await lstat(inspected)).isSymbolicLink()) fail('REVIEW_DIRECTORY_REDIRECTED');
+    } catch (error) {
+      if (mustExist || (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+}
+
 export async function exportArtifact(ledger: AuthorizationLedger, artifactId: string, directory = reviewDirectory) {
   uuid.parse(artifactId);
   const artifact = await ledger.readArtifactForReview(artifactId);
-  const absolute = resolve(directory); await mkdir(absolute, { recursive: true, mode: 0o700 });
-  // Reject a junction/symlink redirect; export only to the explicitly controlled local directory.
+  const absolute = resolve(directory);
+  // Check existing parents before mkdir so a redirect cannot create directories outside this path.
+  await assertNoDirectoryLinks(absolute, false);
+  await mkdir(absolute, { recursive: true, mode: 0o700 });
+  await assertNoDirectoryLinks(absolute, true);
+  // Native aliases (including Windows 8.3 paths) may normalize without being filesystem links.
   const actual = await realpath(absolute);
-  if (actual.toLowerCase() !== absolute.toLowerCase()) fail('REVIEW_DIRECTORY_REDIRECTED');
+  await assertNoDirectoryLinks(actual, true);
   const { bytes, ...metadata } = artifact;
-  await writeFile(join(absolute, `${artifactId}.bin`), bytes, { flag: 'wx', mode: 0o600 });
-  await writeFile(join(absolute, `${artifactId}.metadata.json`), JSON.stringify(metadata, null, 2), { flag: 'wx', mode: 0o600 });
+  await writeFile(join(actual, `${artifactId}.bin`), bytes, { flag: 'wx', mode: 0o600 });
+  await writeFile(join(actual, `${artifactId}.metadata.json`), JSON.stringify(metadata, null, 2), { flag: 'wx', mode: 0o600 });
   return { artifactId, contentSha256: sha256(bytes), byteLength: bytes.length, redacted: artifact.redacted,
     files: [`${artifactId}.bin`, `${artifactId}.metadata.json`] };
 }

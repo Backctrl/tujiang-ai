@@ -73,6 +73,7 @@
 
 | 操作 | 原子保证与结果 |
 | --- | --- |
+| `preflightAvailability` | runner-only，绑定本实例成功取得的精确 approved snapshot。在读取模型 Key 或发出 metadata GET 前，锁内检查本批次全部尚未预留项目对应的全局次数、用途额度、估算与本地费用；已有预留不重复计算。此门只检查可用性，最终 reserve 仍锁内重验并发变化 |
 | `reserve` | 在授权行锁内重验 policy、input-review、manifest、purpose、模态、模型路由、计数与费用；按 batch item 唯一预留。可运行批次的重复输入返回已有状态；stopped/completed 批次禁止新预留/派发，完成批次由 runner 直接读取已保存状态 |
 | `beginDispatch` | 重新检查全部门与全局在途状态，提交 `dispatch_started` 后才允许调用 fetch。只有本次从 reserved 转移成功的调用获得一次性许可 |
 | `recordCapture` | 加密、脱敏并持久化已收到的原文与元数据；相同材料摘要幂等，冲突内容不覆盖原件 |
@@ -80,7 +81,9 @@
 
 派发许可不保存为可以重放使用的 `mayDispatch=true` 回执。同一命令重放只能查看状态，不能再次 POST。finish 可以安全重放；模型请求不能重放。所有网络调用都发生在事务之外，账本不宣称数据库和外部服务拥有分布式 exactly-once 事务。
 
-批次内串行执行。任意失败停止当前批次，后续 item 不派发；不自动重试、换模型、换 provider、fallback 或追加 generation 查询。未知 usage、传输中断、无法确认的派发、错误路由或费用越界同时使授权进入 held，后续批次的 reserve/dispatch 也拒绝。
+批次内串行执行。已取得精确 approved snapshot 后，存储的 adapter 不支持、输入/预期/来源/请求变化、敏感输入、metadata 传输或解析失败、能力/端点/价格/token/参数/隐式缓存/估算无效、能力相对复核内容变化，按固定错误码白名单幂等写入 `stopped` 和 `batch.review_invalidated` 事件。外层 stop 只接受本 runner 实例签发的 snapshot，不能用任意 batch ID 或自行拼装的对象触发。首次读取已批准 payload 或 reserve/beginDispatch 复核失败时，先在事务内确认 review、policy、key，再提交停止状态，最后向调用者抛原错误；不能因事务回滚丢失 stop。后续进程在读取 Key、GET、POST 前拒绝旧批次。重新运行需要新的输入复核批次，旧批次不能恢复为 approved。
+
+调用前的 schema/enable/auth/instance 失败、未批准/已停止/已完成批次、缺 Key、数据库或加密密钥不可用、持久化失败、全局 hold/policy 失败不触发该 stop。已知次数/用途/全局估算或本地预算不足时保持 approved，并由 availability 门保证 0 metadata/0 POST；门通过之后若另一进程抢占额度，最终 reserve 可以在一次 GET 后拒绝，但仍不会 POST。已派发响应的协议或规则失败停止批次；未知 usage、传输中断、无法确认的派发、错误路由或费用越界同时使授权进入 held，后续批次的 reserve/dispatch 也拒绝。不自动重试、换模型、换 provider、fallback 或追加 generation 查询。
 
 ## 6. 崩溃与显式恢复
 
@@ -99,9 +102,9 @@
 
 输入、人工预期、请求、能力快照、响应原文、结构化解析、usage 和错误材料分别有 artifact ID、类型、SHA、完整/部分/不可取得状态及来源 attempt。部分正文的 SHA 只表示已取得前缀，不伪装为完整响应 SHA。文本响应维持最多 2,000,000 bytes 的有限读取。
 
-原文采用数据库内 AES-256-GCM 加密保存，密钥只由本地进程环境读取，不进入数据库、仓库或报告；AAD 绑定授权、batch、attempt、材料类型、来源摘要与 metadata 摘要，HTTP 状态和完整性标记不能被单独替换。请求 Authorization/header 从不保存；遇到服务商回显当前 Key 时先脱敏再留存，并记录发生脱敏和原文摘要，不能仍声称保存的是未变动的原始字节。
+原文采用数据库内 AES-256-GCM 加密保存，密钥只由本地进程环境读取，不进入数据库、仓库或报告；AAD 绑定授权、batch、attempt、材料类型、来源摘要与 metadata 摘要，HTTP 状态和完整性标记不能被单独替换。请求 Authorization/header 从不保存；管理和运行入口在构造账本前登记当前环境中已知的 API Key、token、secret、password、credential、材料密钥及数据库 URL/解码后的密码，加密器也自动保护自身密钥。输入含已知凭据时拒绝创建批次；输出回显凭据时先脱敏再留存，并记录发生脱敏和原文摘要，不能仍声称保存的是未变动的原始字节。
 
-普通 runner/stdout 报告只含状态、固定错误码、计数、费用、SHA 和材料 ID，不含输入正文、预期、原始输出、Key 或数据库 URL。原文通过显式本地审阅导出到受控目录，默认不打印，导出动作有审计；导出文本仍无凭据。留存初始化或密钥不可用时，live 在 POST 前拒绝。
+普通 runner/stdout 报告只含状态、固定错误码、计数、费用、SHA 和材料 ID，不含输入正文、预期、原始输出、Key 或数据库 URL。原文通过显式本地审阅导出到受控目录，默认不打印，导出动作有审计；新管理进程也按当前已知敏感值检查旧材料，导出发生新的脱敏时更新副本摘要与 `redacted` 标记。创建导出目录前检查全部现有父目录，创建后复查并使用实际路径写入，拒绝 symlink/junction 跳转，同时允许 Windows 原生路径别名规范化。留存初始化或密钥不可用时，live 在 POST 前拒绝。
 
 新 evaluation 传输器保留 HTTP 非 2xx 与非法 JSON 的有界原文，不改生产 `src/model-policy.ts` 的公开行为。HTTP 错误、截断、拒答、超时、路由不符、解析/规则失败均保存可取得材料；未知或无效 usage 继续为 null。
 

@@ -36,6 +36,35 @@ test('runner identity cannot mint reviews or invoke management operations; decis
   await assert.rejects(f.runner.reserve(batch.batchId, 'item-1', batch.plan), /INPUT_REVIEW_REQUIRED/);
 }));
 
+test('review invalidation requires the issuing runner snapshot and a fixed reason; repeated stops do not write again', () => withLedger(async f => {
+  const batch = await preparedCore(f.manager); const snapshot = await f.runner.reviewedBatch(batch.batchId);
+  const peer = AuthorizationLedger.forRunner(f.db, new ArtifactCipher(artifactKey)); const before = await peer.status();
+  await assert.rejects(f.manager.stopReviewedBatch(snapshot, 'BATCH_INPUT_CHANGED'), /AUTHORIZATION_INVALID_INSTANCE/);
+  await assert.rejects(peer.stopReviewedBatch(snapshot, 'BATCH_INPUT_CHANGED'), /BATCH_REVIEW_SNAPSHOT_REQUIRED/);
+  await assert.rejects(f.runner.stopReviewedBatch(structuredClone(snapshot), 'BATCH_INPUT_CHANGED'), /BATCH_REVIEW_SNAPSHOT_REQUIRED/);
+  await assert.rejects(f.runner.stopReviewedBatch(snapshot, 'caller-error-with-sensitive-body'));
+  await assert.rejects(f.runner.preflightAvailability(structuredClone(snapshot)), /BATCH_REVIEW_SNAPSHOT_REQUIRED/);
+  assert.deepEqual(await peer.status(), before);
+  const stopped = await f.runner.stopReviewedBatch(snapshot, 'BATCH_INPUT_CHANGED'); assert.equal(stopped.changed, true);
+  const after = await peer.status(); assert.equal(after.batches[0]!.status, 'stopped');
+  assert.equal((await f.runner.stopReviewedBatch(snapshot, 'BATCH_INPUT_CHANGED')).changed, false);
+  assert.deepEqual(await peer.status(), after);
+  await assert.rejects(peer.reviewedBatch(batch.batchId), /BATCH_NOT_RUNNABLE/);
+}));
+
+test('reservation review failures commit a stop before throwing and existing reservations are counted once by availability', () => withLedger(async f => {
+  const batch = await preparedCore(f.manager, corePayload('fact_extraction', 1000, 3));
+  const snapshot = await f.runner.reviewedBatch(batch.batchId);
+  for (const item of batch.payload.items) await f.runner.reserve(batch.batchId, item.id, batch.plan);
+  assert.equal((await f.runner.preflightAvailability(snapshot)).available, true);
+  await assert.rejects(f.runner.reserve(batch.batchId, 'item-1', { ...batch.plan, estimatedMicros: 1001 }), /CAPABILITIES_CHANGED_REVIEW_REQUIRED/);
+  const peer = AuthorizationLedger.forRunner(f.db, new ArtifactCipher(artifactKey));
+  const after = await peer.status(); assert.equal(after.batches[0]!.status, 'stopped');
+  assert.equal(after.modalities.text.reservedRequests, 3); assert.equal(after.modalities.text.consumedRequests, 0);
+  await assert.rejects(peer.reserve(batch.batchId, 'item-1', batch.plan), /BATCH_NOT_RUNNABLE/);
+  assert.equal((await f.db.query("SELECT sequence FROM evaluation_events WHERE type='batch.review_invalidated'")).rows.length, 1);
+}));
+
 test('cross-purpose text and image counts accumulate against one authorization without transfers', () => withLedger(async f => {
   for (const [purpose, quota] of Object.entries(PURPOSE_LIMITS) as [Purpose, number][]) {
     for (let index = 0; index < quota; index++) await consume(f.runner, await preparedCore(f.manager, corePayload(purpose)));

@@ -1,15 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import { RunnerError, runnerConfigSchema } from '../src/model-policy.js';
-import { AUTHORIZATION_POLICY, canonical, describeBatch, fail, microsToUsd, objectSha256, sha256, validateAuthorizedConfig } from './authorization-contract.js';
+import { AUTHORIZATION_POLICY, batchStopReasonSchema, canonical, describeBatch, fail, microsToUsd, objectSha256, sha256, validateAuthorizedConfig } from './authorization-contract.js';
 import { analyzeItem, assertExtractionAdapter, capabilityPlan, extractionItems, itemFixture, type SourceSnapshot } from './authorization-input.js';
-import { assertRunnerLedger, type AuthorizationLedger, type AttemptView } from './authorization-ledger.js';
+import { assertRunnerLedger, type AuthorizationLedger, type AttemptView, type ReviewedBatchSnapshot } from './authorization-ledger.js';
 import { inspectCapturedResponse } from './authorization-observation.js';
 import { captureResponse } from './authorization-transport.js';
 import type { RunnerOptions, RunnerReport } from './runner.js';
 
 // Management commands cannot be reached through the live runner's dependency surface.
 export type LiveLedger = Pick<AuthorizationLedger, 'status' | 'reviewedBatch' | 'protectSecrets' | 'reserve' |
-  'beginDispatch' | 'recordCapture' | 'finish' | 'recordPreflightCapture'>;
+  'beginDispatch' | 'recordCapture' | 'finish' | 'recordPreflightCapture' | 'stopReviewedBatch' | 'preflightAvailability'>;
 export interface LiveAuthorization { ledger: LiveLedger; batchId: string; sources: SourceSnapshot[] }
 
 export async function runAuthorizedEvaluation(configInput: unknown, fixtureInputs: unknown[], options: RunnerOptions): Promise<RunnerReport> {
@@ -18,6 +18,7 @@ export async function runAuthorizedEvaluation(configInput: unknown, fixtureInput
     requestsAttempted: 0, metadataRequests: 0, observedCostUsd: 0, items: [] };
   let apiKey: string | undefined;
   let trustedLedger = false;
+  let reviewedSnapshot: ReviewedBatchSnapshot | undefined;
   const authorization = options.authorization;
   try {
     const rawConfig = runnerConfigSchema.parse(configInput);
@@ -25,12 +26,13 @@ export async function runAuthorizedEvaluation(configInput: unknown, fixtureInput
     if (!authorization) fail('AUTHORIZATION_REQUIRED');
     assertRunnerLedger(authorization.ledger);
     trustedLedger = true;
-    if (rawConfig.modelId === AUTHORIZATION_POLICY.image.modelId) fail('PURPOSE_ADAPTER_NOT_READY');
-    const config = validateAuthorizedConfig(rawConfig, 'fact_extraction');
-    const submittedItems = extractionItems(config, fixtureInputs);
+    const imagePurpose = rawConfig.modelId === AUTHORIZATION_POLICY.image.modelId;
+    const config = validateAuthorizedConfig(rawConfig, imagePurpose ? 'representative_image' : 'fact_extraction');
+    const submittedItems = imagePurpose ? [] : extractionItems(config, fixtureInputs);
     if (submittedItems.some(item => itemFixture(item).provenance !== 'human-curated')) fail('LIVE_REQUIRES_HUMAN_CURATED_FIXTURES');
     const ledger = authorization.ledger;
     const snapshot = await ledger.reviewedBatch(authorization.batchId);
+    if (snapshot.status === 'approved') reviewedSnapshot = snapshot;
     assertExtractionAdapter(snapshot.payload);
     const submitted = describeBatch(authorization.batchId, { ...snapshot.payload, config, items: submittedItems, sources: authorization.sources });
     if (submitted.manifestSha256 !== snapshot.manifestSha256) fail('BATCH_INPUT_CHANGED');
@@ -52,6 +54,7 @@ export async function runAuthorizedEvaluation(configInput: unknown, fixtureInput
       fail('BATCH_NOT_RUNNABLE');
     }
     if (state.status !== 'ready') fail(state.effectiveHold ? 'AUTHORIZATION_EFFECTIVE_HOLD' : 'AUTHORIZATION_HELD');
+    await ledger.preflightAvailability(snapshot);
     apiKey = options.getApiKey?.(); if (!apiKey?.trim()) fail('KEY_NOT_CONFIGURED');
     ledger.protectSecrets([apiKey]);
     // Credential redaction must not silently change an already approved source/request.
@@ -93,6 +96,11 @@ export async function runAuthorizedEvaluation(configInput: unknown, fixtureInput
   } catch (error) {
     report.status = report.requestsAttempted ? 'failed' : 'blocked'; report.code = error instanceof RunnerError ? error.code : 'INVALID_RUN_INPUT';
     if (authorization && trustedLedger) {
+      const reason = batchStopReasonSchema.safeParse(report.code);
+      if (reviewedSnapshot && reason.success) {
+        try { await authorization.ledger.stopReviewedBatch(reviewedSnapshot, reason.data); }
+        catch (stopError) { report.code = stopError instanceof RunnerError ? stopError.code : 'LEDGER_PERSISTENCE_ERROR'; }
+      }
       try { report.authorization = await authorization.ledger.status(); report.observedCostUsd = report.authorization.modalities.text.observedTotalUsd; } catch { /* Never replace the original safe error. */ }
     }
   }

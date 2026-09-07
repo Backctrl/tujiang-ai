@@ -6,10 +6,11 @@ import { randomUUID } from 'node:crypto';
 import { runEvaluation, type RunnerOptions } from '../evaluation/runner.js';
 import { runCli } from '../evaluation/runner-cli.js';
 import { AuthorizationLedger } from '../evaluation/authorization-ledger.js';
+import { ArtifactCipher } from '../evaluation/authorization-artifacts.js';
 import { sha256 } from '../evaluation/authorization-contract.js';
 import { PURPOSE_LIMITS, type Purpose } from '../evaluation/authorization-contract.js';
-import { authorizedCapabilities as capabilities, authorizedConfig as config, goodResponse as good, humanFixture as human,
-  syntheticFixture as fixture, corePayload, prepared, preparedCore, withLedger } from './authorization-helpers.js';
+import { artifactKey, authorizedCapabilities as capabilities, authorizedConfig as config, goodResponse as good, humanFixture as human,
+  syntheticFixture as fixture, consume, corePayload, prepared, preparedCore, withLedger } from './authorization-helpers.js';
 
 const read = (name: string) => JSON.parse(readFileSync(new URL(`../evaluation/fixtures/${name}.json`, import.meta.url), 'utf8'));
 const key = 'TEST_ONLY_SECRET';
@@ -66,6 +67,7 @@ test('config, environment, provenance, missing key and unsupported purpose all f
     ] as const) {
       const report = await runEvaluation(c, [input], { ...m.options, environmentEnabled: () => enabled, getApiKey: () => secret });
       assert.equal(report.code, expected); assert.equal(m.calls.length, 0);
+      assert.equal((await m.f.runner.status()).batches[0]!.status, 'approved');
     }
   });
 });
@@ -92,29 +94,111 @@ test('every unsupported stage including image is explicitly closed before readin
       authorization: { ledger: f.runner, batchId: batch.batchId, sources: batch.payload.sources },
       environmentEnabled: () => true, getApiKey: trap, request: trap });
     assert.equal(report.code, 'PURPOSE_ADAPTER_NOT_READY');
+    assert.equal((await f.runner.status()).batches.find(row => row.id === batch.batchId)!.status, 'stopped');
   }
   assert.equal(accesses, 0); assert.equal((await f.runner.status()).attempts.length, 0);
 }));
 
 test('input, expected, source bytes, adapter and reviewed capability changes fail closed', async () => {
-  await withMock(async m => {
+  for (const mutation of [{ ...human, productName: 'Changed product' }, { ...human, expectedFacts: [] }]) await withMock(async m => {
     let keys = 0;
     const options = { ...m.options, getApiKey: () => { keys++; return key; } };
-    const mutations = [
-      { ...human, productName: 'Changed product' },
-      { ...human, expectedFacts: [] },
-    ];
-    for (const mutation of mutations) assert.equal((await runEvaluation(config, [mutation], options)).code, 'BATCH_INPUT_CHANGED');
-    assert.equal((await runEvaluation(config, [human], { ...options, authorization: { ...options.authorization!,
-      sources: [{ ...m.batch.sources[0]!, bytesBase64: Buffer.from('changed original bytes').toString('base64') }] } })).code, 'BATCH_INPUT_CHANGED');
+    assert.equal((await runEvaluation(config, [mutation], options)).code, 'BATCH_INPUT_CHANGED');
+    const peer = AuthorizationLedger.forRunner(m.f.db, new ArtifactCipher(artifactKey));
+    assert.equal((await peer.status()).batches[0]!.status, 'stopped');
+    const repeat = await runEvaluation(config, [human], { ...options, authorization: { ...options.authorization!, ledger: peer } });
+    assert.equal(repeat.code, 'BATCH_NOT_RUNNABLE'); assert.equal(repeat.metadataRequests, 0); assert.equal(repeat.requestsAttempted, 0);
     assert.equal(keys, 0); assert.equal(m.calls.length, 0);
+  });
+  await withMock(async m => {
+    assert.equal((await runEvaluation(config, [human], { ...m.options, authorization: { ...m.options.authorization!,
+      sources: [{ ...m.batch.sources[0]!, bytesBase64: Buffer.from('changed original bytes').toString('base64') }] } })).code, 'BATCH_INPUT_CHANGED');
+    assert.equal(m.calls.length, 0); assert.equal((await m.f.runner.status()).batches[0]!.status, 'stopped');
   });
   const changed = structuredClone(capabilities); changed.data.endpoints[0].pricing.prompt = '0.0000011';
   await withMock(async m => {
     assert.equal((await runEvaluation(config, [human], m.options)).code, 'CAPABILITIES_CHANGED_REVIEW_REQUIRED');
     assert.equal(m.calls.length, 1); assert.equal((await m.f.runner.status()).attempts.length, 0);
+    const peer = AuthorizationLedger.forRunner(m.f.db, new ArtifactCipher(artifactKey));
+    const repeat = await runEvaluation(config, [human], { ...m.options, authorization: { ...m.options.authorization!, ledger: peer } });
+    assert.equal(repeat.code, 'BATCH_NOT_RUNNABLE'); assert.equal(repeat.metadataRequests, 0); assert.equal(repeat.requestsAttempted, 0);
+    assert.equal(m.calls.length, 1); assert.equal((await peer.status()).batches[0]!.status, 'stopped');
   }, { capabilities: changed });
 });
+
+test('an approved batch containing an old runtime secret remains stopped after credential rotation and cannot POST that secret', async () => {
+  const input = { ...human, evidence: human.evidence.map((evidence: Record<string, unknown>, index: number) =>
+    index === 0 ? { ...evidence, text: `${evidence.text} ${key}` } : evidence) };
+  for (const knownBeforeRead of [false, true]) await withMock(async m => {
+    let firstRunner = m.f.runner;
+    if (knownBeforeRead) {
+      const prior = process.env.OPENROUTER_API_KEY; process.env.OPENROUTER_API_KEY = key;
+      try { firstRunner = AuthorizationLedger.forRunner(m.f.db, new ArtifactCipher(artifactKey)); }
+      finally { if (prior === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = prior; }
+    }
+    assert.ok(m.batch.payload.items[0]!.requestBody.includes(key));
+    const failed = await runEvaluation(config, [input], { ...m.options, authorization: { ...m.options.authorization!, ledger: firstRunner } });
+    assert.equal(failed.code, 'SENSITIVE_INPUT_DETECTED'); assert.equal(failed.metadataRequests, 0); assert.equal(failed.requestsAttempted, 0);
+    const peer = AuthorizationLedger.forRunner(m.f.db, new ArtifactCipher(artifactKey));
+    assert.equal((await peer.status()).batches[0]!.status, 'stopped');
+    const repeat = await runEvaluation(config, [input], { ...m.options, getApiKey: () => 'synthetic-replacement-key',
+      authorization: { ...m.options.authorization!, ledger: peer } });
+    assert.equal(repeat.code, 'BATCH_NOT_RUNNABLE'); assert.equal(repeat.metadataRequests, 0); assert.equal(repeat.requestsAttempted, 0);
+    assert.equal(m.calls.length, 0);
+    const stops = await m.f.db.query("SELECT body FROM evaluation_events WHERE type='batch.review_invalidated'");
+    assert.equal(stops.rows.length, 1); assert.ok(!JSON.stringify(stops.rows).includes(key));
+  }, { fixtures: [input] });
+});
+
+test('all metadata transport failures persistently stop the reviewed batch and the next run performs zero requests', async () => {
+  const cases: [string, () => Promise<Response>][] = [
+    ['HTTP_ERROR', async () => new Response('synthetic unauthorized', { status: 401 })],
+    ['RATE_LIMITED', async () => new Response('synthetic rate limit', { status: 429 })],
+    ['NETWORK_ERROR', async () => { throw new Error('synthetic network failure'); }],
+    ['REQUEST_TIMEOUT', () => new Promise<Response>(() => {})],
+    ['RESPONSE_TOO_LARGE', async () => new Response('x'.repeat(2_000_001))],
+    ['INVALID_RESPONSE', async () => new Response(null)],
+    ['INVALID_RESPONSE_JSON', async () => new Response('{')],
+  ];
+  for (const [code, respond] of cases) await withMock(async m => {
+    let calls = 0; const options = { ...m.options, request: async () => { calls++; return respond(); } };
+    const report = await runEvaluation(m.batch.config, [human], options);
+    assert.equal(report.code, code); assert.equal(report.requestsAttempted, 0); assert.equal(report.metadataRequests, 1);
+    const peer = AuthorizationLedger.forRunner(m.f.db, new ArtifactCipher(artifactKey));
+    assert.equal((await peer.status()).batches[0]!.status, 'stopped');
+    const repeat = await runEvaluation(m.batch.config, [human], { ...options, authorization: { ...options.authorization!, ledger: peer } });
+    assert.equal(repeat.code, 'BATCH_NOT_RUNNABLE'); assert.equal(repeat.metadataRequests, 0); assert.equal(repeat.requestsAttempted, 0);
+    assert.equal(calls, 1);
+  }, { config: { ...config, timeoutMs: code === 'REQUEST_TIMEOUT' ? 30 : 1000 } });
+});
+
+test('known quota, global estimate and local budget exhaustion block before credentials and metadata without stopping a batch', async () => {
+  for (const mode of ['purpose', 'estimate', 'local'] as const) await withMock(async m => {
+    if (mode === 'local') await consume(m.f.runner, m.batch, 'item-1', good(config.modelId, 0.09));
+    else {
+      const other = await preparedCore(m.f.manager, corePayload(mode === 'purpose' ? 'fact_extraction' : 'formal_story',
+        mode === 'purpose' ? 1000 : 250000, 3));
+      for (const item of other.payload.items) await m.f.runner.reserve(other.batchId, item.id, other.plan);
+    }
+    let keys = 0;
+    const report = await runEvaluation(m.batch.config, m.batch.fixtures, { ...m.options, getApiKey: () => { keys++; return key; } });
+    assert.equal(report.code, mode === 'purpose' ? 'AUTHORIZATION_QUOTA_EXCEEDED' : mode === 'estimate' ? 'AUTHORIZATION_ESTIMATE_EXCEEDED' : 'REMAINING_BUDGET_INSUFFICIENT');
+    assert.equal(report.metadataRequests, 0); assert.equal(report.requestsAttempted, 0); assert.equal(keys, 0); assert.equal(m.calls.length, 0);
+    assert.equal(report.authorization?.batches.find(batch => batch.id === m.batch.batchId)?.status, 'approved');
+  }, mode === 'local' ? { config: { ...config, maxRequests: 2 }, fixtures: [human, human] } : {});
+});
+
+test('a competing reservation after availability may consume the quota before final reserve but never dispatch a model', () => withMock(async m => {
+  let calls = 0;
+  const report = await runEvaluation(config, [human], { ...m.options, request: async (_url, init) => {
+    calls++; assert.notEqual(init?.method, 'POST');
+    const other = await preparedCore(m.f.manager, corePayload('fact_extraction', 1000, 3));
+    for (const item of other.payload.items) await m.f.runner.reserve(other.batchId, item.id, other.plan);
+    return Response.json(capabilities);
+  } });
+  assert.equal(report.code, 'AUTHORIZATION_QUOTA_EXCEEDED'); assert.equal(report.metadataRequests, 1); assert.equal(report.requestsAttempted, 0);
+  assert.equal(calls, 1); assert.equal(report.authorization?.batches.find(batch => batch.id === m.batch.batchId)?.status, 'approved');
+}));
 
 test('successful live adapter uses exact reviewed request, strict route and existing evaluator', async () => {
   await withMock(async m => {
@@ -146,12 +230,20 @@ test('capabilities, identity, capacity and prices reject before model POST', asy
     c => { c.data.endpoints[0].pricing.prompt = '1e999'; }, c => { c.data.endpoints[0].pricing.unknown_fee = '1'; },
     c => { c.data.endpoints[0].max_completion_tokens = null; }, c => { c.data.endpoints[0].context_length = 100; },
     c => { c.data.endpoints[0].status = -1; }, c => { c.data.architecture.output_modalities = ['image']; },
+    c => { c.data.endpoints[0].model_id = 'other/model'; },
+    c => { c.data.endpoints[0].pricing.input_cache_write = '0.01'; },
+    c => { c.data.endpoints[0].pricing.prompt = '1e308'; },
+    c => { c.data.endpoints[0].pricing.prompt = '1e30'; },
   ];
   for (const mutate of mutations) {
     const caps = structuredClone(capabilities); mutate(caps);
     await withMock(async m => { const report = await runEvaluation(config, [human], m.options);
       assert.equal(report.status, 'blocked'); assert.equal(m.calls.length, 1); assert.equal(report.requestsAttempted, 0);
       assert.equal((await m.f.db.query("SELECT * FROM evaluation_artifacts WHERE kind='preflight-response'")).rows.length, 1);
+      assert.equal((await m.f.runner.status()).batches[0]!.status, 'stopped');
+      const repeat = await runEvaluation(config, [human], m.options);
+      assert.equal(repeat.code, 'BATCH_NOT_RUNNABLE'); assert.equal(repeat.metadataRequests, 0); assert.equal(repeat.requestsAttempted, 0);
+      assert.equal(m.calls.length, 1);
     }, { capabilities: caps });
   }
 });
@@ -249,11 +341,13 @@ test('missing storage key or unknown in-flight attempt blocks before metadata an
     const missingKey = AuthorizationLedger.forRunner(m.f.db, undefined);
     const report = await runEvaluation(config, [human], { ...m.options, authorization: { ...m.options.authorization!, ledger: missingKey } });
     assert.equal(report.code, 'ARTIFACT_KEY_NOT_CONFIGURED'); assert.equal(m.calls.length, 0);
+    assert.equal((await m.f.runner.status()).batches[0]!.status, 'approved');
     const reserved = await m.f.runner.reserve(m.batch.batchId, 'item-1', m.batch.plan);
     await m.f.runner.beginDispatch(reserved.id, randomUUID());
     const afterCrash = await runEvaluation(config, [human], m.options);
     assert.equal(afterCrash.code, 'AUTHORIZATION_EFFECTIVE_HOLD'); assert.equal(m.calls.length, 0);
     assert.equal(afterCrash.authorization?.modalities.text.consumedRequests, 1);
+    assert.equal(afterCrash.authorization?.batches[0]?.status, 'approved');
   });
 });
 

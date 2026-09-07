@@ -25,6 +25,7 @@ try {
           if (init?.method === 'POST') {
             await send({ event: 'synthetic-post' }); return Response.json(goodResponse(saved.payload.config.modelId));
           }
+          await send({ event: 'synthetic-metadata' });
           return Response.json(authorizedCapabilities);
         } });
       await send({ event: 'result', code: report.code ?? null, report });

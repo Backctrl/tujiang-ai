@@ -5,6 +5,15 @@ import { RunnerError, runnerConfigSchema, type RunnerConfig } from '../src/model
 export const AUTHORIZATION_ID = 'm0-model-trial-2026-09-07';
 export const digestSchema = z.string().regex(/^[a-f0-9]{64}$/);
 export const purposeSchema = z.enum(['fact_extraction', 'formal_story', 'copy', 'layout', 'english_adaptation', 'representative_image']);
+export const batchStopReasonSchema = z.enum([
+  'PURPOSE_ADAPTER_NOT_READY', 'BATCH_INPUT_CHANGED', 'SENSITIVE_INPUT_DETECTED',
+  'HTTP_ERROR', 'RATE_LIMITED', 'NETWORK_ERROR', 'REQUEST_TIMEOUT', 'RESPONSE_TOO_LARGE', 'INVALID_RESPONSE', 'INVALID_RESPONSE_JSON',
+  'INVALID_CAPABILITIES', 'TEXT_NOT_SUPPORTED', 'PROVIDER_MISSING_OR_AMBIGUOUS', 'INVALID_ENDPOINT_OR_PRICE', 'ENDPOINT_ID_MISMATCH',
+  'REQUIRED_PARAMETERS_UNSUPPORTED', 'TOKEN_LIMIT_UNSUPPORTED', 'PRICE_MISSING', 'UNSUPPORTED_PRICE_CATEGORY',
+  'IMPLICIT_CACHE_PRICE_UNSUPPORTED', 'INVALID_COST_ESTIMATE', 'INVALID_COST', 'ESTIMATED_COST_EXCEEDS_BUDGET',
+  'CAPABILITIES_CHANGED_REVIEW_REQUIRED',
+]);
+export type BatchStopReason = z.infer<typeof batchStopReasonSchema>;
 export type Purpose = z.infer<typeof purposeSchema>;
 export type Modality = 'text' | 'image';
 export const PURPOSE_LIMITS: Readonly<Record<Purpose, number>> = Object.freeze({
