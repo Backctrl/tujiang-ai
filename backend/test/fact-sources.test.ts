@@ -3,10 +3,12 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { fixture, command } from './helpers.js';
 import type { Evidence, Fact, Project, Section, Storyboard } from '../src/contracts.js';
-import { availableConfirmedFacts, evaluateFactEligibility, factGovernanceHasBlockingIssue, skillInput,
+import { availableConfirmedFacts, evaluateFactEligibility, factGovernanceHasBlockingIssue, factIntegrityIsValid,
+  factIntegrityReason, skillInput,
   type FactIntegrityReason } from '../src/material-source-gates.js';
 import { checkSkillInputs, preflight } from '../src/domain.js';
-import { createLegacyFactBinding, createStructuredFactCandidateBinding, createStructuredFactConfirmation, FACT_RISK_KINDS,
+import { createFactLifecycleBinding, createLegacyFactBinding, createStructuredFactCandidateBinding,
+  createStructuredFactConfirmation, FACT_RISK_KINDS,
   type FactRisk, type NormalizedFactValue } from '../src/production-fact-sources.js';
 import { IngestionWorker } from '../src/ingestion-worker.js';
 import { Worker } from '../src/worker.js';
@@ -251,9 +253,135 @@ test('correction creates a new locked fact, explicit replacement preserves old l
   assert.equal(p.facts[0]!.value, old.value); assert.equal(p.facts[0]!.status, 'confirmed'); assert.equal(p.facts[0]!.locked, true);
   assert.equal(p.facts[0]!.confirmedBy, old.confirmedBy); assert.equal(p.facts[0]!.confirmedAt, old.confirmedAt);
   assert.equal(p.facts[0]!.supersededByFactId, replacement.id); assert.equal(p.facts[2]!.value, '12 kg'); assert.equal(p.facts[2]!.locked, true);
+  assert.equal(factIntegrityIsValid(p, p.facts[0]!), true); assert.equal(factIntegrityIsValid(p, p.facts[2]!), true);
+  assert.equal(p.facts[0]!.replacementTransitions!.length, 1); assert.deepEqual(p.facts[0]!.replacementTransitions, p.facts[2]!.replacementTransitions);
   assert.equal(p.sections[0]!.freshness, 'stale'); assert.equal(p.sections[1]!.freshness, 'current');
   assert.equal(p.storyboard!.freshness, 'stale'); assert.equal(p.storyboardCandidates![0]!.freshness, 'current');
   assert.deepEqual(availableConfirmedFacts(p).map(item => item.id).sort(), [unrelated.id, replacement.id].sort());
+});
+
+test('replacement is limited to the same applicability scope and fails atomically', async () => {
+  let p = await f.create(); p = await addEvidence(p, 'Model A power: high'); p = await addEvidence(p, 'Model A power: low');
+  const oldSource = source(p.evidence[0]!, 'Model A power: high', 'high');
+  p = await saveCandidate(p, candidate([oldSource], { kind: 'text', value: 'high' }, { attribute: 'power',
+    applicability: { models: { kind: 'all' }, conditions: [] } })); p = await confirm(p, p.facts[0]!);
+  const nextSource = source(p.evidence[1]!, 'Model A power: low', 'low');
+  p = await saveCandidate(p, candidate([nextSource], { kind: 'text', value: 'low' }, { attribute: 'power',
+    applicability: modelApplicability(nextSource, 'Model A', p.evidence[1]!), correctsFactId: p.facts[0]!.id }));
+  const detail = await details(p, p.facts[1]!);
+  assert.equal((detail.commands as { replaceFactId: string | null }).replaceFactId, null);
+  const before = structuredClone(p); const receiptCount = Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count);
+  const response = await f.post(`/api/projects/${p.id}/facts/${p.facts[1]!.id}/structured/confirm`, command(p, {
+    ...completeRiskReview(p.facts[1]!), replaceFactId: p.facts[0]!.id }));
+  assert.equal(response.statusCode, 409); assert.equal(response.json().error.code, 'INVALID_FACT_REPLACEMENT');
+  assert.deepEqual(await f.store.get(p.id), before);
+  assert.equal(Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count), receiptCount);
+});
+
+test('replacement transitions are reciprocal, project-unique and require a locked confirmed predecessor', async () => {
+  let p = await f.create(); p = await addEvidence(p, 'Capacity old: 10 kg'); p = await addEvidence(p, 'Capacity new: 12 kg');
+  const oldSource = source(p.evidence[0]!, 'Capacity old: 10 kg', '10 kg');
+  p = await saveCandidate(p, candidate([oldSource], { kind: 'decimal', value: '10', unit: 'kg' })); p = await confirm(p, p.facts[0]!);
+  const nextSource = source(p.evidence[1]!, 'Capacity new: 12 kg', '12 kg');
+  p = await saveCandidate(p, candidate([nextSource], { kind: 'decimal', value: '12', unit: 'kg' }, { correctsFactId: p.facts[0]!.id }));
+  p = await confirm(p, p.facts[1]!, { replaceFactId: p.facts[0]!.id });
+  const transition = p.facts[0]!.replacementTransitions![0]!;
+  assert.deepEqual(p.facts[1]!.replacementTransitions, [transition]);
+  assert.equal(p.facts.flatMap(fact => fact.replacementTransitions ?? []).filter(item => item.id === transition.id).length, 2);
+  assert.equal(factIntegrityIsValid(p, p.facts[0]!), true); assert.equal(factIntegrityIsValid(p, p.facts[1]!), true);
+
+  const oneSided = structuredClone(p); oneSided.facts[1]!.replacementTransitions = [];
+  oneSided.facts[1]!.lifecycleBinding = createFactLifecycleBinding(oneSided.facts[1]!, 'test-human',
+    'Persisted one-sided transition fixture', oneSided.facts[1]!.status);
+  assert.equal(factIntegrityReason(oneSided, oneSided.facts[0]!), 'INVALID_FACT_SUPERSESSION');
+  assert.equal(factIntegrityReason(oneSided, oneSided.facts[1]!), 'INVALID_FACT_SUPERSESSION');
+  assert.equal(factGovernanceHasBlockingIssue(oneSided), true); assert.deepEqual(availableConfirmedFacts(oneSided), []);
+
+  const unlockedPredecessor = structuredClone(p); const predecessor = unlockedPredecessor.facts[0]!;
+  predecessor.status = 'retracted'; predecessor.locked = false;
+  predecessor.lifecycleBinding = createFactLifecycleBinding(predecessor, 'test-human',
+    'Persisted invalid predecessor transition fixture', 'confirmed');
+  assert.equal(factIntegrityReason(unlockedPredecessor, predecessor), 'INVALID_FACT_SUPERSESSION');
+  assert.equal(factIntegrityReason(unlockedPredecessor, unlockedPredecessor.facts[1]!), 'INVALID_FACT_SUPERSESSION');
+
+  const malformedForeign = structuredClone(p);
+  (malformedForeign.facts[1]!.replacementTransitions as unknown[])!.push(null);
+  assert.doesNotThrow(() => factIntegrityReason(malformedForeign, malformedForeign.facts[0]!));
+  assert.equal(factIntegrityReason(malformedForeign, malformedForeign.facts[0]!), 'INVALID_FACT_SUPERSESSION');
+  assert.equal(factGovernanceHasBlockingIssue(malformedForeign), true);
+});
+
+test('a valid A to B to C replacement chain exposes only C and retracting C never revives predecessors', async () => {
+  let p = await f.create();
+  for (const text of ['Capacity A: 10 kg', 'Capacity B: 12 kg', 'Capacity C: 14 kg']) p = await addEvidence(p, text);
+  const aSource = source(p.evidence[0]!, 'Capacity A: 10 kg', '10 kg');
+  p = await saveCandidate(p, candidate([aSource], { kind: 'decimal', value: '10', unit: 'kg' }));
+  p = await confirm(p, p.facts[0]!); const aId = p.facts[0]!.id;
+  const bSource = source(p.evidence[1]!, 'Capacity B: 12 kg', '12 kg');
+  p = await saveCandidate(p, candidate([bSource], { kind: 'decimal', value: '12', unit: 'kg' }, { correctsFactId: aId }));
+  p = await confirm(p, p.facts[1]!, { replaceFactId: aId }); const bId = p.facts[1]!.id;
+  const cSource = source(p.evidence[2]!, 'Capacity C: 14 kg', '14 kg');
+  p = await saveCandidate(p, candidate([cSource], { kind: 'decimal', value: '14', unit: 'kg' }, { correctsFactId: bId }));
+  p = await confirm(p, p.facts[2]!, { replaceFactId: bId }); const cId = p.facts[2]!.id;
+
+  assert.ok(p.facts.every(fact => factIntegrityIsValid(p, fact)));
+  assert.deepEqual(availableConfirmedFacts(p).map(fact => fact.id), [cId]);
+  assert.equal(((await details(p, p.facts[0]!)).commands as { retract: boolean }).retract, false);
+  assert.equal(((await details(p, p.facts[1]!)).commands as { retract: boolean }).retract, false);
+  assert.equal(((await details(p, p.facts[2]!)).commands as { retract: boolean }).retract, true);
+  p = await f.write(p, `facts/${cId}/retract`, { reason: 'Withdraw the final successor after chain verification' });
+  assert.ok(p.facts.every(fact => factIntegrityIsValid(p, fact)));
+  assert.deepEqual(availableConfirmedFacts(p), []);
+  assert.equal(factGovernanceHasBlockingIssue(p), false);
+  assert.equal(p.facts.find(fact => fact.id === aId)!.status, 'confirmed');
+  assert.equal(p.facts.find(fact => fact.id === bId)!.status, 'confirmed');
+  assert.equal(p.facts.find(fact => fact.id === cId)!.status, 'retracted');
+});
+
+test('explicit reject and retract quarantine lifecycle-unbound active records without blessing confirmation', async () => {
+  let candidateProject = await f.create(); candidateProject = await addEvidence(candidateProject, 'Material: steel');
+  candidateProject = await saveCandidate(candidateProject, candidate([source(candidateProject.evidence[0]!, 'Material: steel', 'steel')],
+    { kind: 'text', value: 'steel' }, { attribute: 'material' }));
+  candidateProject = await f.store.command(candidateProject.id, command(candidateProject), 'test.lifecycle.remove.candidate', 'test-human', current => {
+    delete current!.facts[0]!.lifecycleBinding; return current!;
+  });
+  let response = await f.post(`/api/projects/${candidateProject.id}/facts/${candidateProject.facts[0]!.id}/structured/confirm`,
+    command(candidateProject, completeRiskReview(candidateProject.facts[0]!)));
+  assert.equal(response.statusCode, 409); assert.equal(response.json().error.code, 'INVALID_FACT_BINDING');
+  candidateProject = await f.write(candidateProject, `facts/${candidateProject.facts[0]!.id}/reject`,
+    { reason: 'Explicitly quarantine an unbound historical candidate' });
+  assert.equal(candidateProject.facts[0]!.status, 'rejected'); assert.equal(factIntegrityIsValid(candidateProject, candidateProject.facts[0]!), true);
+
+  let confirmedProject = await f.create(); confirmedProject = await addEvidence(confirmedProject, 'Material: aluminum');
+  confirmedProject = await f.write(confirmedProject, 'facts/candidates', { attribute: 'material', role: 'core', value: 'aluminum',
+    evidenceId: confirmedProject.evidence[0]!.id, quote: 'aluminum', reason: 'Legacy migration fixture' });
+  confirmedProject = await f.write(confirmedProject, `facts/${confirmedProject.facts[0]!.id}/confirm`, { reason: 'Confirm legacy migration fixture' });
+  confirmedProject = await f.store.command(confirmedProject.id, command(confirmedProject), 'test.lifecycle.remove.confirmed', 'test-human', current => {
+    delete current!.facts[0]!.lifecycleBinding; return current!;
+  });
+  confirmedProject = await f.write(confirmedProject, `facts/${confirmedProject.facts[0]!.id}/retract`,
+    { reason: 'Explicitly quarantine an unbound historical confirmation' });
+  assert.equal(confirmedProject.facts[0]!.status, 'retracted'); assert.equal(confirmedProject.facts[0]!.locked, false);
+  assert.equal(factIntegrityIsValid(confirmedProject, confirmedProject.facts[0]!), true);
+});
+
+test('retracted claims require explicit linked reconsideration', async () => {
+  let p = await f.create(); p = await addEvidence(p, 'Material: steel', 'first.txt'); p = await addEvidence(p, 'Material: steel', 'second.txt');
+  const first = source(p.evidence[0]!, 'Material: steel', 'steel');
+  p = await saveCandidate(p, candidate([first], { kind: 'text', value: 'steel' }, { attribute: 'material' }));
+  p = await confirm(p, p.facts[0]!); const retractedId = p.facts[0]!.id;
+  p = await f.write(p, `facts/${retractedId}/retract`, { reason: 'Withdraw the previously confirmed value' });
+  p = await f.write(p, 'runs', { skill: 'extract-facts' });
+  await new Worker(f.store, { generate: async () => ({ facts: [{ attribute: 'material', role: 'core', value: 'steel',
+    evidenceId: p.evidence[1]!.id, quote: 'steel' }] }) }).tick();
+  p = await f.store.get(p.id); assert.equal(p.facts.length, 1); assert.equal(p.facts[0]!.status, 'retracted');
+  const second = source(p.evidence[1]!, 'Material: steel', 'steel');
+  let response = await f.post(`/api/projects/${p.id}/facts/structured/candidates`, command(p,
+    candidate([second], { kind: 'text', value: 'steel' }, { attribute: 'material' })));
+  assert.equal(response.statusCode, 409); assert.equal(response.json().error.code, 'REJECTED_FACT_RECONSIDERATION_REQUIRED');
+  response = await f.post(`/api/projects/${p.id}/facts/structured/candidates`, command(p,
+    candidate([second], { kind: 'text', value: 'steel' }, { attribute: 'material', correctsFactId: retractedId })));
+  assert.equal(response.statusCode, 200, response.body);
 });
 
 test('a rejected claim cannot revive through a new evidence ID or model extraction without an explicit linked reconsideration', async () => {
@@ -297,6 +425,8 @@ test('multi-source withdrawal creates per-source tasks and each unchanged origin
   const second = source(currentMaterialEvidence(p, 1), 'Verified capacity: 10000 g', '10000 g');
   p = await saveCandidate(p, candidate([first, second], { kind: 'decimal', value: '10', unit: 'kg' })); p = await confirm(p, p.facts[0]!);
   const locked = structuredClone(p.facts[0]!);
+  const originalCandidateBinding = structuredClone(locked.structured!.candidateBinding);
+  const originalConfirmation = structuredClone(locked.structured!.confirmation);
   p = await f.store.command(p.id, command(p), 'test.source.downstream', 'test-human', current => {
     current!.sections.push(seedSection('00000000-0000-4000-8000-000000000011', [locked.id])); return current!;
   });
@@ -320,11 +450,91 @@ test('multi-source withdrawal creates per-source tasks and each unchanged origin
   p = await f.write(p, `facts/${locked.id}/sources/${second.id}/reconfirm`, { evidenceId: replacement2.id, reason: 'Second unchanged original verified' });
   assert.equal(availableConfirmedFacts(p).length, 1);
   assert.equal(p.facts[0]!.value, locked.value); assert.equal(p.facts[0]!.confirmedBy, locked.confirmedBy); assert.equal(p.facts[0]!.confirmedAt, locked.confirmedAt);
+  assert.deepEqual(p.facts[0]!.structured!.candidateBinding, originalCandidateBinding);
+  assert.deepEqual(p.facts[0]!.structured!.confirmation, originalConfirmation);
   assert.equal(p.facts[0]!.structured!.sources[0]!.contentSha256, locked.structured!.sources[0]!.contentSha256);
   assert.equal(p.facts[0]!.structured!.sources[1]!.contentSha256, locked.structured!.sources[1]!.contentSha256);
   assert.equal(p.sections[0]!.freshness, 'stale', 'source recovery never auto-refreshes downstream work');
+  const historyTampered = structuredClone(p);
+  historyTampered.facts[0]!.structured!.sources[0]!.reconfirmations!.pop();
+  assert.equal(factIntegrityReason(historyTampered, historyTampered.facts[0]!), 'INVALID_FACT_LIFECYCLE_BINDING');
   center = await f.app.inject({ url: `/api/projects/${p.id}/production/material-reviews`, headers: f.headers });
   assert.equal(center.json().tasks.filter((task: { type: string }) => task.type === 'fact_source_reconfirmation').length, 0);
+});
+
+test('material withdrawal preserves invalid lifecycle state for structured and legacy facts', async () => {
+  for (const kind of ['structured', 'legacy'] as const) {
+    let p = await f.write(await f.create(), 'production/initialize');
+    p = await addMaterial(p, 'Capacity: 10 kg', `${kind}.txt`); p = await decideMaterial(p, 0, 'product_evidence');
+    const evidence = currentMaterialEvidence(p, 0);
+    if (kind === 'structured') {
+      p = await saveCandidate(p, candidate([source(evidence, evidence.text, '10 kg')],
+        { kind: 'decimal', value: '10', unit: 'kg' }));
+      p = await confirm(p, p.facts[0]!);
+    } else {
+      p = await f.write(p, 'facts/candidates', { attribute: 'capacity', role: 'core', value: '10 kg',
+        evidenceId: evidence.id, quote: '10 kg', reason: 'Legacy withdrawal migration fixture' });
+      p = await f.write(p, `facts/${p.facts[0]!.id}/confirm`, { reason: 'Confirm legacy withdrawal fixture' });
+    }
+    p = await f.store.command(p.id, command(p), `test.withdrawal.invalid-lifecycle.${kind}`, 'test-human', current => {
+      delete current!.facts[0]!.lifecycleBinding; return current!;
+    });
+    p = await decideMaterial(p, 0, 'reference');
+    assert.equal(p.facts[0]!.lifecycleBinding, undefined, kind);
+    assert.equal(factIntegrityReason(p, p.facts[0]!), 'INVALID_FACT_LIFECYCLE_BINDING', kind);
+    assert.equal(kind === 'structured'
+      ? p.facts[0]!.structured!.sources[0]!.review!.status : p.facts[0]!.sourceReview!.status,
+    'reconfirmation_required', kind);
+    p = await decideMaterial(p, 0, 'product_evidence');
+    const response = await f.app.inject({ url: `/api/projects/${p.id}/production/material-reviews`, headers: f.headers });
+    const task = response.json().tasks.find((item: { type: string; factId?: string }) =>
+      item.type === 'fact_source_reconfirmation' && item.factId === p.facts[0]!.id);
+    assert.equal(task.status, 'blocked', kind); assert.equal(task.blockedReason, 'INVALID_FACT_BINDING', kind);
+    if (kind === 'legacy') {
+      const before = structuredClone(p);
+      const receiptCount = Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count);
+      const recovery = await f.post(`/api/projects/${p.id}/facts/${p.facts[0]!.id}/source/reconfirm`, command(p, {
+        evidenceId: currentMaterialEvidence(p, 0).id, reason: 'Invalid lifecycle must remain quarantined',
+      }));
+      assert.equal(recovery.statusCode, 409); assert.equal(recovery.json().error.code, 'INVALID_FACT_BINDING');
+      assert.deepEqual(await f.store.get(p.id), before);
+      assert.equal(Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count), receiptCount);
+    }
+  }
+});
+
+test('another invalid active fact blocks structured source recovery in tasks, details and the command atomically', async () => {
+  let p = await f.write(await f.create(), 'production/initialize');
+  p = await addMaterial(p, 'Capacity: 10 kg', 'recovery.txt'); p = await addMaterial(p, 'Material: steel', 'blocker.txt');
+  p = await decideMaterial(p, 0, 'product_evidence'); p = await decideMaterial(p, 1, 'product_evidence');
+  const targetSource = source(currentMaterialEvidence(p, 0), 'Capacity: 10 kg', '10 kg');
+  p = await saveCandidate(p, candidate([targetSource], { kind: 'decimal', value: '10', unit: 'kg' }));
+  p = await confirm(p, p.facts[0]!); const targetId = p.facts[0]!.id;
+  const blockerSource = source(currentMaterialEvidence(p, 1), 'Material: steel', 'steel');
+  p = await saveCandidate(p, candidate([blockerSource], { kind: 'text', value: 'steel' }, { attribute: 'material' }));
+  p = await confirm(p, p.facts[1]!);
+  p = await decideMaterial(p, 0, 'reference'); p = await decideMaterial(p, 0, 'product_evidence');
+  const replacement = currentMaterialEvidence(p, 0);
+  p = await f.store.command(p.id, command(p), 'test.source-recovery.invalid-other', 'test-human', current => {
+    const blocker = current!.facts[1]!; blocker.supersededByFactId = targetId;
+    blocker.lifecycleBinding = createFactLifecycleBinding(blocker, 'test-human',
+      'Persist invalid supersession beside a source recovery', blocker.status);
+    return current!;
+  });
+  let response = await f.app.inject({ url: `/api/projects/${p.id}/production/material-reviews`, headers: f.headers });
+  const task = response.json().tasks.find((item: { type: string; factId?: string }) =>
+    item.type === 'fact_source_reconfirmation' && item.factId === targetId);
+  assert.equal(task.status, 'blocked'); assert.equal(task.blockedReason, 'INVALID_FACT_BINDING');
+  const detail = await details(p, p.facts[0]!);
+  assert.deepEqual((detail.commands as { reconfirmSourceIds: string[] }).reconfirmSourceIds, []);
+  const before = structuredClone(p);
+  const receiptCount = Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count);
+  response = await f.post(`/api/projects/${p.id}/facts/${targetId}/sources/${targetSource.id}/reconfirm`, command(p, {
+    evidenceId: replacement.id, reason: 'Must not recover around another invalid active fact',
+  }));
+  assert.equal(response.statusCode, 409); assert.equal(response.json().error.code, 'INVALID_FACT_BINDING');
+  assert.deepEqual(await f.store.get(p.id), before);
+  assert.equal(Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count), receiptCount);
 });
 
 test('legacy fact details remain read-only and legacy confirmation semantics stay compatible', async () => {
@@ -338,9 +548,19 @@ test('legacy fact details remain read-only and legacy confirmation semantics sta
   assert.equal(p.facts[0]!.structured, undefined); assert.deepEqual(availableConfirmedFacts(p).map(item => item.id), [p.facts[0]!.id]);
   const maxActor = structuredClone(p); maxActor.facts[0]!.confirmedBy = 'a'.repeat(1000);
   maxActor.facts[0]!.legacyBinding = createLegacyFactBinding(maxActor.facts[0]!, maxActor.evidence[0]!);
+  maxActor.facts[0]!.lifecycleBinding = createFactLifecycleBinding(maxActor.facts[0]!, maxActor.facts[0]!.confirmedBy!,
+    'Validate the maximum persisted actor length', maxActor.facts[0]!.status);
   assert.deepEqual(availableConfirmedFacts(maxActor).map(item => item.id), [maxActor.facts[0]!.id]);
   maxActor.facts[0]!.confirmedBy += 'a';
   assert.throws(() => createLegacyFactBinding(maxActor.facts[0]!, maxActor.evidence[0]!));
+
+  p = await addEvidence(p, 'Capacity corrected: 12 kg');
+  const corrected = source(p.evidence[1]!, 'Capacity corrected: 12 kg', '12 kg');
+  p = await saveCandidate(p, candidate([corrected], { kind: 'decimal', value: '12', unit: 'kg' },
+    { correctsFactId: p.facts[0]!.id }));
+  p = await confirm(p, p.facts[1]!, { replaceFactId: p.facts[0]!.id });
+  const legacyPredecessor = await details(p, p.facts[0]!);
+  assert.equal((legacyPredecessor.commands as { retract: boolean }).retract, false);
 });
 
 test('historical structured facts with missing review or a stale contract version are never treated as currently usable', async () => {
@@ -364,6 +584,12 @@ test('numeric value spans use complete token boundaries and preserve Unicode or 
     { text: '重量：10（千克）', raw: '10（千克）', value: '10', unit: 'kg' as const },
     { text: '数量：10', raw: '10', value: '10', unit: 'count' as const, expectedRawUnit: null },
     { text: 'Weight: (10 kg)', raw: '10 kg', value: '10', unit: 'kg' as const },
+    { text: '净含量500克', raw: '500克', value: '500', unit: 'g' as const },
+    { text: '重量：１．５ ㎏', raw: '１．５ ㎏', value: '1.5', unit: 'kg' as const },
+    { text: '重量：10（kg）', raw: '10（kg）', value: '10', unit: 'kg' as const },
+    { text: '重量：10㎏', raw: '10㎏', value: '10', unit: 'kg' as const },
+    { text: 'Value: 10.', raw: '10', value: '10', unit: 'count' as const, expectedRawUnit: null },
+    { text: 'Value: 10 / note', raw: '10', value: '10', unit: 'count' as const, expectedRawUnit: null },
   ];
   for (const item of accepted) {
     let p = await f.create(); p = await addEvidence(p, item.text);
@@ -398,6 +624,36 @@ test('numeric value spans use complete token boundaries and preserve Unicode or 
     { text: 'Ratio: %10', raw: '10', value: '10', unit: 'count' as const, code: 'INCOMPLETE_VALUE_SPAN' },
     { text: 'Weight: 10 千克', raw: '10', value: '10', unit: 'count' as const, code: 'VALUE_SPAN_OMITS_UNIT' },
     { text: 'Weight: 10 (kg)', raw: '10', value: '10', unit: 'count' as const, code: 'VALUE_SPAN_OMITS_UNIT' },
+    { text: 'Weight: １．５ kg', raw: '５ kg', value: '5', unit: 'kg' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Weight: １﹒５ kg', raw: '５ kg', value: '5', unit: 'kg' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Ratio: １／２', raw: '１', value: '1', unit: 'count' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Weight: 10（kg）', raw: '10', value: '10', unit: 'count' as const, code: 'VALUE_SPAN_OMITS_UNIT' },
+    { text: 'Weight: 10㎏', raw: '10', value: '10', unit: 'count' as const, code: 'VALUE_SPAN_OMITS_UNIT' },
+    { text: 'Weight: 10 [kg]', raw: '10', value: '10', unit: 'count' as const, code: 'VALUE_SPAN_OMITS_UNIT' },
+    { text: 'Weight: 10【kg】', raw: '10', value: '10', unit: 'count' as const, code: 'VALUE_SPAN_OMITS_UNIT' },
+    { text: 'Weight: (10) kg', raw: '10', value: '10', unit: 'count' as const, code: 'VALUE_SPAN_OMITS_UNIT' },
+    { text: 'Weight: 10）kg', raw: '10', value: '10', unit: 'count' as const, code: 'VALUE_SPAN_OMITS_UNIT' },
+    { text: 'Rate: 10 m/s', raw: '10 m', value: '10', unit: 'm' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Rate: 10 mg·L⁻¹', raw: '10 mg', value: '10', unit: 'mg' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Energy: 10 kW·h', raw: '10 kW', value: '10', unit: 'kW' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Weight: ⁻5 kg', raw: '5 kg', value: '5', unit: 'kg' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Weight: kg 10', raw: '10', value: '10', unit: 'count' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Range: 10-20', raw: '10', value: '10', unit: 'count' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Range: 10–20', raw: '10', value: '10', unit: 'count' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Range: 10~20', raw: '10', value: '10', unit: 'count' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Tolerance: 10±0.5', raw: '10', value: '10', unit: 'count' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Minimum: ≥10', raw: '10', value: '10', unit: 'count' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Approx: ~10', raw: '10', value: '10', unit: 'count' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Open: 10+', raw: '10', value: '10', unit: 'count' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Area: 10×20', raw: '10', value: '10', unit: 'count' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Power: 10²', raw: '10', value: '10', unit: 'count' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Area: 10 m²', raw: '10 m', value: '10', unit: 'm' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Density: 10 kg/m²', raw: '10 kg', value: '10', unit: 'kg' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Price: $10', raw: '10', value: '10', unit: 'count' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Temperature: 10℃', raw: '10', value: '10', unit: 'count' as const, code: 'VALUE_SPAN_OMITS_UNIT' },
+    { text: 'Value: 10bananas', raw: '10', value: '10', unit: 'count' as const, code: 'VALUE_SPAN_OMITS_UNIT' },
+    { text: 'Value: 10 bananas', raw: '10', value: '10', unit: 'count' as const, code: 'VALUE_SPAN_OMITS_UNIT' },
+    { text: 'Value: 10 unknownUnit', raw: '10', value: '10', unit: 'count' as const, code: 'VALUE_SPAN_OMITS_UNIT' },
   ];
   for (const item of rejected) {
     let p = await f.create(); p = await addEvidence(p, item.text); const before = structuredClone(p);
@@ -482,7 +738,7 @@ test('persisted structured confirmation binding rejects field, evidence identity
     { name: 'canonical value', reason: 'INVALID_STRUCTURED_FACT_VALUE', mutate: fact => { fact.structured!.canonicalValue = { kind: 'decimal', dimension: 'mass', numerator: '11', denominator: '1' }; } },
     { name: 'raw value', reason: 'INVALID_STRUCTURED_FACT_SOURCE', mutate: fact => { fact.structured!.sources[0]!.rawValue = '11 kg'; } },
     { name: 'raw unit', reason: 'INVALID_STRUCTURED_FACT_VALUE', mutate: fact => { fact.structured!.sources[0]!.rawUnit = 'g'; } },
-    { name: 'same-text evidence identity', reason: 'INVALID_STRUCTURED_FACT_CANDIDATE_BINDING', mutate: (fact, evidenceId) => {
+    { name: 'same-text evidence identity', reason: 'INVALID_FACT_LIFECYCLE_BINDING', mutate: (fact, evidenceId) => {
       fact.evidenceId = evidenceId; fact.structured!.sources[0]!.evidenceId = evidenceId;
     } },
     { name: 'risk source anchor', reason: 'INVALID_STRUCTURED_FACT_RISK', mutate: fact => { fact.structured!.derivedRisks[0]!.sourceIds = [randomUUID()]; } },
@@ -515,6 +771,120 @@ test('persisted structured confirmation binding rejects field, evidence identity
       reason: 'A tainted confirmed fact cannot enter an edit' }));
     assert.equal(response.statusCode, 409, item.name); assert.deepEqual(await f.store.get(p.id), beforeEdit, item.name);
   }
+});
+
+test('lifecycle binding digest covers every transition field and confirmation attribution', async () => {
+  let p = await f.create(); p = await addEvidence(p, 'Material: steel');
+  p = await saveCandidate(p, candidate([source(p.evidence[0]!, 'Material: steel', 'steel')],
+    { kind: 'text', value: 'steel' }, { attribute: 'material' }));
+  p = await confirm(p, p.facts[0]!);
+  const mutators: { name: string; mutate: (binding: NonNullable<Fact['lifecycleBinding']>) => void }[] = [
+    { name: 'transitionId', mutate: binding => { binding.transitionId = randomUUID(); } },
+    { name: 'previousStatus', mutate: binding => { binding.previousStatus = 'confirmed'; } },
+    { name: 'status', mutate: binding => { binding.status = 'retracted'; } },
+    { name: 'actor', mutate: binding => { binding.actor = 'different-human'; } },
+    { name: 'at', mutate: binding => { binding.at = new Date(Date.parse(binding.at) + 1000).toISOString(); } },
+    { name: 'reason', mutate: binding => { binding.reason = 'Different persisted transition reason'; } },
+  ];
+  for (const item of mutators) {
+    const changed = structuredClone(p); item.mutate(changed.facts[0]!.lifecycleBinding!);
+    assert.equal(factIntegrityReason(changed, changed.facts[0]!), 'INVALID_FACT_LIFECYCLE_BINDING', item.name);
+  }
+  assert.throws(() => createFactLifecycleBinding(p.facts[0]!, 'different-human',
+    'Mismatched confirmation actor', 'candidate', p.facts[0]!.confirmedAt));
+  assert.throws(() => createFactLifecycleBinding(p.facts[0]!, p.facts[0]!.confirmedBy!,
+    'Mismatched confirmation time', 'candidate', new Date(Date.parse(p.facts[0]!.confirmedAt!) + 1000).toISOString()));
+});
+
+test('retracted lifecycle tampering fails every structured and legacy consumer closed without rewriting history', async () => {
+  for (const kind of ['structured', 'legacy'] as const) {
+    let p = await f.create(); p = await f.write(p, 'identity/confirm', { productName: `${kind} lifecycle fixture` });
+    p = await addEvidence(p, 'Material: steel');
+    if (kind === 'structured') {
+      p = await saveCandidate(p, candidate([source(p.evidence[0]!, 'Material: steel', 'steel')],
+        { kind: 'text', value: 'steel' }, { attribute: 'material' })); p = await confirm(p, p.facts[0]!);
+    } else {
+      p = await f.write(p, 'facts/candidates', { attribute: 'material', role: 'core', value: 'steel',
+        evidenceId: p.evidence[0]!.id, quote: 'steel', reason: 'Legacy lifecycle fixture' });
+      p = await f.write(p, `facts/${p.facts[0]!.id}/confirm`, { reason: 'Confirm legacy lifecycle fixture' });
+    }
+    const factId = p.facts[0]!.id;
+    p = await f.store.command(p.id, command(p), `test.lifecycle.downstream.${kind}`, 'test-human', current => {
+      current!.storyboard = seedStoryboard(randomUUID(), [factId]);
+      current!.sections.push(seedSection(randomUUID(), [factId])); current!.currentSectionId = current!.sections[0]!.id; return current!;
+    });
+    p = await f.write(p, `facts/${factId}/retract`, { reason: 'Legitimate explicit retraction' });
+    assert.equal(factIntegrityIsValid(p, p.facts[0]!), true, kind);
+    p = await f.store.command(p.id, command(p), `test.lifecycle.restore.${kind}`, 'test-human', current => {
+      current!.facts[0]!.status = 'confirmed'; current!.facts[0]!.locked = true; return current!;
+    });
+    const persisted = structuredClone(p);
+    assert.equal(factIntegrityReason(p, p.facts[0]!), 'INVALID_FACT_LIFECYCLE_BINDING', kind);
+    assert.deepEqual(availableConfirmedFacts(p), [], kind);
+    assert.deepEqual(skillInput(p, 'plan-section').confirmedFacts, [], kind);
+    assert.throws(() => checkSkillInputs(p, 'plan-section'), kind);
+    const detail = await details(p, p.facts[0]!);
+    assert.equal(detail.integrityValid, false, kind); assert.equal((detail.commands as { confirm: boolean }).confirm, false, kind);
+    const checked = structuredClone(p); preflight(checked);
+    assert.equal(checked.qa!.issueSeverity, 'blocker', kind);
+    assert.ok(checked.qa!.issues.includes('UNRESOLVED_FACT_CONFLICT'), kind);
+    assert.ok(checked.qa!.issues.includes(`INVALID_FACT_EVIDENCE:${factId}`), kind);
+    assert.deepEqual(await f.store.get(p.id), persisted, `${kind} reads must not rewrite history`);
+  }
+});
+
+test('invalid candidate lifecycle and arbitrary supersession stay visible and block both confirmation paths atomically', async () => {
+  let rejected = await f.write(await f.create(), 'production/initialize'); rejected = await addEvidence(rejected, 'Material: steel');
+  rejected = await saveCandidate(rejected, candidate([source(rejected.evidence[0]!, 'Material: steel', 'steel')],
+    { kind: 'text', value: 'steel' }, { attribute: 'material' }));
+  rejected = await f.write(rejected, `facts/${rejected.facts[0]!.id}/reject`, { reason: 'Reject before persisted tampering' });
+  rejected = await f.store.command(rejected.id, command(rejected), 'test.lifecycle.revive.rejected', 'test-human', current => {
+    current!.facts[0]!.status = 'candidate'; return current!;
+  });
+  let centerResponse = await f.app.inject({ url: `/api/projects/${rejected.id}/production/material-reviews`, headers: f.headers });
+  let reviewTask = centerResponse.json().tasks.find((item: { type: string; factId?: string }) =>
+    item.type === 'fact_review' && item.factId === rejected.facts[0]!.id);
+  assert.equal(reviewTask.status, 'blocked'); assert.equal(reviewTask.blockedReason, 'INVALID_FACT_BINDING');
+
+  let p = await f.write(await f.create(), 'production/initialize');
+  p = await addEvidence(p, 'Capacity: 10 kg'); p = await addEvidence(p, 'Capacity: 12 kg');
+  p = await saveCandidate(p, candidate([source(p.evidence[0]!, 'Capacity: 10 kg', '10 kg')],
+    { kind: 'decimal', value: '10', unit: 'kg' }));
+  p = await saveCandidate(p, candidate([source(p.evidence[1]!, 'Capacity: 12 kg', '12 kg')],
+    { kind: 'decimal', value: '12', unit: 'kg' }));
+  p = await f.store.command(p.id, command(p), 'test.fact.arbitrary-supersession', 'test-human', current => {
+    const blocker = current!.facts[0]!; blocker.supersededByFactId = current!.facts[1]!.id;
+    blocker.lifecycleBinding = createFactLifecycleBinding(blocker, 'test-human', 'Persisted arbitrary pointer fixture', blocker.status);
+    return current!;
+  });
+  assert.equal(factIntegrityReason(p, p.facts[0]!), 'INVALID_FACT_SUPERSESSION');
+  assert.equal(factGovernanceHasBlockingIssue(p), true);
+  centerResponse = await f.app.inject({ url: `/api/projects/${p.id}/production/material-reviews`, headers: f.headers });
+  const tasks = centerResponse.json().tasks.filter((item: { type: string }) => item.type === 'fact_review');
+  assert.equal(tasks.length, 2); assert.ok(tasks.every((item: { status: string; blockedReason: string }) =>
+    item.status === 'blocked' && item.blockedReason === 'INVALID_FACT_BINDING'));
+  const detail = await details(p, p.facts[1]!); assert.equal((detail.commands as { confirm: boolean }).confirm, false);
+  let before = structuredClone(p); let receiptCount = Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count);
+  let response = await f.post(`/api/projects/${p.id}/facts/${p.facts[1]!.id}/structured/confirm`,
+    command(p, completeRiskReview(p.facts[1]!)));
+  assert.equal(response.statusCode, 409); assert.equal(response.json().error.code, 'INVALID_FACT_BINDING');
+  assert.deepEqual(await f.store.get(p.id), before);
+  assert.equal(Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count), receiptCount);
+
+  let legacy = await f.create(); legacy = await addEvidence(legacy, 'Material: steel'); legacy = await addEvidence(legacy, 'Color: blue');
+  legacy = await f.write(legacy, 'facts/candidates', { attribute: 'material', role: 'core', value: 'steel',
+    evidenceId: legacy.evidence[0]!.id, quote: 'steel', reason: 'Invalid active legacy fixture' });
+  legacy = await f.write(legacy, 'facts/candidates', { attribute: 'color', role: 'core', value: 'blue',
+    evidenceId: legacy.evidence[1]!.id, quote: 'blue', reason: 'Legacy confirmation target' });
+  legacy = await f.store.command(legacy.id, command(legacy), 'test.lifecycle.remove.other', 'test-human', current => {
+    delete current!.facts[0]!.lifecycleBinding; return current!;
+  });
+  before = structuredClone(legacy); receiptCount = Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count);
+  response = await f.post(`/api/projects/${legacy.id}/facts/${legacy.facts[1]!.id}/confirm`,
+    command(legacy, { reason: 'Must not confirm around another invalid active fact' }));
+  assert.equal(response.statusCode, 409); assert.equal(response.json().error.code, 'INVALID_FACT_BINDING');
+  assert.deepEqual(await f.store.get(legacy.id), before);
+  assert.equal(Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count), receiptCount);
 });
 
 test('current applicability recomputes conflicts without trusting cached issueSeverity', async () => {
@@ -594,7 +964,7 @@ test('legacy confirmation attribution cannot be deleted from both fact and bindi
   }
 });
 
-test('material review center blocks a conflicting source recovery and omits superseded history', async () => {
+test('material review center blocks a conflicting source recovery and exposes invalid supersession', async () => {
   let p = await f.write(await f.create(), 'production/initialize');
   p = await addMaterial(p, 'Model A Model B power: high', 'high.txt');
   p = await addMaterial(p, 'Model A Model B power: low', 'low.txt');
@@ -621,5 +991,5 @@ test('material review center blocks a conflicting source recovery and omits supe
   });
   response = await f.app.inject({ url: `/api/projects/${p.id}/production/material-reviews`, headers: f.headers });
   task = response.json().tasks.find((item: { factId?: string }) => item.factId === p.facts[1]!.id);
-  assert.equal(task, undefined);
+  assert.equal(task.status, 'blocked'); assert.equal(task.blockedReason, 'INVALID_FACT_BINDING');
 });

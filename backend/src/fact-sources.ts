@@ -3,7 +3,8 @@ import type { Evidence, Fact, Project } from './contracts.js';
 import { refreshConflicts } from './domain.js';
 import { AppError } from './errors.js';
 import { availableConfirmedFacts, currentFactConflict, evaluateFactEligibility, evidenceIsAvailable,
-  factIntegrityIsValid, factSourceIsCurrent, recordMaterialExtraction } from './material-source-gates.js';
+  factIntegrityIsValid, factSourceIsCurrent, factSupersessionIsEffective, projectActiveFactIntegrityIsValid,
+  recordMaterialExtraction } from './material-source-gates.js';
 import type { MaterialWithdrawal } from './production-material-usage.js';
 import {
   FACT_NORMALIZATION_VERSION,
@@ -11,9 +12,12 @@ import {
   FACT_SOURCES_CONTRACT_VERSION,
   allStoredRisks,
   canonicalValuesEqual,
+  factApplicabilityScopesEqual,
+  createFactLifecycleBinding,
   createStructuredFactCandidateBinding,
   createStructuredFactConfirmation,
   decimalValueSpanIssue,
+  factLifecycleBindingIsValid,
   factsConflict,
   normalizeFactKey,
   normalizeFactText,
@@ -94,6 +98,12 @@ function validateProposedRisks(structured: Pick<StructuredFact, 'sources' | 'pro
 function candidateConflicts(p: Project, fact: Fact, excludedId?: string): Fact | undefined {
   return currentFactConflict(p, fact, excludedId);
 }
+function replacementTargetIsValid(p: Project, candidate: Fact, target: Fact | undefined): target is Fact {
+  return !!target && candidate.correctsFactId === target.id && target.status === 'confirmed' && target.locked
+    && factIntegrityIsValid(p, target) && !factSupersessionIsEffective(p, target)
+    && normalizeFactKey(target.attribute) === normalizeFactKey(candidate.attribute) && target.role === candidate.role
+    && factApplicabilityScopesEqual(target, candidate);
+}
 function markFactDependentsStale(p: Project, factId: string) {
   for (const section of p.sections) if (section.factIds.includes(factId)) section.freshness = 'stale';
   if (p.storyboard?.chapters.some(chapter => chapter.factIds.includes(factId))) p.storyboard.freshness = 'stale';
@@ -141,6 +151,7 @@ export function addStructuredFactCandidate(p: Project, input: StructuredFactCand
     issueSeverity: structuredRiskSeverity(structured), structured,
   };
   structured.candidateBinding = createStructuredFactCandidateBinding(fact);
+  fact.lifecycleBinding = createFactLifecycleBinding(fact, actor, input.reason, null);
   const rejected = rejectedFactRequiringReconsideration(p.facts, fact);
   if (rejected && input.correctsFactId !== rejected.id)
     throw new AppError('REJECTED_FACT_RECONSIDERATION_REQUIRED', 409, { factId: rejected.id });
@@ -171,7 +182,7 @@ export function confirmStructuredFact(p: Project, factId: string, input: Structu
   if (!fact) throw new AppError('FACT_NOT_FOUND', 404);
   if (!fact.structured) throw new AppError('STRUCTURED_FACT_REQUIRED', 409);
   if (fact.status !== 'candidate') throw new AppError('FACT_NOT_CANDIDATE', 409);
-  if (!factIntegrityIsValid(p, fact)) throw new AppError('INVALID_FACT_BINDING', 409);
+  if (!projectActiveFactIntegrityIsValid(p)) throw new AppError('INVALID_FACT_BINDING', 409);
   if (!factSourceIsCurrent(p, fact)) throw new AppError('INVALID_EVIDENCE', 409);
   if (structuredRiskSeverity(fact.structured) === 'blocker') throw new AppError('BLOCKING_FACT_RISK', 409);
   const review = storedRiskReview(fact, input, actor);
@@ -180,18 +191,27 @@ export function confirmStructuredFact(p: Project, factId: string, input: Structu
     if (fact.correctsFactId !== input.replaceFactId) throw new AppError('INVALID_FACT_REPLACEMENT', 409);
     replaced = p.facts.find(item => item.id === input.replaceFactId);
     if (!replaced) throw new AppError('FACT_NOT_FOUND', 404);
-    if (replaced.status !== 'confirmed' || !replaced.locked || replaced.supersededByFactId)
+    if (replaced.status !== 'confirmed' || !replaced.locked || !factIntegrityIsValid(p, replaced)
+      || factSupersessionIsEffective(p, replaced))
       throw new AppError('FACT_NOT_REPLACEABLE', 409);
+    if (!replacementTargetIsValid(p, fact, replaced))
+      throw new AppError('INVALID_FACT_REPLACEMENT', 409);
   }
   if (candidateConflicts(p, fact, replaced?.id)) throw new AppError('UNRESOLVED_FACT_CONFLICT', 409);
   fact.structured.riskReview = review;
   fact.status = 'confirmed'; fact.locked = true; fact.confirmedBy = actor; fact.confirmedAt = review.reviewedAt;
   fact.structured.confirmation = createStructuredFactConfirmation(fact);
   if (replaced) {
+    const transition = { id: randomUUID(), predecessorFactId: replaced.id, successorFactId: fact.id,
+      actor, at: review.reviewedAt, reason: input.reason };
     replaced.supersededByFactId = fact.id; replaced.supersededBy = actor;
     replaced.supersededAt = review.reviewedAt; replaced.supersededReason = input.reason;
+    (replaced.replacementTransitions ??= []).push(structuredClone(transition));
+    (fact.replacementTransitions ??= []).push(structuredClone(transition));
+    replaced.lifecycleBinding = createFactLifecycleBinding(replaced, actor, input.reason, replaced.status, review.reviewedAt);
     markFactDependentsStale(p, replaced.id);
   }
+  fact.lifecycleBinding = createFactLifecycleBinding(fact, actor, input.reason, 'candidate', review.reviewedAt);
   p.version++;
   refreshConflicts(p);
   audit(p, replaced ? 'fact.structured_replaced' : 'fact.structured_confirmed', actor, {
@@ -226,7 +246,7 @@ export function reconfirmStructuredFactSource(p: Project, factId: string, source
   const fact = p.facts.find(item => item.id === factId);
   if (!fact) throw new AppError('FACT_NOT_FOUND', 404);
   if (!fact.structured || fact.status !== 'confirmed' || !fact.locked) throw new AppError('STRUCTURED_FACT_REQUIRED', 409);
-  if (!factIntegrityIsValid(p, fact)) throw new AppError('INVALID_FACT_BINDING', 409);
+  if (!projectActiveFactIntegrityIsValid(p)) throw new AppError('INVALID_FACT_BINDING', 409);
   const source = fact.structured.sources.find(item => item.id === sourceId);
   if (!source) throw new AppError('FACT_SOURCE_NOT_FOUND', 404);
   if (structuredSourceReconfirmIsUnchanged(p, factId, sourceId, input.evidenceId)) return;
@@ -242,15 +262,13 @@ export function reconfirmStructuredFactSource(p: Project, factId: string, source
   candidateSource.evidenceId = evidence.id; delete candidateSource.review;
   (candidateSource.reconfirmations ??= []).push(reconfirmation);
   if (candidate.structured!.sources[0]!.id === sourceId) candidate.evidenceId = evidence.id;
-  candidate.structured!.candidateBinding = createStructuredFactCandidateBinding(candidate);
-  candidate.structured!.confirmation = createStructuredFactConfirmation(candidate);
+  candidate.lifecycleBinding = createFactLifecycleBinding(candidate, actor, input.reason, candidate.status, at);
   if (!factIntegrityIsValid(p, candidate)) throw new AppError('INVALID_RECONFIRMATION_SOURCE', 409);
   if (candidateConflicts(p, candidate)) throw new AppError('UNRESOLVED_FACT_CONFLICT', 409);
   (source.reconfirmations ??= []).push(reconfirmation);
   source.evidenceId = evidence.id; delete source.review;
   if (fact.structured.sources[0]!.id === sourceId) fact.evidenceId = evidence.id;
-  fact.structured.candidateBinding = createStructuredFactCandidateBinding(fact);
-  fact.structured.confirmation = createStructuredFactConfirmation(fact);
+  fact.lifecycleBinding = createFactLifecycleBinding(fact, actor, input.reason, fact.status, at);
   p.version++;
   refreshConflicts(p);
   audit(p, 'fact.structured_source_reconfirmed', actor, { factId, sourceId, previousEvidenceId, evidenceId: evidence.id,
@@ -262,14 +280,15 @@ export function invalidateStructuredFactSources(p: Project, evidenceIds: string[
   const ids = new Set(evidenceIds);
   for (const fact of p.facts) {
     if (!fact.structured || !['candidate', 'confirmed'].includes(fact.status)) continue;
+    const lifecycleWasValid = factLifecycleBindingIsValid(fact);
     for (const source of fact.structured.sources) {
       if (!ids.has(source.evidenceId) || source.review) continue;
       source.review = { ...withdrawal, evidenceId: source.evidenceId,
         status: fact.status === 'confirmed' && fact.locked ? 'reconfirmation_required' : 'invalidated' };
-      if (fact.status === 'confirmed' && fact.locked && fact.confirmedBy && fact.confirmedAt)
-        fact.structured.confirmation = createStructuredFactConfirmation(fact);
       affected.push({ factId: fact.id, sourceId: source.id, evidenceId: source.evidenceId });
     }
+    if (lifecycleWasValid && affected.some(item => item.factId === fact.id))
+      fact.lifecycleBinding = createFactLifecycleBinding(fact, withdrawal.actor, withdrawal.reason, fact.status, withdrawal.at);
   }
   return affected;
 }
@@ -285,7 +304,7 @@ export function replacementEvidenceForStructuredSource(p: Project, source: Struc
 }
 export function structuredSourceReconfirmationBlockReason(p: Project, fact: Fact, source: StructuredFactSource,
   evidence: Evidence): 'INVALID_FACT_BINDING' | 'UNRESOLVED_FACT_CONFLICT' | undefined {
-  if (!factIntegrityIsValid(p, fact)) return 'INVALID_FACT_BINDING';
+  if (!projectActiveFactIntegrityIsValid(p)) return 'INVALID_FACT_BINDING';
   const candidate = structuredClone(fact);
   const candidateSource = candidate.structured?.sources.find(item => item.id === source.id);
   if (!candidate.structured || !candidateSource) return 'INVALID_FACT_BINDING';
@@ -293,8 +312,8 @@ export function structuredSourceReconfirmationBlockReason(p: Project, fact: Fact
   delete candidateSource.review;
   if (candidate.structured.sources[0]!.id === source.id) candidate.evidenceId = evidence.id;
   try {
-    candidate.structured.candidateBinding = createStructuredFactCandidateBinding(candidate);
-    candidate.structured.confirmation = createStructuredFactConfirmation(candidate);
+    const binding = fact.lifecycleBinding!;
+    candidate.lifecycleBinding = createFactLifecycleBinding(candidate, binding.actor, binding.reason, candidate.status, binding.at);
   }
   catch { return 'INVALID_FACT_BINDING'; }
   if (!factIntegrityIsValid(p, candidate)) return 'INVALID_FACT_BINDING';
@@ -311,8 +330,9 @@ export function factSourceDetails(p: Project, factId: string) {
   const fact = p.facts.find(item => item.id === factId);
   if (!fact) throw new AppError('FACT_NOT_FOUND', 404);
   const integrityValid = factIntegrityIsValid(p, fact);
+  const projectIntegrityValid = projectActiveFactIntegrityIsValid(p);
   const eligibility = evaluateFactEligibility(p, fact);
-  const conflictFactIds = integrityValid ? p.facts.filter(other => other.id !== fact.id && !other.supersededByFactId
+  const conflictFactIds = integrityValid ? p.facts.filter(other => other.id !== fact.id && !factSupersessionIsEffective(p, other)
     && factSourceIsCurrent(p, other) && factsConflict(fact, other)).map(item => item.id) : [];
   if (!fact.structured) {
     const evidence = p.evidence.find(item => item.id === fact.evidenceId);
@@ -324,16 +344,16 @@ export function factSourceDetails(p: Project, factId: string) {
       normalization: { status: 'not_performed', legacyValue: fact.value },
       risks: { status: 'not_assessed', automaticSemanticRiskDetection: 'not_performed' },
       applicability: { models: { kind: 'unspecified' }, conditions: [] }, conflictFactIds,
-      commands: { confirm: fact.status === 'candidate' && integrityValid && factSourceIsCurrent(p, fact)
+      commands: { confirm: fact.status === 'candidate' && integrityValid && projectIntegrityValid && factSourceIsCurrent(p, fact)
           && conflictFactIds.length === 0,
-        reject: fact.status === 'candidate', retract: fact.status === 'confirmed' } };
+        reject: fact.status === 'candidate', retract: fact.status === 'confirmed' && !factSupersessionIsEffective(p, fact) } };
   }
   if (!integrityValid) return {
     contractVersion: FACT_SOURCES_CONTRACT_VERSION, projectId: p.id, projectVersion: p.version, revision: p.revision,
     fact, structured: true, integrityValid, eligibility, currentUsable: false, sources: [],
     normalization: { status: 'invalid' }, applicability: null, risks: { status: 'invalid' }, conflictFactIds,
     commands: { confirm: false, replaceFactId: null, reject: fact.status === 'candidate',
-      retract: fact.status === 'confirmed', reconfirmSourceIds: [] },
+      retract: fact.status === 'confirmed' && !factSupersessionIsEffective(p, fact), reconfirmSourceIds: [] },
   };
   const sources = fact.structured.sources.map(source => ({ ...source,
     available: !source.review && !!p.evidence.find(item => item.id === source.evidenceId && evidenceIsAvailable(p, item)
@@ -344,6 +364,7 @@ export function factSourceDetails(p: Project, factId: string) {
   const hasBlockingRisk = structuredRiskSeverity(fact.structured) === 'blocker';
   const sourcesAvailable = sources.every(source => source.available);
   const directConflictFactIds = conflictFactIds.filter(id => id !== fact.correctsFactId);
+  const replacementTarget = fact.correctsFactId ? p.facts.find(item => item.id === fact.correctsFactId) : undefined;
   return { contractVersion: FACT_SOURCES_CONTRACT_VERSION, projectId: p.id, projectVersion: p.version, revision: p.revision,
     fact, structured: true, integrityValid, eligibility,
     currentUsable: availableConfirmedFacts(p).some(item => item.id === fact.id), sources,
@@ -353,9 +374,10 @@ export function factSourceDetails(p: Project, factId: string) {
     risks: { proposed: fact.structured.proposedRisks, derived: fact.structured.derivedRisks,
       review: fact.structured.riskReview ?? null, policy: fact.structured.riskPolicy },
     conflictFactIds,
-    commands: { confirm: fact.status === 'candidate' && sourcesAvailable && !hasBlockingRisk && conflictFactIds.length === 0,
-      replaceFactId: fact.status === 'candidate' && sourcesAvailable && !hasBlockingRisk && directConflictFactIds.length === 0
-        && fact.correctsFactId && conflictFactIds.includes(fact.correctsFactId) ? fact.correctsFactId : null,
-      reject: fact.status === 'candidate', retract: fact.status === 'confirmed',
-      reconfirmSourceIds: sources.filter(source => source.review?.status === 'reconfirmation_required').map(source => source.id) } };
+    commands: { confirm: fact.status === 'candidate' && projectIntegrityValid && sourcesAvailable && !hasBlockingRisk && conflictFactIds.length === 0,
+      replaceFactId: fact.status === 'candidate' && projectIntegrityValid && sourcesAvailable && !hasBlockingRisk && directConflictFactIds.length === 0
+        && replacementTargetIsValid(p, fact, replacementTarget) && conflictFactIds.includes(replacementTarget.id) ? replacementTarget.id : null,
+      reject: fact.status === 'candidate', retract: fact.status === 'confirmed' && !factSupersessionIsEffective(p, fact),
+      reconfirmSourceIds: projectIntegrityValid
+        ? sources.filter(source => source.review?.status === 'reconfirmation_required').map(source => source.id) : [] } };
 }

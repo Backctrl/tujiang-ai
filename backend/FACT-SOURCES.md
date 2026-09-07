@@ -8,7 +8,7 @@
 
 旧单来源事实在详情读取时得到一个只读来源视图，不回填或修改项目、历史修订、确认人/时间或幂等回执，也不声称旧 value 已通过新增的单位校验。普通 GET 和重复 migrate 不将旧对象自动升级或批准。fact-sources.2 上线前已经持久化、且没有服务端 legacy-fact-binding.1 摘要的旧 confirmed fact 从全局当前可用集合中排除；需要员工重新创建候选并确认，不能由读取或迁移静默放行。上线后通过旧入口确认或按原 2B2 规则重确认的单来源事实会取得 legacy binding；事实和 binding 都必须保留非空确认人及 ISO 时间，任一缺失或不一致都会从所有消费路径闭锁，读取和 preflight 不会静默修复历史。有效 legacy fact 可继续用于 stage-a.1 下游，但 `formalFreezeEligible` 始终为 false，并返回 `LEGACY_FACT_NOT_STRUCTURED`。现有旧模型提取 Schema 保持不变；本包通过结构化人工候选接口组合多个来源。
 
-旧 confirm 和 source/reconfirm 命令只处理旧事实。新结构化事实的确认、替换和逐来源重确认使用新命令，避免旧 Inspector 只展示一条来源便确认完整的新语义。拒绝候选和显式撤回仍保留既有人工入口；不存在批量确认。
+旧 confirm 和 source/reconfirm 命令只处理旧事实。新结构化事实的确认、替换和逐来源重确认使用新命令，避免旧 Inspector 只展示一条来源便确认完整的新语义。拒绝候选和显式撤回仍保留既有人工入口；不存在批量确认。每条新事实另有 `fact-lifecycle-binding.1`，绑定当前 status/locked、确认归属、来源撤回与重确认链、纠错和替换关系。缺少或不匹配该绑定的 active 记录不会进入任何消费路径，也不能确认；员工仍可通过单条 reject/retract 显式隔离旧记录，该动作只改变为非 active 状态并留下新生命周期绑定，不补签原确认或静默迁移。
 
 ## 最小接口
 
@@ -91,7 +91,7 @@ sources 为 1–10 项。quote、valueSpan、型号范围的 start/end 均为 Ev
 
 文字规范化只允许 Unicode NFKC、首尾和重复空白处理，不做释义、翻译或事实改写；每条原始值应得到同一个规范化值。
 
-数值使用有界十进制字符串和精确有理数运算，明确原始单位及目标单位；不使用浮点近似或未声明容差。只支持文档列出的有限单位与精确换算，不接受客户端声明“已核验”替代校验。目标值/单位必须与所有来源在允许换算下相等；量纲不一致、单位遗漏、数值裁切或单位矛盾均拒绝。例如原文 10 kg 不能规范化成 10 lb；原文数值片段故意漏掉相邻单位也不能绕过检查。完整数值边界覆盖正负号、整数和小数的前后数字、ASCII/全角/Unicode 分组或小数分隔符、Unicode 单位，以及 `10 (kg)` / `10（千克）` 形式的括号单位。当前未声明支持的分组格式整段也不会被推断为安全数值；调用方可改用逐字文字候选。
+数值使用有界十进制字符串和精确有理数运算，明确原始单位及目标单位；不使用浮点近似或未声明容差。只支持文档列出的有限单位与精确换算，不接受客户端声明“已核验”替代校验。目标值/单位必须与所有来源在允许换算下相等；量纲不一致、单位遗漏、数值裁切或单位矛盾均拒绝。例如原文 10 kg 不能规范化成 10 lb；原文数值片段故意漏掉相邻单位也不能绕过检查。完整数值边界先对数值前后有限上下文做 NFKC，再覆盖正负号、整数/小数/分数的前后数字、ASCII/全角/Unicode 分组或小数分隔符、范围/容差/比较符、货币与温度前后缀、Unicode 上标、Unicode 单位、复合单位连接符，以及 `10 (kg)`、`(10) kg`、`10）kg`、`10（千克）` 形式的括号单位。保存的 quote/valueSpan 仍严格使用原 Evidence 的 UTF-16 偏移和原文，不被归一化改写。当前未声明支持的分组、范围或复合单位整段不会被推断为安全单值；调用方可改用逐字文字候选。
 
 首批单位限定质量 mg/g/kg/oz/lb、长度 mm/cm/m/in/ft、体积 mL/L、时间 ms/s/min/h，以及 V/A/mA/W/kW、百分数和无单位计数；同时接受文档所列量纲的常用中文单位别名。精确系数随 normalizationVersion 固定。超出支持范围的内容可保留为逐字文字候选，不获得数值换算已验证的标记；转换词义或处理测量四舍五入留给后续显式能力。
 
@@ -107,11 +107,11 @@ sources 为 1–10 项。quote、valueSpan、型号范围的 start/end 均为 Ev
 
 修改来源集合、规范化值、型号/条件或风险时，创建含完整新结构的候选，并用 correctsFactId 关联原事实。保存候选只增加内部 Revision，原已确认事实保持值、锁定状态、确认人/时间和来源历史。
 
-确认新候选可以明确提供 replaceFactId（必须对应 correctsFactId）。事务在确认新事实的同时给旧事实追加 supersededByFactId 关系，并将仅引用旧事实的 Section/Storyboard 标记为 stale；旧事实的值、status=confirmed、locked=true 和原确认人/时间保持原样。当前有效事实选择排除已被替换者，所有下游引用闸门同样排除。只忽略被明确替换的这一条旧事实，其他重叠冲突仍阻断确认。若用户要并存两种型号，则不提供替换指令，并须通过范围互斥检查。
+确认新候选可以明确提供 replaceFactId（必须对应 correctsFactId）。替换只允许相同 attribute、role 和等价 applicability（型号 kind/规范化型号集合及条件文本均相同）的同一业务槽，不能用 broad→specified 或条件变化整体隐藏旧事实。事务在确认新事实的同时写入一条项目内唯一的 replacement transition；旧、新事实各保存且只保存一份逐字段一致的副本，并与旧事实的 superseded 字段、新事实的 correctsFactId、确认操作者和时间互相校验。旧事实必须继续保持 status=confirmed、locked=true 和原确认人/时间；任一单边、重复、断链、循环或任意 supersededByFactId 都会让关系双方及项目治理 fail-closed。有效关系才会从当前集合排除旧事实，并将引用旧事实的 Section/Storyboard 标记为 stale；其他重叠冲突仍阻断确认。若用户要并存两种型号，则不提供替换指令，并须通过范围互斥检查。
 
 有 blocker 风险的候选不可确认；warning 风险需在单条确认卡中逐项声明已查看并给理由，同时仍须完成六个固定类别的风险复核。风险声明不能覆盖服务端计算的来源不可用、单位矛盾或冲突 blocker。客户端 risks 为空、遗漏或内容错误都不会删除服务端派生风险，也不会把语义风险人工责任变成“系统已检查”。
 
-任一已绑定来源被用途撤回，结构化候选失效；已锁定事实保留并要求逐来源重确认，即使其他来源仍可用也不会自动删除被撤回的来源来放行。每次恢复须指向同原件、同块、同内容的新 product_evidence 投影，验证所有原始定位、值和范围锚点，追加记录后才清除该来源的待处理项。其他失效来源仍阻断，原确认人/时间和锁定值始终保留。待处理中心过滤 superseded 历史事实；候选有重叠冲突或当前 blocker 风险时分别返回 `UNRESOLVED_FACT_CONFLICT` 或 `BLOCKING_FACT_RISK`（冲突优先），来源恢复缺少替代来源、绑定不完整或恢复后会冲突时也返回 `blocked` 和稳定 `blockedReason`，不会产生永远返回 409 的 pending/ready 任务。旧单来源恢复行为保持 2B2 语义。
+任一已绑定来源被用途撤回，结构化候选失效；已锁定事实保留并要求逐来源重确认，即使其他来源仍可用也不会自动删除被撤回的来源来放行。资料撤回只刷新原本有效的 lifecycle binding；缺少或不匹配绑定的历史 active 记录继续保持无效，不能借用途变更获得新绑定。每次恢复须指向同原件、同块、同内容的新 product_evidence 投影，验证所有原始定位、值和范围锚点，追加不可删改的来源恢复记录后才清除该来源的待处理项。重确认不会重写最初的 candidate binding、structured confirmation 或 legacy binding；这些 proof 对同内容的等价 projection ID 稳定，当前 projection 与完整恢复链由 lifecycle binding 另行绑定。其他失效来源或项目内任一无效 active 事实仍阻断恢复，原确认人/时间和锁定值始终保留。待处理中心只过滤经完整验证的 superseded 历史事实；任一无效 active 候选都保留为 `INVALID_FACT_BINDING` blocked 任务，受影响的来源恢复任务也以该原因阻断。候选有重叠冲突或当前 blocker 风险时分别返回 `UNRESOLVED_FACT_CONFLICT` 或 `BLOCKING_FACT_RISK`（完整性失败优先），来源恢复缺少替代来源、绑定不完整或恢复后会冲突时也返回 `blocked` 和稳定 `blockedReason`，不会产生永远返回 409 的 pending/ready 任务。旧单来源恢复行为保持 2B2 语义。
 
 如果原始内容、值或适用范围已改变，来源重确认不能处理，必须创建新候选并重新审核。恢复来源或确认新候选不会自动让旧 Section、QA 或交付重新变为 current/approved。
 
@@ -125,9 +125,9 @@ sources 为 1–10 项。quote、valueSpan、型号范围的 start/end 均为 Ev
 
 `evaluateFactEligibility(project, fact)` 是下游共享的纯函数，返回当前 `eligible/reasons` 和供 3A2 使用的 `formalFreezeEligible/formalFreezeReasons`。reason code 包括事实状态、来源不可用、结构化契约/值/来源/适用范围/风险/候选摘要/确认摘要错误、项目内其它事实完整性失败、当前动态治理 blocker、事实冲突、被替换，以及 legacy 未结构化边界。详情读取直接返回同一结果；`availableConfirmedFacts`、模型输入、人工 Storyboard/Section 编辑与 QA 使用相同判定。
 
-结构化事实每次进入当前可用集合时都会从持久 JSON 重新验证：兼容字段和候选摘要；显示值、normalized 与 canonical 值；每个 raw value/unit、quote/valueSpan 和 Evidence ID/内容哈希；型号与条件来源锚点；风险来源锚点和服务端派生风险；全类别人工复核；确认人、确认时间和确认摘要。同文但不同 Evidence ID 不能替换已绑定来源。候选确认、来源重确认和其无变化快捷路径也先执行完整性校验，不能用一次新命令覆盖或合法化数据库篡改。
+结构化事实每次进入当前可用集合时都会从持久 JSON 重新验证：兼容字段和不可重签的候选摘要；显示值、normalized 与 canonical 值；每个 raw value/unit、quote/valueSpan 和当前 Evidence ID/内容哈希；型号与条件来源锚点；风险来源锚点和服务端派生风险；全类别人工复核；确认人、确认时间和不可重签的确认摘要；当前 lifecycle binding；双向替换事件。同文但不同 Evidence ID 不能直接替换已绑定来源，只能经同原件/同块/同内容的显式重确认追加到来源链。候选确认前还会检查项目内所有其他 active 事实的完整性，不能借伪造 superseded 指针隐藏 blocker。候选确认、来源重确认和其无变化快捷路径也先执行完整性校验，不能用一次新命令覆盖或合法化数据库篡改。
 
-重复模型提取在相同属性/值且范围可能重叠时，不能因 Evidence 换 ID、用途循环或原来源撤回而绕过已拒绝结果。旧 rejected 记录保持 rejected；重新考虑须通过明确关联原记录、给出理由的人工候选入口，不自动由增量提取完成。
+重复模型提取在相同属性/值且范围可能重叠时，不能因 Evidence 换 ID、用途循环或原来源撤回而绕过已拒绝或已撤回事实。旧 rejected/retracted 记录保持原状态；重新考虑须通过明确关联原记录、给出理由的人工候选入口，不自动由增量提取完成。
 
 ## 验证计划
 

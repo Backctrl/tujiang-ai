@@ -5,11 +5,12 @@ import { LocalObjects } from './objects.js';
 import { requireProduction } from './production.js';
 import type { MaterialUsageInput, MaterialSourceImpact, MaterialProvenance, MaterialUsageDecision, MaterialReviewCenter } from './production-material-usage.js';
 import { currentFactConflict, evidenceIsAvailable, factIntegrityIsValid, factSourceIsCurrent,
-  materialLocatorText } from './material-source-gates.js';
+  factSupersessionIsEffective, materialLocatorText, projectActiveFactIntegrityIsValid } from './material-source-gates.js';
 import { audit } from './store.js';
 import { invalidateStructuredFactSources, replacementEvidenceForStructuredSource, structuredSourceImpact,
   structuredSourceReconfirmationBlockReason } from './fact-sources.js';
-import { createLegacyFactBinding, structuredRiskSeverity } from './production-fact-sources.js';
+import { prepareLegacyFactSourceReconfirmation } from './domain.js';
+import { createFactLifecycleBinding, factLifecycleBindingIsValid, structuredRiskSeverity } from './production-fact-sources.js';
 
 /** Shared impact calculation; a future formal-baseline adapter can consume the same source set. */
 export function materialSourceImpact(p: Project, materialId: string, blockIds: string[]): MaterialSourceImpact {
@@ -94,8 +95,11 @@ export async function reviewMaterialUsage(p: Project, materialId: string, input:
   for (const fact of p.facts) {
     if (fact.structured) continue;
     if (!impact.affectedFactIds.includes(fact.id) || !['candidate', 'confirmed'].includes(fact.status)) continue;
+    const lifecycleWasValid = factLifecycleBindingIsValid(fact);
     fact.sourceReview = { ...withdrawn, evidenceId: fact.evidenceId,
       status: fact.status === 'confirmed' ? 'reconfirmation_required' : 'invalidated' };
+    if (lifecycleWasValid)
+      fact.lifecycleBinding = createFactLifecycleBinding(fact, withdrawn.actor, withdrawn.reason, fact.status, withdrawn.at);
   }
   for (const section of p.sections) if (impact.affectedSectionIds.includes(section.id)) section.freshness = 'stale';
   // Legacy storyboards can have no id; still mark their actual dependencies stale.
@@ -114,6 +118,7 @@ export function replacementEvidence(p: Project, evidence: Evidence, quote: strin
 export function materialReviewCenter(p: Project): MaterialReviewCenter {
   const production = requireProduction(p);
   const tasks: MaterialReviewCenter['tasks'] = [];
+  const activeIntegrityInvalid = !projectActiveFactIntegrityIsValid(p);
   for (const material of production.materials ?? []) {
     if (material.parse.runStatus !== 'succeeded' || material.parse.queueStatus !== 'done') continue;
     const blockIds = material.blocks.filter(block => !material.usageReview?.current[block.id]).map(block => block.id);
@@ -126,14 +131,16 @@ export function materialReviewCenter(p: Project): MaterialReviewCenter {
     }
   }
   for (const fact of p.facts) {
-    if (fact.supersededByFactId) continue;
+    if (factSupersessionIsEffective(p, fact)) continue;
     const evidence = p.evidence.find(item => item.id === fact.evidenceId);
     if (fact.structured) {
-      if (fact.status === 'candidate' && factIntegrityIsValid(p, fact)) {
-        const conflict = factSourceIsCurrent(p, fact) && currentFactConflict(p, fact);
-        const blockedReason = conflict ? 'UNRESOLVED_FACT_CONFLICT' as const
+      if (fact.status === 'candidate') {
+        const integrityValid = factIntegrityIsValid(p, fact);
+        const conflict = integrityValid && factSourceIsCurrent(p, fact) && currentFactConflict(p, fact);
+        const blockedReason = activeIntegrityInvalid ? 'INVALID_FACT_BINDING' as const
+          : conflict ? 'UNRESOLVED_FACT_CONFLICT' as const
           : structuredRiskSeverity(fact.structured) === 'blocker' ? 'BLOCKING_FACT_RISK' as const : undefined;
-        if (factSourceIsCurrent(p, fact)) tasks.push({ id: `fact-review:${fact.id}`,
+        if (!integrityValid || factSourceIsCurrent(p, fact)) tasks.push({ id: `fact-review:${fact.id}`,
           type: 'fact_review', status: blockedReason ? 'blocked' : 'pending', factId: fact.id, evidenceId: fact.evidenceId,
           sourceIds: fact.structured.sources.map(source => source.id),
           ...(blockedReason ? { blockedReason } : {}),
@@ -159,11 +166,13 @@ export function materialReviewCenter(p: Project): MaterialReviewCenter {
       }
       continue;
     }
-    if (fact.status === 'candidate' && factSourceIsCurrent(p, fact)) {
-      const conflict = currentFactConflict(p, fact);
+    if (fact.status === 'candidate' && (!factIntegrityIsValid(p, fact) || factSourceIsCurrent(p, fact))) {
+      const conflict = factIntegrityIsValid(p, fact) && currentFactConflict(p, fact);
+      const blockedReason = activeIntegrityInvalid ? 'INVALID_FACT_BINDING' as const
+        : conflict ? 'UNRESOLVED_FACT_CONFLICT' as const : undefined;
       tasks.push({ id: `fact-review:${fact.id}`,
-      type: 'fact_review', status: conflict ? 'blocked' : 'pending', factId: fact.id, evidenceId: fact.evidenceId,
-      ...(conflict ? { blockedReason: 'UNRESOLVED_FACT_CONFLICT' as const } : {}),
+      type: 'fact_review', status: blockedReason ? 'blocked' : 'pending', factId: fact.id, evidenceId: fact.evidenceId,
+      ...(blockedReason ? { blockedReason } : {}),
       ...(evidence?.materialSource ? { materialId: evidence.materialSource.materialId } : {}) });
     }
     if (fact.status !== 'confirmed' || !fact.locked || fact.sourceReview?.status !== 'reconfirmation_required' || !evidence?.materialSource) continue;
@@ -171,14 +180,14 @@ export function materialReviewCenter(p: Project): MaterialReviewCenter {
     let blockedReason: 'REPLACEMENT_EVIDENCE_REQUIRED' | 'INVALID_FACT_BINDING' | 'UNRESOLVED_FACT_CONFLICT' | undefined;
     if (!replacement) blockedReason = 'REPLACEMENT_EVIDENCE_REQUIRED';
     else {
-      const candidate = structuredClone(fact);
-      const start = replacement.text.indexOf(fact.quote);
-      candidate.evidenceId = replacement.id; candidate.start = start; candidate.end = start + candidate.quote.length;
-      delete candidate.sourceReview;
-      try { candidate.legacyBinding = createLegacyFactBinding(candidate, replacement); }
-      catch { blockedReason = 'INVALID_FACT_BINDING'; }
-      if (!blockedReason && (!factIntegrityIsValid(p, candidate) || start < 0)) blockedReason = 'INVALID_FACT_BINDING';
-      if (!blockedReason && currentFactConflict(p, candidate)) blockedReason = 'UNRESOLVED_FACT_CONFLICT';
+      try {
+        prepareLegacyFactSourceReconfirmation(p, fact.id, replacement.id,
+          'Validate source reconfirmation readiness', 'material-review-center');
+      }
+      catch (error) {
+        blockedReason = error instanceof AppError && error.code === 'UNRESOLVED_FACT_CONFLICT'
+          ? 'UNRESOLVED_FACT_CONFLICT' : 'INVALID_FACT_BINDING';
+      }
     }
     const affected = evidenceSourceImpact(p, [evidence.id]);
     tasks.push({ id: `fact-source-reconfirmation:${fact.id}`, type: 'fact_source_reconfirmation', status: blockedReason ? 'blocked' : 'ready',

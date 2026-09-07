@@ -221,11 +221,39 @@ test('purpose withdrawal preserves locked facts and receipts, marks only depende
   p = await f.write(p, route, { reason: 'checked same original block again', evidenceId: replacement.id });
   assert.equal(p.version, businessVersion + 1); assert.equal(p.facts[0]!.sourceReview, undefined);
   assert.equal(p.facts[0]!.evidenceId, replacement.id); assert.equal(p.facts[0]!.confirmedAt, originalFact.confirmedAt);
+  assert.deepEqual(p.facts[0]!.legacyBinding, originalFact.legacyBinding, 'source recovery preserves the original confirmation proof');
   assert.equal(p.facts[0]!.sourceReconfirmations!.length, 1); assert.equal(p.facts[0]!.sourceReconfirmations![0]!.previousEvidenceId, originalEvidence.id);
   assert.equal(p.sections[0]!.freshness, 'stale'); assert.equal(p.storyboard!.freshness, 'stale');
   assert.deepEqual(await f.write(p, route, { reason: 'duplicate human click', evidenceId: replacement.id }), p);
   p = await f.write(p, 'qa/preflight');
   assert.equal(p.qa!.issueSeverity, 'blocker'); assert.equal(p.qa!.exportAllowed, false);
+});
+
+test('legacy source reconfirmation validates the prospective clone and rejects changed replacement text atomically', async () => {
+  let p = await confirmed(); const factId = p.facts[0]!.id;
+  p = await usage(p, [[0, 'reference']]);
+  p = await usage(p, [[0, 'product_evidence']]);
+  const replacement = evidenceFor(p); const blockId = material(p).blocks[0]!.id;
+  p = await f.store.command(p.id, command(p), 'test.legacy.changed-replacement-text', 'test-human', current => {
+    const evidence = current!.evidence.find(item => item.id === replacement.id)!;
+    const block = material(current!).blocks.find(item => item.id === blockId)!;
+    const changed = `${evidence.text}!`; const sha256 = createHash('sha256').update(changed).digest('hex');
+    evidence.text = changed; evidence.sha256 = sha256; evidence.objectKey = `${sha256}.txt`;
+    block.text = changed;
+    return current!;
+  });
+  assert.equal(evidenceIsAvailable(p, p.evidence.find(item => item.id === replacement.id)!), true);
+  const task = (await center(p)).tasks.find(item => item.type === 'fact_source_reconfirmation' && item.factId === factId);
+  assert.equal(task?.status, 'blocked');
+  assert.equal(task?.blockedReason, 'INVALID_FACT_BINDING');
+  const before = structuredClone(p);
+  const receiptCount = Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count);
+  const response = await f.post(`/api/projects/${p.id}/facts/${factId}/source/reconfirm`, command(p, {
+    reason: 'Changed full text must not inherit the original confirmation proof', evidenceId: replacement.id,
+  }));
+  assert.equal(response.statusCode, 409); assert.equal(response.json().error.code, 'INVALID_FACT_BINDING');
+  assert.deepEqual(await f.store.get(p.id), before);
+  assert.equal(Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count), receiptCount);
 });
 
 test('manual, Agent output and diagnostic gates reject withdrawn sources while unrelated approved facts remain usable', async () => {

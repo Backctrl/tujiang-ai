@@ -9,6 +9,9 @@ import {
   applicabilitySchema,
   canonicalValuesEqual,
   decimalValueSpanIsComplete,
+  factApplicabilityScopesEqual,
+  factLifecycleBindingIsValid,
+  factReplacementTransitionSchema,
   factRiskSchema,
   factsConflict,
   legacyFactBindingIsValid,
@@ -68,7 +71,8 @@ export type FactIntegrityReason = 'INVALID_STRUCTURED_FACT_CONTRACT' | 'INVALID_
   | 'INVALID_STRUCTURED_FACT_SOURCE' | 'INVALID_STRUCTURED_FACT_APPLICABILITY' | 'INVALID_STRUCTURED_FACT_RISK'
   | 'INVALID_STRUCTURED_FACT_CANDIDATE_BINDING' | 'INCOMPLETE_STRUCTURED_FACT_RISK_REVIEW'
   | 'INVALID_STRUCTURED_FACT_CONFIRMATION_BINDING'
-  | 'INVALID_LEGACY_FACT_SOURCE' | 'LEGACY_FACT_BINDING_REQUIRED';
+  | 'INVALID_LEGACY_FACT_SOURCE' | 'LEGACY_FACT_BINDING_REQUIRED'
+  | 'INVALID_FACT_LIFECYCLE_BINDING' | 'INVALID_FACT_SUPERSESSION';
 export type FactEligibilityReason = FactIntegrityReason | 'FACT_NOT_CONFIRMED' | 'FACT_NOT_LOCKED' | 'FACT_SUPERSEDED'
   | 'FACT_SOURCE_UNAVAILABLE' | 'BLOCKING_FACT_RISK' | 'UNRESOLVED_FACT_CONFLICT'
   | 'PROJECT_FACT_INTEGRITY_FAILURE' | 'PROJECT_FACT_GOVERNANCE_BLOCKER' | 'LEGACY_FACT_NOT_STRUCTURED';
@@ -172,22 +176,92 @@ function structuredFactIntegrityReason(p: Project, fact: Fact): FactIntegrityRea
     || structured.riskReview || structured.confirmation) return 'INVALID_STRUCTURED_FACT_CONFIRMATION_BINDING';
   return undefined;
 }
-function structuredFactIntegrityIsValid(p: Project, fact: Fact): boolean { return !structuredFactIntegrityReason(p, fact); }
+function factBaseIntegrityReason(p: Project, fact: Fact): FactIntegrityReason | undefined {
+  if (fact.structured) {
+    const structuredReason = structuredFactIntegrityReason(p, fact);
+    if (structuredReason) return structuredReason;
+  } else {
+    const evidence = p.evidence.find(item => item.id === fact.evidenceId);
+    if (!evidence || fact.start < 0 || fact.end !== fact.start + fact.quote.length
+      || evidence.text.slice(fact.start, fact.end) !== fact.quote) return 'INVALID_LEGACY_FACT_SOURCE';
+    if (fact.status === 'confirmed' || fact.status === 'retracted') {
+      if ((fact.status === 'confirmed') !== fact.locked || !fact.confirmedBy || !fact.confirmedAt
+        || !legacyFactBindingIsValid(fact, evidence)) return 'LEGACY_FACT_BINDING_REQUIRED';
+    } else if (fact.locked || fact.confirmedBy || fact.confirmedAt || fact.legacyBinding)
+      return 'LEGACY_FACT_BINDING_REQUIRED';
+  }
+  if (!factLifecycleBindingIsValid(fact)) return 'INVALID_FACT_LIFECYCLE_BINDING';
+  return undefined;
+}
+function replacementRelationIsValid(p: Project, fact: Fact): boolean {
+  const projectTransitions: { ownerId: string; item: ReturnType<typeof factReplacementTransitionSchema.parse> }[] = [];
+  for (const owner of p.facts) {
+    if (owner.replacementTransitions === undefined) continue;
+    if (!Array.isArray(owner.replacementTransitions)) return false;
+    for (const value of owner.replacementTransitions) {
+      const parsed = factReplacementTransitionSchema.safeParse(value);
+      if (!parsed.success) return false;
+      projectTransitions.push({ ownerId: owner.id, item: parsed.data });
+    }
+  }
+  const transitions = projectTransitions.filter(entry => entry.ownerId === fact.id).map(entry => entry.item);
+  if (new Set(transitions.map(item => item.id)).size !== transitions.length) return false;
+  const projectMentions = projectTransitions.map(entry => entry.item)
+    .filter(item => item.predecessorFactId === fact.id || item.successorFactId === fact.id);
+  if (projectMentions.some(item => !transitions.some(local => local.id === item.id))) return false;
+  const incoming = transitions.filter(item => item.successorFactId === fact.id);
+  const outgoing = transitions.filter(item => item.predecessorFactId === fact.id);
+  if (incoming.length > 1 || outgoing.length > 1 || transitions.length !== incoming.length + outgoing.length) return false;
+  const outgoingTransition = outgoing[0];
+  const flatSupersession = fact.supersededByFactId || fact.supersededBy || fact.supersededAt || fact.supersededReason;
+  if (!!outgoingTransition !== !!flatSupersession) return false;
+  if (outgoingTransition && (fact.supersededByFactId !== outgoingTransition.successorFactId
+    || fact.supersededBy !== outgoingTransition.actor || fact.supersededAt !== outgoingTransition.at
+    || fact.supersededReason !== outgoingTransition.reason)) return false;
+  for (const transition of transitions) {
+    if (transition.predecessorFactId === transition.successorFactId) return false;
+    const predecessor = p.facts.find(item => item.id === transition.predecessorFactId);
+    const successor = p.facts.find(item => item.id === transition.successorFactId);
+    const occurrences = projectTransitions.filter(item => item.item.id === transition.id);
+    if (!predecessor || !successor || predecessor === successor
+      || occurrences.length !== 2 || new Set(occurrences.map(item => item.ownerId)).size !== 2
+      || !occurrences.some(item => item.ownerId === predecessor.id) || !occurrences.some(item => item.ownerId === successor.id)
+      || occurrences.some(item => canonical(item.item) !== canonical(transition))
+      || predecessor.supersededByFactId !== successor.id || predecessor.supersededBy !== transition.actor
+      || predecessor.supersededAt !== transition.at || predecessor.supersededReason !== transition.reason
+      || successor.correctsFactId !== predecessor.id || normalizeRequestedValueForKey(predecessor.attribute) !== normalizeRequestedValueForKey(successor.attribute)
+      || predecessor.role !== successor.role || !factApplicabilityScopesEqual(predecessor, successor)
+      || predecessor.status !== 'confirmed' || !predecessor.locked || !['confirmed', 'retracted'].includes(successor.status)
+      || successor.confirmedBy !== transition.actor || successor.confirmedAt !== transition.at
+      || factBaseIntegrityReason(p, predecessor) || factBaseIntegrityReason(p, successor)) return false;
+  }
+  const seen = new Set<string>(); let cursor: Fact | undefined = fact;
+  while (cursor?.supersededByFactId) {
+    if (seen.has(cursor.id)) return false;
+    seen.add(cursor.id); cursor = p.facts.find(item => item.id === cursor!.supersededByFactId);
+  }
+  return true;
+}
+const normalizeRequestedValueForKey = (value: string) => value.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLowerCase();
+export function factSupersessionIsEffective(p: Project, fact: Fact): boolean {
+  return !factBaseIntegrityReason(p, fact) && replacementRelationIsValid(p, fact) && !!fact.supersededByFactId;
+}
 export function factIntegrityReason(p: Project, fact: Fact): FactIntegrityReason | undefined {
-  if (fact.structured) return structuredFactIntegrityReason(p, fact);
-  const evidence = p.evidence.find(item => item.id === fact.evidenceId);
-  if (!evidence || fact.start < 0 || fact.end !== fact.start + fact.quote.length
-    || evidence.text.slice(fact.start, fact.end) !== fact.quote) return 'INVALID_LEGACY_FACT_SOURCE';
-  if (fact.status === 'confirmed' && (!fact.locked || !legacyFactBindingIsValid(fact, evidence)))
-    return 'LEGACY_FACT_BINDING_REQUIRED';
+  const base = factBaseIntegrityReason(p, fact);
+  if (base) return base;
+  if (!replacementRelationIsValid(p, fact)) return 'INVALID_FACT_SUPERSESSION';
   return undefined;
 }
 export function factIntegrityIsValid(p: Project, fact: Fact): boolean {
   return !factIntegrityReason(p, fact);
 }
+export function projectActiveFactIntegrityIsValid(p: Project): boolean {
+  return p.facts.filter(fact => ['candidate', 'confirmed'].includes(fact.status))
+    .every(fact => factIntegrityIsValid(p, fact));
+}
 export function factSourceIsCurrent(p: Project, fact: Fact): boolean {
   if (fact.structured) {
-    if (!structuredFactIntegrityIsValid(p, fact)) return false;
+    if (!factIntegrityIsValid(p, fact)) return false;
     return fact.structured.sources.every(source => {
       if (source.review) return false;
       const evidence = p.evidence.find(item => item.id === source.evidenceId);
@@ -202,19 +276,20 @@ export function factSourceIsCurrent(p: Project, fact: Fact): boolean {
 }
 export function availableEvidence(p: Project): Evidence[] { return p.evidence.filter(item => evidenceIsAvailable(p, item)); }
 export function currentFactConflict(p: Project, fact: Fact, excludedId?: string): Fact | undefined {
-  return p.facts.find(other => other.id !== fact.id && other.id !== excludedId && !other.supersededByFactId
+  if (factSupersessionIsEffective(p, fact)) return;
+  return p.facts.find(other => other.id !== fact.id && other.id !== excludedId && !factSupersessionIsEffective(p, other)
     && factSourceIsCurrent(p, other) && factsConflict(fact, other));
 }
 export function evaluateFactEligibility(p: Project, fact: Fact): FactEligibility {
   const reasons: FactEligibilityReason[] = [];
   if (fact.status !== 'confirmed') reasons.push('FACT_NOT_CONFIRMED');
   if (!fact.locked) reasons.push('FACT_NOT_LOCKED');
-  if (fact.supersededByFactId) reasons.push('FACT_SUPERSEDED');
   const integrity = factIntegrityReason(p, fact);
   if (integrity) reasons.push(integrity);
-  const active = p.facts.filter(item => ['candidate', 'confirmed'].includes(item.status) && !item.supersededByFactId);
-  if (active.some(item => item.id !== fact.id && factIntegrityReason(p, item))) reasons.push('PROJECT_FACT_INTEGRITY_FAILURE');
-  const current = active.filter(item => factSourceIsCurrent(p, item));
+  if (!integrity && factSupersessionIsEffective(p, fact)) reasons.push('FACT_SUPERSEDED');
+  const allActive = p.facts.filter(item => ['candidate', 'confirmed'].includes(item.status));
+  if (allActive.some(item => item.id !== fact.id && factIntegrityReason(p, item))) reasons.push('PROJECT_FACT_INTEGRITY_FAILURE');
+  const current = allActive.filter(item => !factSupersessionIsEffective(p, item) && factSourceIsCurrent(p, item));
   if (current.some(item => item.structured && structuredRiskSeverity(item.structured) === 'blocker')
     || current.some(item => current.some(other => other.id !== item.id && factsConflict(item, other))))
     reasons.push('PROJECT_FACT_GOVERNANCE_BLOCKER');
@@ -227,9 +302,9 @@ export function evaluateFactEligibility(p: Project, fact: Fact): FactEligibility
     formalFreezeEligible: formalFreezeReasons.length === 0, formalFreezeReasons: [...new Set(formalFreezeReasons)] };
 }
 export function factGovernanceHasBlockingIssue(p: Project): boolean {
-  const active = p.facts.filter(fact => ['candidate', 'confirmed'].includes(fact.status) && !fact.supersededByFactId);
-  if (active.some(fact => !factIntegrityIsValid(p, fact))) return true;
-  const current = active.filter(fact => factSourceIsCurrent(p, fact));
+  const active = p.facts.filter(fact => ['candidate', 'confirmed'].includes(fact.status));
+  if (!projectActiveFactIntegrityIsValid(p)) return true;
+  const current = active.filter(fact => !factSupersessionIsEffective(p, fact) && factSourceIsCurrent(p, fact));
   return current.some(fact => fact.structured && structuredRiskSeverity(fact.structured) === 'blocker')
     || current.some(fact => current.some(other => other.id !== fact.id && factsConflict(fact, other)));
 }
