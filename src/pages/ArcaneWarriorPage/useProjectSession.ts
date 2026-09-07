@@ -14,7 +14,7 @@ import type { ContextDraft } from '../../../backend/src/production-context.js'
 import type { StartupStatus } from './startup-contract.js'
 import { startupReadEnvelopeMatches, startupReadMatches } from './startup-contract.js'
 
-type SessionPending = { kind: 'standard'; run: () => Promise<Project>; label: string } | { kind: 'material'; operation: MaterialOperation; label: string; onSaved?: (project: Project) => void }
+type SessionPending = { kind: 'standard'; run: () => Promise<Project>; label: string } | { kind: 'material'; operation: MaterialOperation; label: string; onSaved?: (project: Project) => void; conflictSaveRequired?: boolean }
   | { kind: 'setup'; operation: SetupOperation; label: string }
 
 const projectStorageKey = 'tujiang_stage_a_project_id'
@@ -330,7 +330,14 @@ export function useProjectSession() {
         onSaved?.(outcome.project)
       } else if (outcome.kind !== 'blocked') {
         setError(errorMessage(outcome.error)); setNotice('')
-        if (outcome.kind === 'uncertain' && outcome.operation) setPending({ kind: 'material', operation: outcome.operation, label: outcome.operation.label, onSaved })
+        if (outcome.kind === 'uncertain' && outcome.operation) {
+          const conflictSaveRequired = !!outcome.operation.conflict
+          setPending({ kind: 'material', operation: outcome.operation, label: outcome.operation.label, onSaved, conflictSaveRequired })
+          if (conflictSaveRequired) {
+            setConflictBefore(outcome.operation.before, outcome.operation.conflict?.allowsSameRevision); setRecoveryNeedsCheck(false)
+            setNotice('已收到业务冲突，但本地复核记录尚未保存。恢复浏览器存储后，使用原操作重试仅补存冲突记录；随后读取最新项目并明确复核。')
+          }
+        }
         if (outcome.error instanceof ApiError && outcome.error.status === 401) { setAuthExpired(true); setRunConsent(false) }
         if (outcome.kind === 'conflict' && outcome.operation) {
           setConflictBefore(outcome.operation.before, outcome.operation.conflict?.allowsSameRevision)
@@ -439,10 +446,15 @@ export function useProjectSession() {
     catch { setError(errorMessage(new ApiError('LOCAL_RECOVERY_SETTLE_FAILED', 0))) }
     finally { busyRef.current = false; setBusy(false) }
   }
-  const canRetry = !!pending && !!token.trim() && !busy && !((pending.kind === 'material' || pending.kind === 'setup') && recoveryNeedsCheck) && !(pending.kind === 'setup' && setupRejected) && !(pending.kind === 'material' && pending.operation.conflict)
+  const canRetry = !!pending && !busy && (pending.kind === 'material' && pending.conflictSaveRequired && !!pending.operation.conflict
+    || !!token.trim() && !((pending.kind === 'material' || pending.kind === 'setup') && recoveryNeedsCheck) && !(pending.kind === 'setup' && setupRejected) && !(pending.kind === 'material' && pending.operation.conflict))
   const retry = () => {
     const current = pendingRef.current
-    if (!current || busyRef.current || !tokenRef.current.trim()) return
+    if (!current || busyRef.current) return
+    if (current.kind === 'material' && current.conflictSaveRequired && current.operation.conflict) {
+      return materialAttempt(() => current.operation, true, current.operation.entryId, current.onSaved)
+    }
+    if (!tokenRef.current.trim()) return
     if (current.kind === 'setup') {
       if (recoveryCheckRef.current || setupRejected) return
       busyRef.current = true; setBusy(true); setError('')
@@ -465,11 +477,11 @@ export function useProjectSession() {
       throw err
     }
   }
-  const canResolveConflict = !busy && !!project && !!conflictBefore && conflictChecked && (project.revision > conflictBefore.revision
+  const canResolveConflict = !busy && !(pending?.kind === 'material' && pending.conflictSaveRequired) && !!project && !!conflictBefore && conflictChecked && (project.revision > conflictBefore.revision
     || (conflictAllowsSameRevision && project.revision === conflictBefore.revision))
   const resolveConflict = async () => {
-    if (busyRef.current || !canResolveConflict || !conflictRef.current) return
     const current = pendingRef.current
+    if (busyRef.current || !canResolveConflict || !conflictRef.current || current?.kind === 'material' && current.conflictSaveRequired) return
     busyRef.current = true; setBusy(true)
     try {
       if (current?.kind === 'material' && current.operation.conflict) { await materialIntakeStorage.releaseConflict(current.operation); setPending(null); setRecoveryNeedsCheck(false) }

@@ -87,14 +87,19 @@ export function onlyMaterialParseProgress(before: Project, after: Project) {
 // The durable boundary is before HTTP. Settlement removes the file and pending request atomically.
 export async function executeMaterialOperation(operation: MaterialOperation, api: Pick<StageAApi, 'executePrepared' | 'get'>, storage: MaterialIntakeStorage,
   receiveSnapshot: (project: Project) => void, replay = false, onRebased?: (operation: MaterialOperation) => void): Promise<MaterialWriteOutcome> {
-  if (operation.conflict) return { kind: 'conflict', error: new ApiError(operation.conflict.code, 409), operation }
-  try { await storage.savePending(operation) }
-  catch { return { kind: replay ? 'uncertain' : 'storage', error: new ApiError(replay ? 'LOCAL_RECOVERY_SETTLE_FAILED' : 'LOCAL_RECOVERY_SAVE_FAILED', 0), operation } }
   let current = operation
   const uncertain = async (error: unknown): Promise<MaterialWriteOutcome> => {
     await storage.markUncertain(current, errorMessage(error)).catch(() => undefined)
     return { kind: 'uncertain', error, operation: current }
   }
+  // The server already rejected this request. Retrying only repairs its local review record.
+  if (operation.conflict) {
+    try { await storage.settle(operation, 'conflict', operation.conflict.message) }
+    catch { return uncertain(new ApiError('LOCAL_RECOVERY_SETTLE_FAILED', 0)) }
+    return { kind: 'conflict', error: new ApiError(operation.conflict.code, 409), operation }
+  }
+  try { await storage.savePending(operation) }
+  catch { return { kind: replay ? 'uncertain' : 'storage', error: new ApiError(replay ? 'LOCAL_RECOVERY_SETTLE_FAILED' : 'LOCAL_RECOVERY_SAVE_FAILED', 0), operation } }
   for (;;) {
     let next: Project
     try {

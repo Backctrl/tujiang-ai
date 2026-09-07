@@ -388,6 +388,75 @@ test('mounted upload business 409 pauses its local File, survives reopening with
   } finally { materialIntakeStorage.releaseConflict = releaseConflict; await h.close(); }
 });
 
+for (const fault of ['before-commit', 'after-commit'] as const) test(`mounted upload conflict persistence failure ${fault} recovers locally before read and human review without replaying HTTP`, async () => {
+  const h = await harness(), settleConflict = materialIntakeStorage.settle;
+  try {
+    await h.mount(); await h.connect(); await h.fill();
+    await act(async () => { await h.get().intake.addFiles([new File(['10 kg'], 'conflict-persistence.txt', { type: 'text/plain' })], { kind: 'local_upload' }); });
+    await h.settle(() => h.get().intake.entries.length === 1, 'original queued');
+    let injected = false, persistenceAttempts = 0;
+    h.setIntercept(async (path, options, send) => {
+      if (!injected && options?.method === 'POST' && path.endsWith('/production/materials')) {
+        injected = true;
+        await h.f.write(h.get().session.getLatestProject()!, 'evidence', { documentName: 'Concurrent business change', locator: 'line 1', usage: 'product_evidence', text: '11 kg' });
+      }
+      return send();
+    });
+    materialIntakeStorage.settle = async (...args) => {
+      if (args[1] !== 'conflict') return settleConflict.apply(materialIntakeStorage, args);
+      persistenceAttempts++;
+      if (fault === 'after-commit') await settleConflict.apply(materialIntakeStorage, args);
+      throw new Error('Injected conflict persistence failure');
+    };
+    await act(async () => { await h.get().intake.start(); });
+    await h.settle(() => {
+      const { session, intake } = h.get();
+      return session.pending?.kind === 'material' && !!session.pending.operation.conflict && !intake.running && !session.busy;
+    }, 'received conflict remains pending after persistence failure');
+    const pending = h.get().session.pending; assert.equal(pending?.kind, 'material'); if (pending?.kind !== 'material') return;
+    const frozen = structuredClone(pending.operation);
+    const uploads = () => h.trace.filter(item => item.method === 'POST' && item.path.endsWith('/production/materials'));
+    const businessWrites = () => h.trace.filter(item => item.method === 'POST' && !item.path.endsWith('/check')).length;
+    const writes = businessWrites();
+    assert.equal(uploads().length, 1); assert.equal(uploads()[0]!.body, frozen.prepared.body);
+    assert.equal(persistenceAttempts, 1); assert.equal(h.get().session.canWrite, false);
+    assert.equal(h.get().session.canResolveConflict, false); assert.equal(h.get().session.canRetry, true, 'the failed local save has an explicit recovery action');
+    await act(async () => { await h.get().session.refresh(); await h.get().session.resolveConflict(); });
+    assert.equal(h.get().session.canResolveConflict, false, 'reading cannot release an unpersisted conflict');
+    await act(async () => { h.get().session.setToken(''); });
+    await act(async () => { await h.get().session.retry(); });
+    assert.equal(persistenceAttempts, 2, 'local persistence recovery does not require a credential');
+    assert.equal(h.get().session.canRetry, true); assert.equal(h.get().session.canResolveConflict, false);
+    assert.equal(businessWrites(), writes, 'a repeated persistence failure never replays the upload');
+    materialIntakeStorage.settle = settleConflict;
+    await act(async () => { await h.get().session.retry(); });
+    let durable: Awaited<ReturnType<typeof materialIntakeStorage.readPending>>;
+    await act(async () => { durable = await materialIntakeStorage.readPending(); }); assert.ok(durable?.conflict);
+    assert.deepEqual(durable, frozen, 'local recovery persists the same before, body, key, File reference and conflict');
+    await h.settle(() => h.get().intake.entries[0]?.status === 'conflict', 'File and conflict are persisted together');
+    assert.equal(h.get().session.canRetry, false); assert.equal(h.get().session.canResolveConflict, false);
+    assert.equal(h.get().session.recoveryNeedsCheck, true, 'a read before persistence cannot acknowledge the saved conflict');
+    assert.equal(businessWrites(), writes);
+    h.setIntercept(); await h.unmount(); await h.mount(); await h.connect();
+    assert.ok(h.get().session.conflictBefore); assert.equal(h.get().session.canWrite, false);
+    assert.equal(h.get().session.canRetry, false); assert.equal(h.get().session.canResolveConflict, false);
+    assert.equal(businessWrites(), writes, 'reopening the now-durable conflict never writes');
+    await act(async () => { await h.get().session.refresh(); });
+    assert.equal(h.get().session.canResolveConflict, true);
+    await act(async () => { await h.get().session.retry(); await h.get().intake.retryLocal(h.get().intake.entries[0]!); });
+    assert.equal(businessWrites(), writes, 'reading alone does not release the upload');
+    await act(async () => { await h.get().session.resolveConflict(); });
+    await h.settle(() => h.get().intake.canStart && h.get().intake.entries[0]?.status === 'waiting', 'explicit review releases the preserved File');
+    assert.equal(businessWrites(), writes);
+    const revision = h.get().session.project!.revision;
+    await act(async () => { await h.get().intake.retryLocal(h.get().intake.entries[0]!); });
+    await h.settle(() => h.get().intake.materials.length === 1 && !h.get().intake.running, 'only the explicit new submission uploads');
+    const submitted = JSON.parse(uploads()[1]!.body!) as { idempotencyKey: string; expectedRevision: number };
+    assert.equal(uploads().length, 2); assert.notEqual(submitted.idempotencyKey, JSON.parse(frozen.prepared.body).idempotencyKey);
+    assert.equal(submitted.expectedRevision, revision); assert.equal(h.navigations.length, 0);
+  } finally { materialIntakeStorage.settle = settleConflict; await h.close(); }
+});
+
 test('startup receipt arriving before the matching project render is delivered after alignment exactly once', async () => {
   const h = await harness(); let controlled: Renderer | undefined;
   try {
