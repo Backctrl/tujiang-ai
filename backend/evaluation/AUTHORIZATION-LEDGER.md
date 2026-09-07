@@ -47,7 +47,7 @@
 
 `BatchManifest` 是不可变对象，至少绑定：授权 ID、batch UUID、purpose、adapter ID/version、配置 SHA、原始来源文件及其字节 SHA、全部标准化 fixture SHA、人工预期 SHA、实际编译请求 SHA、相关上游人工复核引用。所有摘要采用明确版本的 canonical JSON/原始字节 SHA-256；键序变化不能改变结构摘要。
 
-输入快照、预期答案和请求正文单独受控留存。人工预期保留完整内容供复核，永不拼入模型请求。人工复核对象是完整 manifest 和可查看的输入；仅给一个 SHA、仅写 `human-curated` 或仅通过 dry-run 都不足以批准。
+输入快照、预期答案和请求正文单独受控留存。读取批次时按 manifest 中的 source/item 与字节摘要逐项检查 source、input、expected、request 分件，要求材料存在、归属/类型正确、认证通过且内容与快照一致；分件删除或替换会阻断运行。人工预期保留完整内容供复核，永不拼入模型请求。人工复核对象是完整 manifest 和可查看的输入；仅给一个 SHA、仅写 `human-curated` 或仅通过 dry-run 都不足以批准。
 
 `InputReview` 记录 review ID、精确 manifest SHA、reviewer、独立管理凭据指纹、外部 decisionReference/receipt SHA、时间、决定和原因。身份与凭据只从管理进程环境读取，不能来自 batch、fixture 或 runner 参数；runner 实例在运行时拒绝所有管理写操作。显式批准才能启用该 batch；拒绝保留记录。批准后任何输入、预期、配置、来源、请求或 adapter 变化都必须形成新的 batch 与新复核，不能覆盖原记录。执行时重新编译并比较请求 SHA，防止代码或原件在复核后变化。
 
@@ -85,6 +85,8 @@ batch-input、input-review-decision、capabilities、response 与 parsed-result 
 
 批次内串行执行。已取得精确 approved snapshot 后，存储的 adapter 不支持、输入/预期/来源/请求变化、敏感输入、材料完整性校验失败（`ARTIFACT_INTEGRITY_FAILED`）、metadata 传输或解析失败、能力/端点/价格/token/参数/隐式缓存/估算无效、能力相对复核内容变化，按固定错误码白名单幂等写入 `stopped` 和 `batch.review_invalidated` 事件。外层 stop 只接受本 runner 实例签发的 snapshot，不能用任意 batch ID 或自行拼装的对象触发。首次读取已批准 payload 或 reserve/beginDispatch 复核失败时，先在事务内确认 review、policy、key，再提交停止状态，最后向调用者抛原错误；不能因事务回滚丢失 stop。后续进程在读取 Key、GET、POST 前拒绝旧批次，即使恢复原材料也不能重启。重新运行需要新的输入复核批次，旧批次不能恢复为 approved。
 
+派发、捕获或完成之后，finish、recover、inspect 和有 Key 的 status 发现审批记录或材料失效，也先提交 stopped 再返回错误；completed 批次同样可被标记失效。管理检查入口仅因实际认证的输入/材料失效停止批次，不接受任意运行错误作为管理停止理由。停止时不改已派发次数、已知费用或未知用量，也不把未完成请求自动结算。恢复原材料后可以继续审阅材料、读取同指纹的已完成历史回执，但 pending finish/recover 不能把 stopped 改回 completed；未结算费用继续保持 hold，保留显式人工核账路径。
+
 调用前的 schema/enable/auth/instance 失败、未批准/已停止/已完成批次、缺 Key、数据库或加密密钥不可用、持久化失败、全局 hold/policy 失败不触发该 stop。已知次数/用途/全局估算或本地预算不足时保持 approved，并由 availability 门保证 0 metadata/0 POST；门通过之后若另一进程抢占额度，最终 reserve 可以在一次 GET 后拒绝，但仍不会 POST。已派发响应的协议或规则失败停止批次；未知 usage、传输中断、无法确认的派发、错误路由或费用越界同时使授权进入 held，后续批次的 reserve/dispatch 也拒绝。不自动重试、换模型、换 provider、fallback 或追加 generation 查询。
 
 ## 6. 崩溃与显式恢复
@@ -110,7 +112,7 @@ batch-input、input-review-decision、capabilities、response 与 parsed-result 
 
 普通 runner/stdout 报告只含状态、固定错误码、计数、费用、SHA 和材料 ID，不含输入正文、预期、原始输出、Key 或数据库 URL。原文通过显式本地审阅导出到受控目录，默认不打印，导出动作有审计；新管理进程也按当前已知敏感值检查旧材料，导出发生新的脱敏时更新副本摘要与 `redacted` 标记。创建导出目录前检查全部现有父目录，创建后复查并使用实际路径写入，拒绝 symlink/junction 跳转，同时允许 Windows 原生路径别名规范化。留存初始化或密钥不可用时，live 在 POST 前拒绝。
 
-list、inspect 与 export 都经过认证读取，并从认证摘要和实际副本字节推导长度、摘要及脱敏状态；被篡改的索引标记不能直接回显。输入导出另验 batch-input 和完整 manifest。input-review 的决定材料必须存在、属于同一 batch，且决定、原因/引用/receipt 摘要、reviewer 与凭据指纹全部一致；已批准行丢失或损坏先提交持久 stop。finish/recover 的回执重放也先验证当前材料引用。配置材料 Key 的 status 验证 attempt 材料后才给出引用，标记 `artifactVerification=verified`；没有 Key 时只提供未认证的账本汇总，标记 `key-unavailable` 并省略 response/parsed 引用。
+list、inspect 与 export 都经过认证读取，并从认证摘要和实际副本字节推导长度、摘要及脱敏状态；被篡改的索引标记不能直接回显。输入导出另验 batch-input、完整 manifest 和全部输入分件。input-review 的决定材料必须存在、属于同一 batch，且决定、原因/引用/receipt 摘要、reviewer 与凭据指纹全部一致；已批准行丢失或损坏先提交持久 stop。finish/recover 的回执重放也先验证当前材料引用。配置材料 Key 的 status 先验证 approved/completed 批次的审批、输入与 attempt 材料，发现失效时提交 stop 并返回错误；已停止批次可以保留停止状态供检查，输出的 attempt 材料引用仍须认证。没有 Key 时只提供未认证的账本汇总，标记 `key-unavailable` 并省略 response/parsed 引用，不能据此写入认证失败事件。
 
 新 evaluation 传输器保留 HTTP 非 2xx 与非法 JSON 的有界原文，不改生产 `src/model-policy.ts` 的公开行为。HTTP 错误、截断、拒答、超时、路由不符、解析/规则失败均保存可取得材料；未知或无效 usage 继续为 null。
 

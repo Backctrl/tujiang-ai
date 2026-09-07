@@ -91,7 +91,7 @@ export const integrityCases: { name: string; run: (f: Context) => Promise<void> 
     await f.db.query('ALTER TABLE evaluation_attempts DROP CONSTRAINT evaluation_attempt_capabilities_reference');
     await f.db.query('UPDATE evaluation_attempts SET batch_id=$2 WHERE id=$1', [attempt.id, b.batchId]);
     await assert.rejects(f.runner.beginDispatch(attempt.id, randomUUID()), integrity);
-    await assert.rejects(f.runner.reserve(a.batchId, 'item-1', a.plan), integrity);
+    await assert.rejects(f.runner.reserve(a.batchId, 'item-1', a.plan), /BATCH_NOT_RUNNABLE/);
     const attempts = await f.db.query<{ state: string; started_at: unknown }>('SELECT state,started_at FROM evaluation_attempts');
     assert.equal(attempts.rows.length, 2); assert.ok(attempts.rows.every(row => row.state === 'reserved' && row.started_at === null));
     const batches = await f.db.query<{ status: string }>('SELECT status FROM evaluation_batches');
@@ -125,12 +125,12 @@ export const integrityCases: { name: string; run: (f: Context) => Promise<void> 
     }
     assert.equal((await f.manager.readArtifactForReview(saved.artifactId)).redacted, true);
   } },
-  { name: 'capture and parsed references reject valid artifacts from another attempt, batch or kind, including cached results', run: async f => {
+  { name: 'capture references reject valid artifacts from another attempt, batch or kind and restoring them cannot resume settlement', run: async f => {
     const batch = await preparedCore(f.manager, corePayload('fact_extraction', 1000, 2));
     const other = await preparedCore(f.manager, corePayload('copy'));
     const preflight = await f.runner.recordPreflightCapture(batch.batchId, capture({ syntheticMetadata: true }));
     const first = await captured(f, batch, 'item-1');
-    const firstResult = await f.runner.finish(first.attemptId, first.owner, analysis, first.command);
+    await f.runner.finish(first.attemptId, first.owner, analysis, first.command);
     const outside = await captured(f, other, 'item-1');
     await f.runner.finish(outside.attemptId, outside.owner, analysis, outside.command);
     const current = await captured(f, batch, 'item-2');
@@ -155,8 +155,19 @@ export const integrityCases: { name: string; run: (f: Context) => Promise<void> 
       await assert.rejects(f.manager.status(), integrity);
     }
     await f.db.query('UPDATE evaluation_attempts SET capture_artifact_id=$2 WHERE id=$1', [current.attemptId, current.artifactId]);
+    await assert.rejects(f.runner.finish(current.attemptId, current.owner, analysis, current.command), /BATCH_NOT_RUNNABLE/);
+    await assert.rejects(f.manager.recoverCapture(current.attemptId, inspected.capture!.sourceSha256, analysis, await reviewedCommand(f.manager)), /BATCH_NOT_RUNNABLE/);
+    const state = await f.manager.status(); assert.equal(state.modalities.text.consumedRequests, 3);
+    assert.equal(state.batches.find(row => row.id === batch.batchId)!.status, 'stopped');
+    assert.equal(state.attempts.find(row => row.id === current.attemptId)!.state, 'dispatch_started');
+  } },
+  { name: 'parsed reference corruption invalidates completed results before cached finish and recovery replies', run: async f => {
+    const batch = await preparedCore(f.manager, corePayload('fact_extraction', 1000, 2));
+    const first = await captured(f, batch, 'item-1');
+    const firstResult = await f.runner.finish(first.attemptId, first.owner, analysis, first.command);
+    const current = await captured(f, batch, 'item-2'); const inspected = await f.manager.inspectAttempt(current.attemptId);
+    const recoveryCommand = await reviewedCommand(f.manager);
     const recovered = await f.manager.recoverCapture(current.attemptId, inspected.capture!.sourceSha256, analysis, recoveryCommand);
-    assert.equal(recovered.outcome, 'needs_human_review');
     await assert.rejects(f.db.query('UPDATE evaluation_attempts SET parsed_artifact_id=$2 WHERE id=$1', [first.attemptId, recovered.parsedArtifactId]), foreignKey);
     await f.db.query('ALTER TABLE evaluation_attempts DROP CONSTRAINT evaluation_attempt_parsed_reference');
     for (const [target, swapped] of [[first, recovered.parsedArtifactId], [current, firstResult.parsedArtifactId]] as const) {
@@ -174,7 +185,8 @@ export const integrityCases: { name: string; run: (f: Context) => Promise<void> 
     }
     assert.deepEqual(await f.runner.finish(first.attemptId, first.owner, analysis, first.command), firstResult);
     assert.deepEqual(await f.manager.recoverCapture(current.attemptId, inspected.capture!.sourceSha256, analysis, recoveryCommand), recovered);
-    const state = await f.manager.status(); assert.equal(state.modalities.text.consumedRequests, 3); assert.equal(state.modalities.text.knownObservedUsd, 0.003);
+    const state = await f.manager.status(); assert.equal(state.modalities.text.consumedRequests, 2); assert.equal(state.modalities.text.knownObservedUsd, 0.002);
+    assert.equal(state.batches[0]!.status, 'stopped');
   } },
   { name: 'batch input references and artifact ID renaming cannot borrow authenticated content or reopen stopped inputs', run: async f => {
     const other = await prepared(f.manager); const foreignInput = await f.manager.inputArtifactId(other.batchId);
@@ -259,4 +271,75 @@ export const integrityCases: { name: string; run: (f: Context) => Promise<void> 
       await f.db.query('UPDATE evaluation_artifacts SET sealed=$2 WHERE id=$1', [artifactId, JSON.stringify(original.sealed)]);
     });
   } },
+  { name: 'every source, input, expected and request part must remain authenticated and present before a reviewed batch can run', run: async f => {
+    for (const kind of ['source', 'input', 'expected', 'request']) {
+      const batch = await prepared(f.manager);
+      const original = (await f.db.query('SELECT * FROM evaluation_artifacts WHERE batch_id=$1 AND kind=$2 LIMIT 1', [batch.batchId, kind])).rows[0]!;
+      await f.db.query('DELETE FROM evaluation_artifacts WHERE id=$1', [original.id]);
+      await assert.rejects(f.manager.inputArtifactId(batch.batchId), integrity);
+      await persistedStop(f, batch, 'ARTIFACT_INTEGRITY_FAILED', async () => {
+        const columns = ['id', 'authorization_id', 'batch_id', 'attempt_id', 'kind', 'sealed', 'source_sha256', 'metadata', 'created_by', 'created_at'];
+        await f.db.query(`INSERT INTO evaluation_artifacts(${columns.join(',')}) VALUES(${columns.map((_, i) => `$${i + 1}`).join(',')})`,
+          columns.map(column => ['sealed', 'metadata'].includes(column) ? JSON.stringify(original[column]) : original[column]));
+      });
+    }
+  } },
+  ...(['dispatch_started', 'finished'] as const).flatMap(stage => (['finish', 'recover', 'inspect', 'status'] as const).map(entry => ({
+    name: `${entry} detects corrupted input review after ${stage}, commits stop before returning and preserves accounting`,
+    run: async (f: Context) => {
+      const batch = await preparedCore(f.manager); const saved = await captured(f, batch, 'item-1');
+      const inspected = await f.manager.inspectAttempt(saved.attemptId); const recoveryCommand = await reviewedCommand(f.manager);
+      let priorResult;
+      if (stage === 'finished') priorResult = entry === 'recover'
+        ? await f.manager.recoverCapture(saved.attemptId, inspected.capture!.sourceSha256, analysis, recoveryCommand)
+        : await f.runner.finish(saved.attemptId, saved.owner, analysis, saved.command);
+      const before = await f.manager.status();
+      const review = (await f.db.query('SELECT * FROM evaluation_input_reviews WHERE batch_id=$1', [batch.batchId])).rows[0]!;
+      let restore: () => Promise<void>;
+      if (entry === 'finish') {
+        await f.db.query('DELETE FROM evaluation_input_reviews WHERE batch_id=$1', [batch.batchId]);
+        restore = async () => {
+          const columns = ['id', 'batch_id', 'manifest_sha256', 'decision', 'reviewer', 'reviewer_credential_sha256', 'reason_sha256',
+            'decision_reference_sha256', 'decision_receipt_sha256', 'decision_artifact_id', 'created_at'];
+          await f.db.query(`INSERT INTO evaluation_input_reviews(${columns.join(',')}) VALUES(${columns.map((_, i) => `$${i + 1}`).join(',')})`,
+            columns.map(column => review[column]));
+        };
+      } else if (entry === 'inspect') {
+        const original = await artifactRow(f.db, review.decision_artifact_id as string);
+        const ciphertext = Buffer.from(original.sealed.ciphertext, 'base64'); ciphertext[0] = ciphertext[0]! ^ 1;
+        await f.db.query('UPDATE evaluation_artifacts SET sealed=$2 WHERE id=$1',
+          [review.decision_artifact_id, JSON.stringify({ ...original.sealed, ciphertext: ciphertext.toString('base64') })]);
+        restore = async () => { await f.db.query('UPDATE evaluation_artifacts SET sealed=$2 WHERE id=$1', [review.decision_artifact_id, JSON.stringify(original.sealed)]); };
+      } else {
+        const column = entry === 'recover' ? 'decision_receipt_sha256' : 'reviewer';
+        await f.db.query(`UPDATE evaluation_input_reviews SET ${column}=$2 WHERE batch_id=$1`,
+          [batch.batchId, entry === 'recover' ? 'd'.repeat(64) : 'changed-reviewer-after-dispatch']);
+        restore = async () => { await f.db.query(`UPDATE evaluation_input_reviews SET ${column}=$2 WHERE batch_id=$1`, [batch.batchId, review[column]]); };
+      }
+      const unverified = await AuthorizationLedger.forRunner(f.db, undefined).status();
+      assert.equal(unverified.artifactVerification, 'key-unavailable');
+      assert.equal(unverified.batches[0]!.status, stage === 'finished' ? 'completed' : 'approved');
+      const invoke = () => entry === 'finish' ? f.runner.finish(saved.attemptId, saved.owner, analysis, saved.command)
+        : entry === 'recover' ? f.manager.recoverCapture(saved.attemptId, inspected.capture!.sourceSha256, analysis, recoveryCommand)
+        : entry === 'inspect' ? f.manager.inspectAttempt(saved.attemptId) : f.manager.status();
+      await assert.rejects(invoke(), integrity);
+      assert.equal((await f.db.query<{ status: string }>('SELECT status FROM evaluation_batches WHERE id=$1', [batch.batchId])).rows[0]!.status, 'stopped');
+      assert.equal((await f.db.query("SELECT 1 FROM evaluation_events WHERE type='batch.review_invalidated' AND body->>'batchId'=$1", [batch.batchId])).rows.length, 1);
+      await restore();
+      const after = await f.manager.status();
+      assert.equal(after.batches[0]!.status, 'stopped'); assert.deepEqual(after.modalities, before.modalities);
+      assert.equal(after.attempts[0]!.state, stage); assert.equal(after.revision, before.revision + 1);
+      if (stage === 'dispatch_started') {
+        await assert.rejects(f.runner.finish(saved.attemptId, saved.owner, analysis, saved.command), /BATCH_NOT_RUNNABLE/);
+        await assert.rejects(f.manager.recoverCapture(saved.attemptId, inspected.capture!.sourceSha256, analysis, await reviewedCommand(f.manager)), /BATCH_NOT_RUNNABLE/);
+      } else if (entry === 'finish' || entry === 'recover') {
+        // An authenticated historical receipt remains readable; it cannot change stopped back to completed.
+        assert.deepEqual(await invoke(), priorResult);
+        assert.equal((await f.manager.status()).batches[0]!.status, 'stopped');
+      }
+      await assert.rejects(AuthorizationLedger.forRunner(f.db, new ArtifactCipher(artifactKey)).reviewedBatch(batch.batchId), /BATCH_NOT_RUNNABLE/);
+      await f.verifyRestart?.(batch.batchId);
+      assert.equal((await f.db.query("SELECT 1 FROM evaluation_events WHERE type='attempt.dispatch_started'")).rows.length, 1);
+    },
+  }))),
 ];

@@ -61,11 +61,13 @@ npx tsx evaluation/authorization-cli.ts export-artifact <artifact-uuid>
 
 省略 `list-artifacts` 的 batch 参数可查看授权的全部材料索引，包括人工恢复决定。显式导出只写入已忽略的 `backend/.data/evaluation-review/`，生成 `<artifact-uuid>.bin` 与 `.metadata.json`，拒绝覆盖和目录跳转；创建目录前检查现有父目录，创建后复查并写入实际路径，Windows 原生路径别名可以正常规范化。不向 stdout 输出原文。管理与运行入口都会登记当前已知凭据；敏感输入拒绝创建批次，输出先脱敏再加密。新管理进程导出旧材料时会再次脱敏，`redacted=true` 与副本摘要反映本次实际导出的内容。`originalSha256` 指收到的原文摘要，`contentSha256` 指可复核副本。`partial` 的摘要只覆盖已收到前缀；`unavailable` 表示没有响应正文。
 
-当前材料格式为 `artifact.2`，材料 ID、归属、类型、脱敏状态、长度和摘要均受 AES-GCM 认证。list/inspect/export 以及 finish/recover 重放都验证材料；任意引用互换、密文或标记损坏返回 `ARTIFACT_INTEGRITY_FAILED`。旧 `artifact.1` 或缺少认证能力引用的旧 attempt 不自动升级，不能据此继续执行；保留原记录与累计额度，按主工作流形成新的可复核输入批次。status 有材料 Key 时验证 attempt 材料后输出引用；没有 Key 时标记 `artifactVerification=key-unavailable`，只提供未认证汇总并省略 response/parsed 引用。
+当前材料格式为 `artifact.2`，材料 ID、归属、类型、脱敏状态、长度和摘要均受 AES-GCM 认证。list/inspect/export 以及 finish/recover 重放都验证材料；任意引用互换、密文或标记损坏返回 `ARTIFACT_INTEGRITY_FAILED`。批次输入读取还验证每个 source/input/expected/request 分件存在且内容匹配 manifest。旧 `artifact.1` 或缺少认证能力引用的旧 attempt 不自动升级，不能据此继续执行；保留原记录与累计额度，由主工作流处理版本迁移，不能换新库或新批次绕过缺失的历史认证。status 有材料 Key 时验证 approved/completed 批次的审批、输入与 attempt 材料后输出引用；没有 Key 时标记 `artifactVerification=key-unavailable`，只提供未认证汇总并省略 response/parsed 引用。
 
 ## 中断与人工恢复
 
 输入复核失效、材料完整性失败或 metadata/能力预检失败会持久停止旧批次；审批记录删除、决定或 receipt 与认证材料不一致也算复核失效。换 Key、换进程或还原文件都不能让旧批次重新发请求，需要准备并独立复核新批次。已停止批次不能通过补写 review 重新批准。调用前已经确定额度或预算不足时不会读取模型 Key 或发 metadata GET，批次保留 approved；这类可恢复额度问题与输入复核失效分开处理。网络前可用性检查通过后若另一个进程抢占额度，最终 reserve 仍会拒绝 POST。
+
+finish、recover、inspect 和有 Key 的 status 在派发或完成之后发现审批/材料损坏时，也先持久停止该批次再返回错误。次数和费用不变；尚未结算的派发继续保持未知用量和 hold。修复原材料后可读取历史回执，但不能继续 pending finish/recover 或恢复该批次的运行状态。需要确认费用时使用下述显式 reconcile 流程，不重新请求模型。
 
 所有下列命令只处理本地记录，不发起模型或 generation 查询。它们需要包含 `commandId`、当前 `expectedRevision` 和实际 `reason` 的 JSON；旧 revision 冲突后应重新查看状态。
 

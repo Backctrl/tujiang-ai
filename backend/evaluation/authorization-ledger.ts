@@ -216,7 +216,27 @@ export class AuthorizationLedger {
     try { described = describeBatch(batch.id, JSON.parse(artifact.bytes.toString('utf8'))); } catch { return fail('BATCH_INPUT_CHANGED'); }
     if (described.payload.sources.some(s => this.requireCipher().redact(Buffer.from(s.bytesBase64, 'base64')).redacted)) fail('SENSITIVE_INPUT_DETECTED');
     if (described.manifestSha256 !== batch.manifest_sha256 || objectSha256(batch.manifest) !== batch.manifest_sha256) fail('BATCH_INPUT_CHANGED');
+    await this.verifyPayloadParts(tx, auth, batch, described.payload);
     return described.payload;
+  }
+  private async verifyPayloadParts(tx: Connection, auth: AuthorizationRow, batch: BatchRow, payload: BatchPayload) {
+    const parts = [
+      ...payload.sources.map(source => ({ kind: 'source', metadata: { sourceId: source.id }, digest: sha256(Buffer.from(source.bytesBase64, 'base64')) })),
+      ...payload.items.flatMap(item => [
+        { kind: 'input', metadata: { itemId: item.id }, digest: objectSha256(item.input) },
+        { kind: 'expected', metadata: { itemId: item.id }, digest: objectSha256(item.expected) },
+        { kind: 'request', metadata: { itemId: item.id }, digest: sha256(item.requestBody) },
+      ]),
+    ];
+    for (const part of parts) {
+      const rows = await tx.query<ArtifactRow>(`SELECT * FROM evaluation_artifacts WHERE authorization_id=$1
+        AND batch_id=$2 AND attempt_id IS NULL AND kind=$3 AND source_sha256=$4 AND metadata=$5::jsonb`,
+      [AUTHORIZATION_ID, batch.id, part.kind, part.digest, JSON.stringify(part.metadata)]);
+      if (rows.rows.length !== 1) fail('ARTIFACT_INTEGRITY_FAILED');
+      const artifact = await this.artifact(tx, auth, rows.rows[0]!.id, { batchId: batch.id, attemptId: null, kind: part.kind });
+      if (artifact.row.sealed.originalSha256 !== part.digest || artifact.row.sealed.contentSha256 !== part.digest) fail('ARTIFACT_INTEGRITY_FAILED');
+      if (sha256(artifact.bytes) !== part.digest) fail('SENSITIVE_INPUT_DETECTED');
+    }
   }
   private async assertInputReview(tx: Connection, batch: BatchRow) {
     const rows = await tx.query<Row<{ id: string; manifest_sha256: string; decision: string; decision_receipt_sha256: string; decision_reference_sha256: string;
@@ -246,16 +266,19 @@ export class AuthorizationLedger {
   }
   private async stopBatchForReviewFailure(tx: Connection, batch: BatchRow, code: BatchStopReason) {
     if (batch.status === 'stopped') return { batchId: batch.id, status: 'stopped' as const, changed: false };
-    this.assertBatchRunnable(batch);
+    if (batch.status !== 'completed') this.assertBatchRunnable(batch);
     await tx.query("UPDATE evaluation_batches SET status='stopped' WHERE id=$1", [batch.id]);
     await this.event(tx, 'batch.review_invalidated', { batchId: batch.id, manifestSha256: batch.manifest_sha256, code });
     return { batchId: batch.id, status: 'stopped' as const, changed: true };
   }
   private async withReviewFailureStop<T>(tx: Connection, auth: AuthorizationRow, batch: BatchRow, action: () => Promise<T>): Promise<ReviewOperation<T>> {
+    this.assertKey(auth);
     try { await this.verifyInputReview(tx, auth, batch); return { value: await action() }; }
     catch (error) {
-      if (!runnerInstances.has(this) || batch.status !== 'approved' || !(error instanceof RunnerError)) throw error;
+      if (!['approved', 'completed'].includes(batch.status) || !(error instanceof RunnerError)) throw error;
       const reason = batchStopReasonSchema.safeParse(error.code); if (!reason.success) throw error;
+      // Inspection can invalidate a review only on authenticated input/material failures, never arbitrary execution reasons.
+      if (!runnerInstances.has(this) && !['ARTIFACT_INTEGRITY_FAILED', 'BATCH_INPUT_CHANGED', 'SENSITIVE_INPUT_DETECTED'].includes(reason.data)) throw error;
       await this.stopBatchForReviewFailure(tx, batch, reason.data);
       // The transaction must commit this tagged failure before the caller receives the original error.
       return { failure: error };
@@ -511,6 +534,7 @@ export class AuthorizationLedger {
     if (!attempt.capture_artifact_id) fail('RESPONSE_UNAVAILABLE');
     if (attempt.state !== 'dispatch_started') fail('ATTEMPT_ALREADY_FINISHED');
     const batch = await this.batch(tx, attempt.batch_id);
+    this.assertBatchRunnable(batch);
     await this.verifyInputReview(tx, auth, batch);
     const payload = await this.payload(tx, auth, batch);
     const captured = await this.artifact(tx, auth, attempt.capture_artifact_id, { batchId: batch.id, attemptId: attempt.id, kind: 'response' });
@@ -578,36 +602,40 @@ export class AuthorizationLedger {
       { batchId: attempt.batch_id, attemptId: attempt.id, kind: 'parsed-result' });
   }
   async finish(attemptId: string, ownerToken: string, analysis: LocalAnalysis | undefined, command: LedgerCommand) {
-    return this.locked(async (tx, auth) => {
+    const result = await this.locked(async (tx, auth) => {
       const attempt = await this.attempt(tx, attemptId);
       if (attempt.owner_sha256 !== sha256(ownerToken)) fail('DISPATCH_OWNER_MISMATCH');
       const batch = await this.batch(tx, attempt.batch_id);
-      await this.verifyInputReview(tx, auth, batch); await this.payload(tx, auth, batch);
-      await this.verifyAttemptArtifacts(tx, auth, attempt);
-      return this.receipt(tx, command, { type: 'finish', attemptId, ownerSha256: sha256(ownerToken), analysis: analysis ?? null }, async () => {
-        return this.settle(tx, auth, attempt, analysis, false);
+      return this.withReviewFailureStop(tx, auth, batch, async () => {
+        await this.payload(tx, auth, batch); await this.verifyAttemptArtifacts(tx, auth, attempt);
+        return this.receipt(tx, command, { type: 'finish', attemptId, ownerSha256: sha256(ownerToken), analysis: analysis ?? null }, async () => {
+          return this.settle(tx, auth, attempt, analysis, false);
+        });
       });
     });
+    return reviewValue(result);
   }
   async recoverCapture(attemptId: string, captureSha256: string, analysis: LocalAnalysis | undefined, command: ReviewedCommand) {
     this.requireManagement();
-    return this.locked(async (tx, auth) => {
+    const result = await this.locked(async (tx, auth) => {
       const attempt = await this.attempt(tx, attemptId); const batch = await this.batch(tx, attempt.batch_id);
-      await this.verifyInputReview(tx, auth, batch); await this.payload(tx, auth, batch);
-      await this.verifyAttemptArtifacts(tx, auth, attempt);
-      if (!attempt.capture_artifact_id) fail('RESPONSE_UNAVAILABLE');
-      const artifact = await this.artifact(tx, auth, attempt.capture_artifact_id, { batchId: attempt.batch_id, attemptId, kind: 'response' });
-      if (artifact.row.source_sha256 !== captureSha256) fail('CAPTURE_CONFLICT');
-      return this.receipt(tx, command, { type: 'recover-capture', attemptId, captureSha256,
-        analysis: analysis ?? null, expectedRevision: command.expectedRevision, reason: command.reason }, async () => {
-        this.checkRevision(auth, command);
-        const result = await this.settle(tx, auth, attempt, analysis, true);
-        const decisionArtifactId = await this.storeArtifact(tx, auth, { batchId: attempt.batch_id, attemptId, kind: 'recovery-decision' },
-          Buffer.from(canonical({ captureSha256, ...command })), {});
-        await this.event(tx, 'attempt.recovery_reviewed', { attemptId, captureSha256, decisionArtifactId, reasonSha256: sha256(command.reason) });
-        return result;
+      return this.withReviewFailureStop(tx, auth, batch, async () => {
+        await this.payload(tx, auth, batch); await this.verifyAttemptArtifacts(tx, auth, attempt);
+        if (!attempt.capture_artifact_id) fail('RESPONSE_UNAVAILABLE');
+        const artifact = await this.artifact(tx, auth, attempt.capture_artifact_id, { batchId: attempt.batch_id, attemptId, kind: 'response' });
+        if (artifact.row.source_sha256 !== captureSha256) fail('CAPTURE_CONFLICT');
+        return this.receipt(tx, command, { type: 'recover-capture', attemptId, captureSha256,
+          analysis: analysis ?? null, expectedRevision: command.expectedRevision, reason: command.reason }, async () => {
+          this.checkRevision(auth, command);
+          const settled = await this.settle(tx, auth, attempt, analysis, true);
+          const decisionArtifactId = await this.storeArtifact(tx, auth, { batchId: attempt.batch_id, attemptId, kind: 'recovery-decision' },
+            Buffer.from(canonical({ captureSha256, ...command })), {});
+          await this.event(tx, 'attempt.recovery_reviewed', { attemptId, captureSha256, decisionArtifactId, reasonSha256: sha256(command.reason) });
+          return settled;
+        });
       });
     });
+    return reviewValue(result);
   }
   async cancelReservation(attemptId: string, command: ReviewedCommand) {
     this.requireManagement();
@@ -688,16 +716,18 @@ export class AuthorizationLedger {
 
   async inspectAttempt(attemptId: string) {
     this.requireManagement();
-    return this.locked(async (tx, auth) => {
+    const result = await this.locked(async (tx, auth) => {
       const attempt = await this.attempt(tx, attemptId); const batch = await this.batch(tx, attempt.batch_id);
-      await this.verifyInputReview(tx, auth, batch);
-      await this.verifyAttemptArtifacts(tx, auth, attempt);
-      const captured = attempt.capture_artifact_id ? await this.artifact(tx, auth, attempt.capture_artifact_id,
-        { batchId: attempt.batch_id, attemptId, kind: 'response' }) : null;
-      return { attempt: view(attempt), payload: await this.payload(tx, auth, batch), manifest: batch.manifest,
-        capture: captured ? { bytes: captured.bytes, metadata: captured.row.metadata as unknown as CapturedMetadata,
-          sourceSha256: captured.row.source_sha256 } : null };
+      return this.withReviewFailureStop(tx, auth, batch, async () => {
+        await this.verifyAttemptArtifacts(tx, auth, attempt);
+        const captured = attempt.capture_artifact_id ? await this.artifact(tx, auth, attempt.capture_artifact_id,
+          { batchId: attempt.batch_id, attemptId, kind: 'response' }) : null;
+        return { attempt: view(attempt), payload: await this.payload(tx, auth, batch), manifest: batch.manifest,
+          capture: captured ? { bytes: captured.bytes, metadata: captured.row.metadata as unknown as CapturedMetadata,
+            sourceSha256: captured.row.source_sha256 } : null };
+      });
     });
+    return reviewValue(result);
   }
   async readArtifactForReview(artifactId: string) {
     this.requireManagement();
@@ -734,9 +764,18 @@ export class AuthorizationLedger {
     });
   }
   async status(): Promise<AuthorizationStatus> {
-    return this.locked(async (tx, auth) => {
+    const result = await this.locked<ReviewOperation<AuthorizationStatus>>(async (tx, auth) => {
       const attempts = await this.attempts(tx);
       const batches = (await tx.query<BatchRow>('SELECT * FROM evaluation_batches WHERE authorization_id=$1 ORDER BY created_at,id', [AUTHORIZATION_ID])).rows;
+      if (this.cipher) {
+        for (const batch of batches.filter(batch => batch.status === 'approved' || batch.status === 'completed')) {
+          const checked = await this.withReviewFailureStop(tx, auth, batch, async () => {
+            await this.payload(tx, auth, batch);
+            for (const attempt of attempts.filter(attempt => attempt.batch_id === batch.id)) await this.verifyAttemptArtifacts(tx, auth, attempt);
+          });
+          if ('failure' in checked) return checked;
+        }
+      }
       const modalities = {} as Record<Modality, BudgetView>;
       for (const modality of ['text', 'image'] as const) {
         const rows = attempts.filter(a => a.modality === modality && a.state !== 'cancelled');
@@ -764,11 +803,12 @@ export class AuthorizationLedger {
           await this.verifyAttemptArtifacts(tx, auth, attempt); verifiedAttempts.push(view(attempt));
         } else verifiedAttempts.push({ ...view(attempt), responseArtifactId: null, parsedArtifactId: null });
       }
-      return { contractVersion: 'authorization-ledger.1', authorizationId: AUTHORIZATION_ID, policySha256: POLICY_SHA256,
+      return { value: { contractVersion: 'authorization-ledger.1', authorizationId: AUTHORIZATION_ID, policySha256: POLICY_SHA256,
         revision: auth.revision, status: auth.status === 'closed' ? 'closed' : effectiveHold ? 'held' : auth.status,
         declaredStatus: auth.status, effectiveHold, holdReason: effectiveHold ? 'ATTEMPT_UNRESOLVED' : auth.hold_reason,
         budgetEnforcement: 'local-estimate-not-billing-cap', artifactVerification: this.cipher ? 'verified' : 'key-unavailable', modalities, purposes,
-        batches: batches.map(b => ({ id: b.id, purpose: b.manifest.purpose, manifestSha256: b.manifest_sha256, status: b.status })), attempts: verifiedAttempts };
+        batches: batches.map(b => ({ id: b.id, purpose: b.manifest.purpose, manifestSha256: b.manifest_sha256, status: b.status })), attempts: verifiedAttempts } };
     });
+    return reviewValue(result);
   }
 }
