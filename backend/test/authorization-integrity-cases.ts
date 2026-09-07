@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readdir, realpath, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Database } from '../src/database.js';
@@ -9,7 +9,7 @@ import { exportArtifact } from '../evaluation/authorization-cli.js';
 import { AUTHORIZATION_ID, canonical, objectSha256, sha256 } from '../evaluation/authorization-contract.js';
 import { AuthorizationLedger } from '../evaluation/authorization-ledger.js';
 import { runEvaluation } from '../evaluation/runner.js';
-import { artifactKey, capture, corePayload, decision, goodResponse, prepared, preparedCore, reviewedCommand } from './authorization-helpers.js';
+import { artifactKey, capture, corePayload, decision, goodResponse, managementLedger, prepared, preparedCore, reviewedCommand } from './authorization-helpers.js';
 
 interface Context {
   db: Database; runner: AuthorizationLedger; manager: AuthorizationLedger;
@@ -50,6 +50,53 @@ async function persistedStop(f: Context, batch: Awaited<ReturnType<typeof prepar
 }
 
 export const integrityCases: { name: string; run: (f: Context) => Promise<void> }[] = [
+  { name: 'equivalent secret encodings reject inputs and scrub captures and exports without folding ordinary text case', run: async f => {
+    const secret = `Synthetic-Codec-Secret-Łÿÿ-Case+/?-${randomUUID()}`;
+    const raw = Buffer.from(secret); const base64 = raw.toString('base64'); const hex = raw.toString('hex');
+    const percent = encodeURIComponent(secret);
+    assert.match(base64, /=+$/); assert.notEqual(base64.replaceAll('+', '-').replaceAll('/', '_'), base64);
+    const variants = [...new Set([secret, hex.toUpperCase(), Array.from(hex, (character, i) => i % 2 ? character.toUpperCase() : character).join(''),
+      base64, base64.replace(/=+$/, ''), base64.replaceAll('+', '-').replaceAll('/', '_'), raw.toString('base64url'),
+      percent.replace(/%[A-F0-9]{2}/g, value => value.toLowerCase()),
+      percent.replace(/%[A-F0-9]{2}/g, value => `%${value[1]!.toLowerCase()}${value[2]}`)])];
+    const ordinary = [secret.toLowerCase(), Buffer.from(secret.toLowerCase()).toString('hex'),
+      Buffer.from(secret.toLowerCase()).toString('base64url'), encodeURIComponent(secret.toLowerCase()), 'Ordinary PostgreSQL postgres text'];
+    const environmentName = 'TUJIANG_EVALUATION_CODEC_SECRET'; const prior = process.env[environmentName]; process.env[environmentName] = secret;
+    const priorFetch = globalThis.fetch; let network = 0;
+    globalThis.fetch = async () => { network++; throw new Error('synthetic network forbidden'); };
+    try {
+      const manager = managementLedger(f.db); const runner = AuthorizationLedger.forRunner(f.db, new ArtifactCipher(artifactKey));
+      for (const variant of variants) {
+        const payload = corePayload(); payload.sources[0]!.bytesBase64 = Buffer.from(`source:${variant}`).toString('base64');
+        await assert.rejects(manager.createBatch(randomUUID(), payload), /SENSITIVE_INPUT_DETECTED/);
+      }
+      for (const registered of [hex.toUpperCase(), raw.toString('base64url')]) {
+        process.env[environmentName] = registered;
+        const encodedManager = managementLedger(f.db);
+        const payload = corePayload(); payload.sources[0]!.bytesBase64 = Buffer.from(secret).toString('base64');
+        await assert.rejects(encodedManager.createBatch(randomUUID(), payload), /SENSITIVE_INPUT_DETECTED/);
+      }
+      process.env[environmentName] = secret;
+      assert.equal((await f.db.query('SELECT 1 FROM evaluation_artifacts')).rows.length, 0);
+      const payload = corePayload(); payload.sources[0]!.bytesBase64 = Buffer.from(ordinary.join('\n')).toString('base64');
+      const batch = await preparedCore(manager, payload);
+      const saved = await captured({ ...f, manager, runner }, batch, 'item-1', { echoes: variants, ordinary });
+      const reviewed = await managementLedger(f.db).readArtifactForReview(saved.artifactId);
+      for (const variant of variants) assert.equal(reviewed.bytes.includes(Buffer.from(variant)), false);
+      for (const value of ordinary) assert.equal(reviewed.bytes.includes(Buffer.from(value)), true);
+      assert.equal(reviewed.redacted, true); assert.equal(reviewed.originalSha256, sha256(saved.response.bytes));
+      const directory = await mkdtemp(join(await realpath(tmpdir()), 'tujiang-codec-export-'));
+      try {
+        const exported = await exportArtifact(managementLedger(f.db), saved.artifactId, directory);
+        const bytes = await readFile(join(directory, exported.files[0]!));
+        assert.deepEqual(bytes, reviewed.bytes); assert.equal(exported.redacted, true);
+      } finally { await rm(directory, { recursive: true }); }
+      assert.equal(network, 0);
+    } finally {
+      globalThis.fetch = priorFetch;
+      if (prior === undefined) delete process.env[environmentName]; else process.env[environmentName] = prior;
+    }
+  } },
   { name: 'attempt reservations authenticate their exact batch, item, semantics and capability identity before quota reuse or dispatch', run: async f => {
     const a = await preparedCore(f.manager, corePayload('fact_extraction', 1000, 2));
     const b = await preparedCore(f.manager, corePayload('copy', 1000, 2));

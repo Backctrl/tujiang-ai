@@ -8,10 +8,24 @@ export interface SealedArtifact {
 export interface ArtifactBinding { authorizationId: string; artifactId: string; batchId: string | null; attemptId: string | null; kind: string;
   sourceSha256: string; metadataSha256: string }
 
+function byteRepresentations(bytes: Buffer) {
+  const base64 = bytes.toString('base64'); const unpadded = base64.replace(/=+$/, '');
+  return [base64, unpadded, base64.replaceAll('+', '-').replaceAll('/', '_'), bytes.toString('base64url'),
+    bytes.toString('hex'), bytes.toString('hex').toUpperCase()];
+}
+function percentPattern(encoded: string) {
+  // Fold only hexadecimal digits within percent escapes, preserving all other text case exactly.
+  const tokens = encoded.match(/%[A-F0-9]{2}|./g)!;
+  return tokens.map(token => token.startsWith('%') && token.length === 3
+    ? `%${Array.from(token.slice(1), character => /[A-F]/.test(character) ? `[${character.toLowerCase()}${character}]` : character).join('')}`
+    : `\\x${token.charCodeAt(0).toString(16).padStart(2, '0')}`).join('');
+}
+
 export class ArtifactCipher {
   private readonly key: Buffer;
   private secrets: string[] = [];
   private binarySecrets: Buffer[] = [];
+  private encodedPatterns: RegExp[] = [];
   readonly keyId: string;
   constructor(encodedKey: string) {
     this.key = Buffer.from(encodedKey, 'base64');
@@ -21,17 +35,31 @@ export class ArtifactCipher {
   }
   protectSecrets(secrets: string[]) {
     const text = new Set(this.secrets); const binary = new Map(this.binarySecrets.map(value => [value.toString('hex'), value]));
+    const patterns = new Map(this.encodedPatterns.map(value => [`${value.flags}:${value.source}`, value]));
+    const addPattern = (source: string, flags: string) => patterns.set(`${flags}:${source}`, new RegExp(source, flags));
     for (const secret of secrets.filter(Boolean)) {
-      const raw = Buffer.from(secret); const variants = [secret, raw.toString('base64'), raw.toString('hex')];
-      const decoded = [Buffer.from(secret, 'base64'), /^[a-f0-9]+$/i.test(secret) && secret.length % 2 === 0 ? Buffer.from(secret, 'hex') : Buffer.alloc(0)];
+      const raw = Buffer.from(secret); const variants = [secret, ...byteRepresentations(raw)];
+      addPattern(raw.toString('hex'), 'gi');
+      const normalizedBase64 = secret.replaceAll('-', '+').replaceAll('_', '/').replace(/=+$/, '');
+      const decodedBase64 = Buffer.from(normalizedBase64, 'base64');
+      const decoded = [
+        /^[A-Za-z0-9+/_-]+={0,2}$/.test(secret) && decodedBase64.toString('base64').replace(/=+$/, '') === normalizedBase64 ? decodedBase64 : Buffer.alloc(0),
+        /^[a-f0-9]+$/i.test(secret) && secret.length % 2 === 0 ? Buffer.from(secret, 'hex') : Buffer.alloc(0),
+      ];
       for (const bytes of decoded) {
-        if (bytes.length < 16 || ![bytes.toString('base64'), bytes.toString('hex')].includes(secret)) continue;
-        binary.set(bytes.toString('hex'), bytes); variants.push(bytes.toString('base64'), bytes.toString('hex'));
+        if (bytes.length < 16) continue;
+        binary.set(bytes.toString('hex'), bytes); variants.push(...byteRepresentations(bytes)); addPattern(bytes.toString('hex'), 'gi');
+        const utf8 = bytes.toString('utf8'); if (Buffer.from(utf8).equals(bytes)) variants.push(utf8);
       }
-      for (const value of variants) for (const encoding of [value, JSON.stringify(value).slice(1, -1), encodeURIComponent(value)]) text.add(encoding);
+      for (const value of variants) {
+        const encoded = encodeURIComponent(value);
+        for (const encoding of [value, JSON.stringify(value).slice(1, -1), encoded]) text.add(encoding);
+        if (encoded.includes('%')) addPattern(percentPattern(encoded), 'g');
+      }
     }
     this.secrets = [...text].sort((left, right) => right.length - left.length);
     this.binarySecrets = [...binary.values()];
+    this.encodedPatterns = [...patterns.values()].sort((left, right) => right.source.length - left.source.length);
   }
   redact(bytes: Uint8Array): { bytes: Buffer; redacted: boolean } {
     let input = Buffer.from(bytes); let binaryRedacted = false;
@@ -45,6 +73,7 @@ export class ArtifactCipher {
     let value = input.toString('utf8');
     const original = value;
     for (const secret of this.secrets) value = value.split(secret).join('[REDACTED]');
+    for (const pattern of this.encodedPatterns) value = value.replace(pattern, '[REDACTED]');
     value = value.replace(/\bsk-or-v1-[A-Za-z0-9_-]+\b/g, '[REDACTED]')
       .replace(/(authorization["']?\s*[:=]\s*["']?Bearer\s+)[^\s"',}]+/gi, '$1[REDACTED]');
     // Keep arbitrary raw bytes byte-identical when there was no textual redaction.

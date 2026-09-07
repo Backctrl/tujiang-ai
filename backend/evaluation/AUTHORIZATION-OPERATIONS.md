@@ -84,4 +84,4 @@ finish、recover、inspect 和有 Key 的 status 在派发或完成之后发现�
 
 ## 验证
 
-`npm test` 包含离线、权限、材料、CLI 与模拟传输用例；`npm run test:postgres` 额外加载独立真实 PostgreSQL 子进程的预算竞争、重复派发与 reserve/dispatch/capture/finish 四个中断点测试。共享的完整性矩阵在 PGlite 与真实 PostgreSQL 各执行一次，包含标记/密文/ID 篡改、跨 item/batch/type 引用、attempt 语义列迁移、审批缺失与恢复后的跨进程零请求检查。缺少 `TEST_DATABASE_URL` 时后者报错，不跳过。测试仅在本次随机生成且校验过的 schema 内写入；模拟旧库缺少外键时也只在该测试 schema 删除指定约束，所有模型响应由合成 fetch 提供。
+`npm test` 包含离线、权限、材料、CLI 与模拟传输用例；`npm run test:postgres` 额外加载独立真实 PostgreSQL 子进程的预算竞争、重复派发与 reserve/dispatch/capture/finish 四个中断点测试。共享的完整性矩阵在 PGlite 与真实 PostgreSQL 各执行一次，包含标记/密文/ID 篡改、跨 item/batch/type 引用、attempt 语义列迁移、审批缺失与恢复后的跨进程零请求检查。凭据编码用例覆盖大小写混合 hex、有/无填充的标准及 URL-safe base64、百分号转义大小写；验证敏感输入没有材料落库、capture/review/export 脱敏一致、普通文本大小写被保留，并拦截及计数所有 HTTP 调用以确认请求数为零。缺少 `TEST_DATABASE_URL` 时后者报错，不跳过。测试仅在本次随机生成且校验过的 schema 内写入；模拟旧库缺少外键时也只在该测试 schema 删除指定约束，所有模型响应由合成 fetch 提供。
