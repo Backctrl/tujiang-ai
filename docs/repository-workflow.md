@@ -19,7 +19,9 @@ GitHub `Backctrl/tujiang-ai` 是共享代码源。`main` 保存已审阅的组�
 
 GitHub Desktop 的 Repository → Show in Explorer 可以确认实际目录。同名仓库可能是不同 clone；Fetch 不会合并另一个分支。Codex 正在工作的目录不要在 Desktop 中随意切分支。
 
-本轮目录分工：`F:/Project/tujiang-ai` 为 Desktop 检出，`F:/Project/tujiang-ai-source` 为开发主目录；临时 PR 工作目录用于隔离验证。具体分支/HEAD 与同步回执由本轮控制中心台账保存，不把旧文档中的路径或提交当作当前状态。
+本地目录于 2026-09-07 统一整理到 `F:/Project/tujiang-ai`：`01-main` 是主仓库，`02-development` 保存开发 worktree，`03-runtime` 保存集成、运行与验收 worktree，`04-archive` 保存已结束阶段与旧副本。原 Desktop 检出位于 `04-archive/tujiang-ai-legacy-checkout`；旧 `F:/Project/tujiang-ai-source` 仅是指向 `01-main` 的当前任务兼容目录联接。
+
+新任务目录建在 `02-development/<task-name>`，运行和验收目录建在 `03-runtime/<task-name>`，不再散放在 `F:/Project` 顶层。移动已有 worktree 时使用 Git worktree 命令，核对分支、未提交内容及依赖目录联接。具体分支/HEAD 与同步回执由当前执行台账保存，不把旧文档中的路径或提交当作当前状态。
 
 ## 从干净安装验证
 
