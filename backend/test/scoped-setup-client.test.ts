@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createElement, useRef, useState } from 'react';
+import { createElement, isValidElement, useRef, useState, type ReactElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { registerHooks } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -12,7 +12,8 @@ import { contextDraftSchema, type ContextDraft, type ScopedRulePack } from '../s
 import type { Project } from '../src/contracts.js';
 import { ApiError, StageAApi, prepareProjectWrite } from '../../src/pages/ArcaneWarriorPage/stage-a-api.js';
 import { compileContextForm, contextForm, contextReadiness, scopedTargetFields } from '../../src/pages/ArcaneWarriorPage/project-context.js';
-import { isRuleCatalog, type RuleCatalog } from '../../src/pages/ArcaneWarriorPage/rule-catalog.js';
+import { isRuleCatalog, ruleKey, type RuleCatalog } from '../../src/pages/ArcaneWarriorPage/rule-catalog.js';
+import { draftKey } from '../../src/pages/ArcaneWarriorPage/project-drafts.js';
 import { useProjectContext, type ContextSession, type ProjectContextController } from '../../src/pages/ArcaneWarriorPage/useProjectContext.js';
 import { useProjectSnapshot } from '../../src/pages/ArcaneWarriorPage/useProjectSnapshot.js';
 import { useProjectSession } from '../../src/pages/ArcaneWarriorPage/useProjectSession.js';
@@ -33,6 +34,11 @@ async function ui(name: string) {
   const assets = registerHooks({ load(url, context, next) { return /\.(png|jpe?g|webp|svg)(?:\?|$)/.test(url) ? { format: 'module', source: `export default ${JSON.stringify(url)}`, shortCircuit: true } : next(url, context); } });
   try { return await tsImport(`../../src/pages/ArcaneWarriorPage/${name}.tsx`, { parentURL: import.meta.url, tsconfig: fileURLToPath(new URL('../../tsconfig.app.json', import.meta.url)) }); }
   finally { assets.deregister(); }
+}
+function elements(node: unknown): ReactElement<Record<string, unknown>>[] {
+  if (Array.isArray(node)) return node.flatMap(elements);
+  if (!isValidElement<Record<string, unknown>>(node)) return [];
+  return [node, ...elements(node.props.children)];
 }
 
 test('full catalog preserves optional legacy compatibility and rejects malformed scoped semantics before exposing choices', async () => {
@@ -188,6 +194,86 @@ test('scope and catalog changes in the same React batch preserve input and canno
       assert.equal(c.canActivate, true); latest = null; c.activate(); assert.equal(writes, 0);
       latest = { ...catalog, scopedRulePacks: [{ ...scopedRule, constraints: [numericRule('replacement', { kind: 'content', contentType: scopedRule.target.contentType }, 'moduleCount', { max: 1 })] }] };
       c.activate(); assert.equal(writes, 0);
+    });
+  } finally { await f.close(); }
+});
+
+test('actual locale selector only offers compatible catalog tuples and atomically changes country, language, currency, units and exact rule', async () => {
+  const second: ScopedRulePack = { ...structuredClone(scopedRule), id: 'synthetic-fr-ca-metric', name: 'Synthetic second locale',
+    target: { ...scopedRule.target, country: 'CA', language: 'fr-CA', currency: 'CAD', unitSystem: 'metric' } };
+  const elsewhere: ScopedRulePack = { ...structuredClone(scopedRule), id: 'synthetic-other-site', target: { ...scopedRule.target, site: 'not-this-site', language: 'de-DE', currency: 'EUR' } };
+  const f = await fixture({ rulePacks: [rule], scopedRulePacks: [scopedRule, second, elsewhere] });
+  try {
+    let project = await f.write(await f.create(), 'production/initialize'); project = await f.write(project, 'production/context/draft', { context: scopedContext });
+    const { LocaleFields, TargetFields } = await ui('ProjectContextFields');
+    await withStorage(() => {
+      const before = structuredClone(project), calls: string[] = [];
+      const session: ContextSession = { project, getLatestProject: () => project, catalog: [rule], scopedCatalog: [scopedRule, second, elsewhere], canWrite: true, write: path => { calls.push(path); return undefined; } };
+      let c = render(session, controller => {
+        const select = elements(LocaleFields({ context: controller })).find(element => element.type === 'select' && element.props['aria-label'] === '已支持的本地化与规则组合');
+        assert.ok(select); assert.equal(select.props.value, ruleKey(scopedRule));
+        const values = elements(select).filter(element => element.type === 'option').map(element => element.props.value);
+        assert.deepEqual(values, ['', ruleKey(scopedRule), ruleKey(second)], 'neither another channel nor unconditional locale values are offered');
+        const onChange = select.props.onChange as (event: { target: { value: string } }) => void;
+        onChange({ target: { value: ruleKey(second) } });
+      });
+      assert.deepEqual(c.compiled.context.primaryTarget, second.target); assert.deepEqual(c.compiled.context.rulePackRef, { id: second.id, version: second.version });
+      assert.equal(c.form.selectionBasis, 'local_production_policy'); assert.deepEqual(project, before); assert.deepEqual(calls, []);
+      const supported = renderToStaticMarkup(createElement(LocaleFields, { context: c })).split('context-supported-locale')[1]!.split('</div>')[0]!;
+      assert.equal((supported.match(/readOnly=""/g) ?? []).length, 4); assert.doesNotMatch(supported, /value="(?:de-DE|EUR)"/);
+      c = render(session, controller => controller.setLocaleRule(elsewhere.id, elsewhere.version));
+      assert.deepEqual(c.compiled.context.primaryTarget, second.target, 'direct invocation cannot select a different channel');
+      c = render(session, controller => controller.setField('language', 'fr-FR'));
+      assert.equal(c.form.language, 'fr-FR'); assert.equal(c.form.rulePackId, ''); assert.equal(c.canSave, true); assert.equal(c.canActivate, false);
+      const draftHtml = renderToStaticMarkup(createElement(LocaleFields, { context: c }));
+      assert.match(draftHtml, /未配置本地化与原输入（仅作草稿）/); assert.match(draftHtml.split('context-locale-draft')[1]!, /value="fr-FR"/);
+      assert.doesNotMatch(draftHtml.split('context-supported-locale')[1]!.split('</div>')[0]!, /value="fr-FR"/);
+      c = render(session, controller => controller.setField('platform', 'custom-platform'));
+      const targetHtml = renderToStaticMarkup(createElement(TargetFields, { context: c, session: { ...session, catalogLoading: false, token: 'test', reloadCatalog: () => undefined } }));
+      assert.doesNotMatch(targetHtml.split('未配置目标与原输入')[0]!, /<option[^>]+value="custom-platform"/);
+      assert.match(targetHtml.split('未配置目标与原输入')[1]!, /value="custom-platform"/);
+    });
+  } finally { await f.close(); }
+});
+
+test('locale catalog loss preserves frozen history and custom drafts without fabricating supported options or replacing a version on refresh', async () => {
+  const f = await fixture({ rulePacks: [], scopedRulePacks: [scopedRule] });
+  try {
+    let project = await f.write(await f.create(), 'production/initialize'); project = await f.write(project, 'production/context/draft', { context: scopedContext });
+    project = await f.write(project, 'production/context/activate');
+    const before = structuredClone(project), { LocaleFields } = await ui('ProjectContextFields');
+    await withStorage(() => {
+      const session: ContextSession = { project, getLatestProject: () => project, catalog: [], scopedCatalog: [], canWrite: true, write: () => undefined };
+      const c = render(session); assert.equal(c.readOnly, true); assert.deepEqual(c.compiled.context, scopedContext);
+      const select = elements(LocaleFields({ context: c })).find(element => element.type === 'select'); assert.ok(select);
+      assert.equal(select.props.disabled, true); assert.equal(select.props.value, ''); assert.equal(elements(select).filter(element => element.type === 'option').length, 1);
+      const html = renderToStaticMarkup(createElement(LocaleFields, { context: c })); assert.match(html, /历史版本本地化 · 仅供查看/); assert.match(html, /en-US/);
+      const copied = render(session, controller => controller.requestCopy(controller.activeVersion!));
+      assert.equal(copied.canSave, true); assert.equal(copied.canActivate, false); assert.equal(copied.localeRules.length, 0);
+      const replacement = { ...structuredClone(scopedRule), id: 'new-catalog-version', version: 'v-next' };
+      const refreshed = render({ ...session, scopedCatalog: [replacement] });
+      assert.equal(refreshed.form.rulePackId, scopedRule.id); assert.equal(refreshed.form.rulePackVersion, scopedRule.version); assert.equal(refreshed.canActivate, false);
+      assert.equal(elements(LocaleFields({ context: refreshed })).find(element => element.type === 'select')!.props.value, '', 'a fresh catalog never silently chooses its replacement');
+      assert.deepEqual(project, before);
+    });
+  } finally { await f.close(); }
+});
+
+test('stale locale handlers cannot apply an old channel or a catalog that changed before React rerenders', async () => {
+  const second: ScopedRulePack = { ...structuredClone(scopedRule), id: 'synthetic-second-locale', target: { ...scopedRule.target, language: 'fr-CA', currency: 'CAD', unitSystem: 'metric' } };
+  const f = await fixture({ rulePacks: [], scopedRulePacks: [scopedRule, second] });
+  try {
+    let project = await f.write(await f.create(), 'production/initialize'); project = await f.write(project, 'production/context/draft', { context: scopedContext });
+    await withStorage(() => {
+      let latest: RuleCatalog | null = { contractVersion: 'production.1', rulePacks: [], scopedRulePacks: [scopedRule, second] };
+      const session: ContextSession = { project, getLatestProject: () => project, catalog: [], scopedCatalog: [scopedRule, second], getLatestCatalog: () => latest, canWrite: true, write: () => undefined };
+      const c = render(session); latest = null; c.setLocaleRule(second.id, second.version);
+      assert.equal(localStorage.getItem(draftKey(project.id, 'productionContext:reviewed')), null, 'expired catalog must not mutate the draft');
+      latest = { contractVersion: 'production.1', rulePacks: [], scopedRulePacks: [scopedRule, second] };
+      const moved = render(session, controller => controller.setField('site', 'new-local-site'));
+      const raw = localStorage.getItem(draftKey(project.id, 'productionContext:reviewed'));
+      c.setLocaleRule(second.id, second.version);
+      assert.equal(localStorage.getItem(draftKey(project.id, 'productionContext:reviewed')), raw); assert.equal(moved.form.site, 'new-local-site');
     });
   } finally { await f.close(); }
 });

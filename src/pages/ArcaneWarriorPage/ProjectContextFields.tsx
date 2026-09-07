@@ -53,33 +53,48 @@ function RuleDetails({ rule, title, category }: { rule: StoredRulePack; title: s
   </div>
 }
 
+function targetMatches(form: ContextForm, rule: StoredRulePack) {
+  return Object.entries(rule.target).every(([field, value]) => form[field as keyof ContextForm] === value)
+}
+
 export function TargetFields({ context: c, session: s }: Props) {
-  const ref = c.compiled.context.rulePackRef, selected = ruleKey(ref)
+  const ref = c.compiled.context.rulePackRef
   const available = c.rules?.filter(rule => ruleModel(rule) === c.model) ?? []
   const scoped = c.model === 'scoped-rules.1'
   const platforms = [...new Set(available.map(rule => rule.target.platform))]
   const sites = [...new Set(available.filter(rule => rule.target.platform === c.form.platform).map(rule => rule.target.site))]
   const contentTypes = [...new Set(available.filter(isScopedRule).filter(rule => rule.target.platform === c.form.platform && rule.target.site === c.form.site).map(rule => rule.target.contentType))]
   const matching = available.filter(rule => (!c.form.platform || rule.target.platform === c.form.platform) && (!c.form.site || rule.target.site === c.form.site) && (!scoped || !c.form.contentType || (isScopedRule(rule) && rule.target.contentType === c.form.contentType)))
-  const choose = (field: 'platform' | 'site' | 'contentType', label: string, options: string[]) => <label>{label}<select value={c.form[field]} disabled={!c.canEdit || s.catalogLoading} onChange={e => c.setField(field, e.target.value)}><option value="">请选择{label}</option>{c.form[field] && !options.includes(c.form[field]) && <option value={c.form[field]}>{c.form[field]}（目录未配置）</option>}{options.map(value => <option key={value} value={value}>{value}</option>)}</select></label>
+  const selected = matching.some(rule => ruleKey(rule) === ruleKey(ref) && targetMatches(c.form, rule)) ? ruleKey(ref) : ''
+  const choose = (field: 'platform' | 'site' | 'contentType', label: string, options: string[]) => <label>{label}<select value={options.includes(c.form[field]) ? c.form[field] : ''} disabled={!c.canEdit || s.catalogLoading || !options.length} onChange={e => c.setField(field, e.target.value)}><option value="">请选择{label}</option>{options.map(value => <option key={value} value={value}>{value}</option>)}</select></label>
   return <><div className="form-grid"><label className="wide">规则类型<select value={c.model} disabled={!c.canEdit} onChange={e => c.requestModel(e.target.value as RuleModel)}><option value="scoped-rules.1">按范围核验的目标规则</option><option value="legacy-canvas.1">旧版画布规则</option></select></label>
     {choose('platform', '首发平台', platforms)}{choose('site', '站点', sites)}{scoped && choose('contentType', '内容类型', contentTypes)}
-    <TextField context={c} field="country" label="国家 / 地区代码" maxLength={2} placeholder="选择规则后带入" />
     <label className="wide">已配置的平台规则<select value={selected} disabled={!c.canEdit || s.catalogLoading || c.rules === null} onChange={e => {
       const rule = matching.find(item => ruleKey(item) === e.target.value); c.setRule(rule?.id ?? '', rule?.version ?? '')
-    }}><option value="">选择规则并带入目标与本地化配置</option>{selected && !matching.some(rule => ruleKey(rule) === selected) && <option value={selected}>{ref?.id} · {ref?.version}（当前选择中不可用）</option>}{matching.map(rule => <option key={ruleKey(rule)} value={ruleKey(rule)}>{isScopedRule(rule) ? rule.name : rule.id} · {rule.version} · {rule.target.country} / {rule.target.language}</option>)}</select></label></div>
+    }}><option value="">选择规则并带入目标与本地化配置</option>{matching.map(rule => <option key={ruleKey(rule)} value={ruleKey(rule)}>{isScopedRule(rule) ? rule.name : rule.id} · {rule.version} · {rule.target.country} / {rule.target.language} / {rule.target.currency} / {rule.target.unitSystem === 'metric' ? '公制' : '英制'}</option>)}</select></label></div>
     <p className="hint">选择规则后带入该目标的语言、货币和计量单位。平台、站点或内容类型变化后需要重新选择规则。</p>
     <Button disabled={!s.project || !s.token.trim() || s.authExpired || s.catalogLoading} onClick={s.reloadCatalog}><RefreshCw size={14} />{s.catalogLoading ? '正在读取规则' : '重新读取平台规则'}</Button>
     {s.catalogError && <p role="alert" className="hint">{s.catalogError}</p>}
     {c.rules !== null && !available.length && <p className="hint">暂无此类已配置规则。可先保存草稿，补齐已核验规则后再启用。</p>}
-    <details className="inspector-block"><summary>手动填写未配置目标（仅作草稿）</summary><p className="integration-note">目录未配置的目标可以保留为草稿；启用前必须匹配已核验的规则版本。</p><div className="form-grid"><TextField context={c} field="platform" label="首发平台" /><TextField context={c} field="site" label="站点" />{scoped && <TextField context={c} field="contentType" label="内容类型" />}</div></details>
+    <details className="inspector-block" open={!!c.form.platform && !platforms.includes(c.form.platform)}><summary>未配置目标与原输入（仅作草稿）</summary><p className="integration-note">这里保留目录以外的目标和旧输入，不代表平台已支持。启用前必须明确选择相容的已核验组合。</p><div className="form-grid"><TextField context={c} field="platform" label="首发平台" /><TextField context={c} field="site" label="站点" />{scoped && <TextField context={c} field="contentType" label="内容类型" />}</div>{ref && !selected && <p>保留的规则引用：{ref.id} · {ref.version}，不在当前可选组合中。</p>}</details>
     {c.rule && <><RuleDetails rule={c.rule} title={c.readOnly ? '当前版本冻结的规则' : '所选规则'} category={c.form.category} /><Button disabled={!c.canEdit} onClick={c.applyRuleTarget}>按规则重新填写目标与本地化</Button></>}
     {c.frozenReference && <><p role="status" className="hint">当前目录缺少此版本。下面仅供核对历史冻结规则，不能据此启用草稿。</p><RuleDetails rule={c.frozenReference} title="历史冻结规则参考" category={c.form.category} /></>}
   </>
 }
 
 export function LocaleFields({ context: c }: { context: ProjectContextController }) {
-  return <div className="form-grid"><TextField context={c} field="language" label="目标语言" placeholder="例如 zh-CN" /><TextField context={c} field="currency" label="货币" maxLength={3} placeholder="例如 CNY" /><label className="wide">计量单位<select value={c.form.unitSystem} disabled={!c.canEdit} onChange={e => c.setField('unitSystem', e.target.value)}><option value="">选择单位体系</option><option value="metric">公制</option><option value="imperial">英制</option></select></label></div>
+  const current = c.localeRules.find(rule => ruleKey(rule) === ruleKey(c.compiled.context.rulePackRef) && targetMatches(c.form, rule))
+  const fields = [['country', '国家 / 地区'], ['language', '目标语言'], ['currency', '货币'], ['unitSystem', '计量单位']] as const
+  const value = (field: typeof fields[number][0], text: string) => field === 'unitSystem' ? text === 'metric' ? '公制' : text === 'imperial' ? '英制' : text : text
+  return <><div className="form-grid context-supported-locale"><label className="wide">已支持的本地化与规则组合<select aria-label="已支持的本地化与规则组合" value={current ? ruleKey(current) : ''} disabled={!c.canEdit || !c.localeRules.length} onChange={e => {
+      const rule = c.localeRules.find(item => ruleKey(item) === e.target.value); if (rule) c.setLocaleRule(rule.id, rule.version)
+    }}><option value="">选择当前平台、站点与内容类型的完整组合</option>{c.localeRules.map(rule => <option key={ruleKey(rule)} value={ruleKey(rule)}>{rule.target.country} / {rule.target.language} / {rule.target.currency} / {value('unitSystem', rule.target.unitSystem)} · {isScopedRule(rule) ? rule.name : rule.id} · {rule.version}</option>)}</select></label>
+    {fields.map(([field, label]) => <label key={field}>{label}<input readOnly value={current ? value(field, current.target[field]) : ''} placeholder="选择已支持组合后显示" /></label>)}</div>
+    <p className="hint">选择一个完整组合会同时更新国家、语言、货币、计量单位与精确规则版本。</p>
+    {!c.localeRules.length && <p className="hint">当前平台、站点与内容类型没有可选的本地化组合；现有输入和历史规则仍保留。</p>}
+    {!current && c.readOnly && c.rule && <div className="inspector-block"><b>历史版本本地化 · 仅供查看</b><p>{fields.map(([field, label]) => `${label}：${value(field, c.form[field]) || '未填写'}`).join(' · ')}</p><p>当前目录未提供此完整组合，下面保留原值。</p></div>}
+    <details className="inspector-block context-locale-draft" open={!current && fields.some(([field]) => !!c.form[field])}><summary>未配置本地化与原输入（仅作草稿）</summary><p className="integration-note">这里的自由输入用于保留未配置目标和旧草稿，不会加入上方已支持的组合。修改后需重新选择已核验组合才能启用。</p><div className="form-grid"><TextField context={c} field="country" label="国家 / 地区代码" maxLength={2} /><TextField context={c} field="language" label="目标语言" /><TextField context={c} field="currency" label="货币" maxLength={3} /><TextField context={c} field="unitSystem" label="计量单位" placeholder="metric 或 imperial" /></div></details>
+  </>
 }
 
 export function CanvasFields({ context: c }: { context: ProjectContextController }) {

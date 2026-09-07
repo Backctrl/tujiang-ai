@@ -3,7 +3,7 @@ import type { ProjectContextVersion } from '../../../backend/src/production-cont
 import type { Project } from './stage-a-api.js'
 import type { ProjectSession } from './useProjectSession.js'
 import { readDraft, sameJsonValue, useProjectDraft, useReviewedDraft } from './project-drafts.js'
-import { compileContextForm, contextDifferences, contextForm, contextFormDifferences, contextReadiness, normalizeContextForm, projectContextBase, selectedRule, type ContextBase, type ContextForm } from './project-context.js'
+import { compileContextForm, contextDifferences, contextForm, contextFormDifferences, contextReadiness, normalizeContextForm, projectContextBase, scopedTargetFields, selectedRule, type ContextBase, type ContextForm } from './project-context.js'
 import { isScopedRule, modelLabel, ruleKey, ruleModel, type RuleModel } from './rule-catalog.js'
 
 export type ContextSession = Pick<ProjectSession, 'project' | 'getLatestProject' | 'canWrite' | 'catalog' | 'write'>
@@ -53,7 +53,7 @@ export function useProjectContext(s: ContextSession) {
   const setField = (key: keyof ContextForm, value: string) => {
     if (!canEdit || !currentNow() || key === 'ruleModel') return
     const next = { ...form, [key]: value }
-    if (['platform', 'site', 'contentType'].includes(key) && form[key] !== value) { next.rulePackId = ''; next.rulePackVersion = '' }
+    if (scopedTargetFields.includes(key as typeof scopedTargetFields[number]) && form[key] !== value) { next.rulePackId = ''; next.rulePackVersion = '' }
     if (key === 'platform' && form.platform !== value) { next.site = ''; next.contentType = '' }
     if (key === 'site' && form.site !== value && model === 'scoped-rules.1') next.contentType = ''
     stored.setValue(next)
@@ -66,6 +66,14 @@ export function useProjectContext(s: ContextSession) {
       : { ...form, rulePackId: '', rulePackVersion: '' })
   }
   const applyRuleTarget = () => { if (canEdit && rule && currentNow() && catalogNow() && ruleModel(rule) === model) setRule(rule.id, rule.version) }
+  const sameChannel = (target: ContextForm) => target.platform === form.platform && target.site === form.site && target.contentType === form.contentType && target.ruleModel === model
+  const localeRules = rules?.filter(item => ruleModel(item) === model && !!form.platform && !!form.site && item.target.platform === form.platform && item.target.site === form.site
+    && (model !== 'scoped-rules.1' || (isScopedRule(item) && !!form.contentType && item.target.contentType === form.contentType))) ?? []
+  const setLocaleRule = (id: string, version: string) => {
+    const live = readDraft<{ value: ContextForm; base: ContextBase | null; active: boolean } | undefined>(s.project?.id, 'productionContext:reviewed', undefined)
+    if (!localeRules.some(item => item.id === id && item.version === version) || (live?.active && !sameChannel(normalizeContextForm(live.value, live.base).form))) return
+    setRule(id, version)
+  }
   const archive = (value: SavedMode) => setBackups(previous => ({ ...previous, [value.form.ruleModel]: value }))
   const canCopyVersion = (version?: ProjectContextVersion) => !!version && s.canWrite && initialized && currentNow()
     && !!state?.versions.some(item => item.version === version.version && sameJsonValue(item, version))
@@ -115,7 +123,7 @@ export function useProjectContext(s: ContextSession) {
     void s.write('production/initialize', {}, '已开启制作配置，请填写并明确保存。')
   }
   const local = { ...stored, acknowledge, needsReview: stored.needsReview || migrationRequired || !!unsupported.length }
-  return { initialized, state, activeVersion, serverDraft, form, model, readOnly, compatibilityBlocked: false, canEdit, canCopyVersion, local, compiled, issues, rule, rules, frozenReference,
+  return { initialized, state, activeVersion, serverDraft, form, model, readOnly, compatibilityBlocked: false, canEdit, canCopyVersion, local, compiled, issues, rule, rules, localeRules, setLocaleRule, frozenReference,
     canSave, canActivate, setField, setRule, applyRuleTarget, save, activate, initialize, discard, requestCopy, pendingCopy, confirmCopy, requestModel, backups,
     migrationRequired, unsupported, migrateLocal, migrationRaw: migrationRequired || unsupported.length ? JSON.stringify(stored.value, null, 2) : '',
     cancelCopy: () => setPendingCopy(null), copyVersion, setCopyVersion,
