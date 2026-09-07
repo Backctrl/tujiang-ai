@@ -17,13 +17,13 @@
 | 2A1 | A | 已完成 | [PR #9](https://github.com/Backctrl/tujiang-ai/pull/9)；部分配置草稿、不可变上下文及跨项目规则版本；完整启动链仍依赖 2A3 | D11–D20 |
 | 2B1 | A | 已完成 | [PR #11](https://github.com/Backctrl/tujiang-ai/pull/11)；原件、确定性解析、定位与单文件恢复；[M2 分包记录](verification/m2.md) | D11–D20 |
 | 2B2 | A | 已完成 | [PR #14](https://github.com/Backctrl/tujiang-ai/pull/14)；用途纠正、来源追溯与重确认，114 项后端／13 项真实 PostgreSQL 及独立审查通过 | D11–D20 |
-| 2C | B | 进行中（重新验收） | [PR #12](https://github.com/Backctrl/tujiang-ai/pull/12) 的配置版本与恢复检查有效；用户确认的连续表单、支持组合和真实启动流程尚未完成，分 2C2/2C3 补齐后整页重验 | D11–D20 |
+| 2C | B | 已完成 | [PR #12](https://github.com/Backctrl/tujiang-ai/pull/12)、[#21](https://github.com/Backctrl/tujiang-ai/pull/21)、[#25](https://github.com/Backctrl/tujiang-ai/pull/25)；配置版本、连续五区、支持组合、真实上传与原子启动的整页恢复链通过独立审查、真实 PostgreSQL 与浏览器 | D11–D20 |
 | 2D1 | B | 已完成 | [PR #15](https://github.com/Backctrl/tujiang-ai/pull/15)、[窄栏修复 #16](https://github.com/Backctrl/tujiang-ai/pull/16)；真实上传、持久恢复、AW 原件与 Facts 窄栏操作均通过独立验收 | D11–D20 |
 | 2D2 | B | 已完成 | [PR #20](https://github.com/Backctrl/tujiang-ai/pull/20)；四类用途／提取／事实／来源重确认任务、局部影响、草稿隔离及重开／409 恢复通过 Q；完整 Facts 页仍待 3A/3C | D11–D20 |
 | 2A2 | A | 已完成 | [PR #18](https://github.com/Backctrl/tujiang-ai/pull/18)；范围化规则、历史兼容和只读检查通过独立审查、真实 PostgreSQL 与浏览器；完整目标编辑归 2C2 | D11–D20 |
-| 2A3 | A | 待验收 | [PR #22](https://github.com/Backctrl/tujiang-ai/pull/22)；服务端启动检查、原子启动、冻结输入与显式继续；195 项默认／19 项真实 PostgreSQL 检查通过，Q 审查中 | D11–D20 |
-| 2C2/2C3 | B | 进行中 | [PR #21](https://github.com/Backctrl/tujiang-ai/pull/21) 的连续五区已实现；语言／货币／单位仍可拼成未支持组合的 P2 修复中；2C3 继续接真实启动与首次上传准备流程 | D11–D20 |
-| 3A1 | A | 进行中（暂停实现） | 多来源／适用范围契约草案已整理；优先完成 2A3，尚无已验收实现 | D21–D29 |
+| 2A3 | A | 已完成 | [PR #22](https://github.com/Backctrl/tujiang-ai/pull/22)；服务端检查、原子启动、冻结输入、范围刷新与显式恢复；195 项默认／19 项真实 PostgreSQL 及三平台 CI 通过 | D11–D20 |
+| 2C2/2C3 | B | 已完成 | [PR #21](https://github.com/Backctrl/tujiang-ai/pull/21) 修复完整支持组合，[PR #25](https://github.com/Backctrl/tujiang-ai/pull/25) 接通首次上传、真实启动、刷新重绑与冲突恢复；297 项默认／19 项真实 PostgreSQL 及真实浏览器通过 | D11–D20 |
+| 3A1 | A | 进行中 | 多来源、规范值、适用范围与风险复核实现正在按独立对抗审查补强；合并前仍需真实 PostgreSQL 和下游 fail-closed 复验 | D21–D29 |
 | 3A2/3B | A | 待开始 | Facts 基线、正式动态故事结构与批准 | D21–D29 |
 | 3C/3D | B | 待开始 | 缺口闭环、章节规格、事实与素材绑定 | D21–D29 |
 | 4A/4B | A | 待开始 | 章节命令、锁、布局候选与母版批准 | D30–D44 |
@@ -51,11 +51,13 @@
 | 2A2 | `codex/mvp-2a2-scoped-rules`，`F:/Project/tujiang-ai/04-archive/tujiang-mvp-rules` | ScopedRulePack、兼容快照、只读范围检查 | min/max/exact、范围隔离、版本不可变与真实 PostgreSQL；独立 PR |
 | 2A3 | `codex/mvp-2a3-project-startup`，`F:/Project/tujiang-ai/02-development/tujiang-mvp-startup` | 后端启动检查、输入冻结、显式继续及相关契约 | 默认不配置模型仍给出真实阻断／建议；原子性、幂等与输入范围验证；独立 PR |
 | 2C2 | `codex/mvp-2c2-scoped-setup`，`F:/Project/tujiang-ai/02-development/tujiang-mvp-scoped-setup` | 原 Setup 连续五区、完整目标选择及局部集成 CSS | 对照用户功能与分布参考，真实后端组合与草稿恢复；独立 PR |
+| 2C3 | `codex/mvp-2c3-startup-ui`，`F:/Project/tujiang-ai/02-development/tujiang-mvp-startup-ui` | 原 Setup 首次上传、启动、恢复和客户端会话 | 已合并 PR #25；真实 HTTP／PostgreSQL／IndexedDB／浏览器与刷新凭据重绑通过 |
+| 3A1 | `codex/mvp-3a1-fact-sources`，`F:/Project/tujiang-ai/02-development/tujiang-mvp-fact-sources` | 结构化事实来源、规范值、适用范围、风险复核与下游闸门 | 独立攻击复现必须成为回归；旧入口与持久化篡改一律 fail-closed；独立 PR |
 | 4C1 | `codex/mvp-4c1-renderer-foundation`，`F:/Project/tujiang-ai/04-archive/tujiang-mvp-renderer` | 独立 Renderer 与测量；不改业务批准和原工作台 | 合成章节、固定字体／素材、连续三次渲染；独立 PR |
 
 所有 Agent 不回退其他人的修改，不修改其他目录。公共契约由 A 维护、前端 API 与会话由 B 维护、共享 Renderer 由 C 维护。Q 不实现后再自审；C/Q 轮换第三个执行席位。每次合并前记录最终提交、审查结论和对应验证；不强制覆盖未提交文件。
 
-2026-09-07 用户指出 Setup 的实际功能分布与已确定参考不一致。此前验证覆盖了配置保存和恢复，却没有覆盖中间连续表单及最终启动交互；据此重新打开 2C 和 Setup 整页验收，不以此前局部截图或接口通过替代。补齐标准见 [D005](decisions.md#d005setup-功能与分布重验) 与 [M2 未关闭范围](verification/m2.md#未关闭范围)。
+2026-09-07 用户指出 Setup 的实际功能分布与已确定参考不一致。此前验证覆盖了配置保存和恢复，却没有覆盖中间连续表单及最终启动交互；据此重新打开 2C 和 Setup 整页验收，不以此前局部截图或接口通过替代。补齐标准见 [D005](decisions.md#d005setup-功能与分布重验)。PR #21、#22、#25 随后补齐连续表单、支持组合、服务端原子启动及刷新重绑，整页工程验收记录见 [M2](verification/m2.md#2a32c22c3-整页收尾)。
 
 同日用户补充产品事实页的功能分布参考。2D2 仅验收资料用途与事实来源处理；完整 Facts 页仍依赖 3A1/3A2 与 3C1 的多来源对照、缺口、Agent 解释和正式事实版本放行。提取记录归左栏，统一队列与来源对照归中区，右栏绑定当前事实展示解释、影响和确认动作，见 [D006](decisions.md#d006产品事实页功能分布与正式放行)。
 
@@ -65,4 +67,4 @@
 
 本轮使用真实 PostgreSQL、本地文件存储和单操作者认证，提供可重复启动与恢复。公网部署、多用户成员授权、自动发布和完整品牌治理不属于本轮。真实模型和图片调用需先形成具体配置、调用量及预算方案，取得授权后执行。
 
-AW FLEX 的四份上游原件、两份逐字 CSV 导出及父子哈希清单已在真实本地后端完成接收与哈希核对；其中原始画板 JSON 明确超出解析块上限，原件保留，逐字 CSV 的 475 个文字节点完整解析。已确定淘宝中国中文母版及 Amazon 美国站英文 A+ 商品详情内容，初期采用 Basic A+ 制作范围。用户选择先验收一个 SKU，待补具体型号、预期事实、部分平台规则及人工签收，详见 [业务输入清单](business-inputs.md)。[规则核对记录](platform-rules.md)已整理；[模型试验方案](model-evaluation-proposal.md)已获最多 12 次文本、2 次图片及 1 USD 本地估算门授权，当前仍为 0 次模型 POST。M1 工程验收已完成；M0、M2 及最终业务验收仍保持开放。不依赖缺失输入的开发继续推进。
+AW FLEX 的四份上游原件、两份逐字 CSV 导出及父子哈希清单已在真实本地后端完成接收与哈希核对；其中原始画板 JSON 明确超出解析块上限，原件保留，逐字 CSV 的 475 个文字节点完整解析。已确定淘宝中国中文母版及 Amazon 美国站英文 A+ 商品详情内容，初期采用 Basic A+ 制作范围。用户选择先验收一个 SKU，待补具体型号、预期事实、部分平台规则及人工签收，详见 [业务输入清单](business-inputs.md)。[规则核对记录](platform-rules.md)已整理；[模型试验方案](model-evaluation-proposal.md)已获最多 12 次文本、2 次图片及 1 USD 本地估算门授权，当前仍为 0 次模型 POST。M1、M2 工程验收已完成；M0 与最终业务验收仍保持开放。不依赖缺失输入的开发继续推进。
