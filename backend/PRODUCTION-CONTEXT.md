@@ -38,7 +38,7 @@ interface ProjectContextVersion {
 
 | 对象 | 完整激活所需字段 |
 | --- | --- |
-| `productBrief` | `productName`、`internalCode`、`category`、`stage`（非空文字，各最多 200 字符）；`introduction`（最多 10000 字符）；`commercialIntent`（最多 2000 字符） |
+| `productBrief` | 必填：`productName`、`category`、`stage`（非空文字，各最多 200 字符）与 `introduction`（非空、最多 10000 字符）；可省略：`internalCode`（非空、最多 200 字符）与 `commercialIntent`（非空、最多 2000 字符）。已保存的 P 快照保持原内容，不因可选性调整而重写。 |
 | `primaryTarget` | `platform`、`site`；`country`（2 位大写）；`language`（语言标签）；`currency`（3 位大写）；`unitSystem`（`metric` 或 `imperial`）；新规则模型还须 `contentType` |
 | `canvasProfile` | `widthPx`（1—20000 的整数）；`format`（`png`、`jpeg` 或 `webp`）；新规则模型还须 `selectionBasis: 'local_production_policy'` |
 | `rulePackRef` | `id`、`version`（非空文字，各最多 200 字符） |

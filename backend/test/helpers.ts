@@ -10,8 +10,9 @@ import { buildApp } from '../src/app.js';
 import { LocalObjects } from '../src/objects.js';
 import type { Project } from '../src/contracts.js';
 import type { ProductionCatalog } from '../src/production-context.js';
+import type { StartupExecutionConfig } from '../src/production-startup.js';
 
-export async function fixture(productionCatalog?: ProductionCatalog) {
+export async function fixture(productionCatalog?: ProductionCatalog, startupExecution?: StartupExecutionConfig) {
   const engine = new PGlite();
   const wrap = (client: Pick<PGlite, 'query'>): Connection => ({
     async query<T extends Record<string, unknown>>(sql: string, params?: unknown[]) {
@@ -24,7 +25,7 @@ export async function fixture(productionCatalog?: ProductionCatalog) {
   const store = new Store(db);
   const token = randomUUID();
   const objects = new LocalObjects(dir);
-  const app = buildApp(store, objects, { token, actor: 'test-human', productionCatalog });
+  const app = buildApp(store, objects, { token, actor: 'test-human', productionCatalog, startupExecution });
   const headers = { authorization: `Bearer ${token}` };
   async function post(url: string, payload: unknown) { return app.inject({ method: 'POST', url, headers, payload: payload as Record<string, unknown> }); }
   async function create() {

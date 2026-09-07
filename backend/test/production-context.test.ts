@@ -144,6 +144,20 @@ test('activation rejects target, canvas and same-version rule substitution witho
   assert.deepEqual(p, before);
 });
 
+test('optional brief code and commercial intent do not block activation or rewrite older context snapshots', () => {
+  const production: Production = { contractVersion: 'production.1', objects: [] };
+  saveContextDraft(production, context);
+  const first = structuredClone(activateContext(production, { rulePacks: [rule] }, 'employee'));
+  const { productName, category, stage, introduction } = context.productBrief;
+  saveContextDraft(production, { ...context, productBrief: { productName, category, stage, introduction } });
+  const second = activateContext(production, { rulePacks: [rule] }, 'employee');
+  assert.equal(second.version, 2); assert.equal(second.context.productBrief.internalCode, undefined);
+  assert.equal(second.context.productBrief.commercialIntent, undefined);
+  assert.equal(second.rulePackSha256, first.rulePackSha256); assert.deepEqual(production.context!.versions[0], first);
+  saveContextDraft(production, { ...context, productBrief: { productName, category, stage } });
+  assert.throws(() => activateContext(production, { rulePacks: [rule] }, 'employee'), /PRODUCTION_CONTEXT_INCOMPLETE/);
+});
+
 test('production context writes during a legacy fact run preserve its actual input dependency', async () => {
   const f = await fixture({ rulePacks: [rule] });
   try {

@@ -8,6 +8,8 @@ M2 范围规则扩展区分官方内容/模块/图片槽/文本字段约束与�
 
 M2 资料底座支持 TXT/Markdown/CSV/JSON/PNG/JPEG/WebP 原件接收、认证下载、持久解析任务及待审核候选。员工在事实待处理中心逐块确认用途，服务端派生可追溯的 Evidence、Asset 或 Reference。用途纠正保留旧来源和锁定事实，并要求受影响事实明确重确认；图片未执行 OCR。原件接口、限制与恢复见 [资料接收契约](MATERIAL-INGESTION.md)，用途接口与来源闸门见 [资料用途契约](MATERIAL-USAGE.md)。
 
+M2 项目启动在现有项目草稿上完成提交：只读检查未保存表单、原子建立或复用 P、登记首批资料范围，并在来源与服务端执行配置满足条件时排队提取。待解析、待用途审核或执行服务未配置时可以进入事实页，并显示实际等待状态；员工随后明确继续，已派发任务不重复创建。解析失败后的重新上传通过有差异、指纹和原因的范围更新纳入。接口、状态与恢复边界见 [项目启动契约](STARTUP.md)。
+
 ## 基线与工程选择
 
 - [端到端流程 v1，revision 15](https://oriniture.feishu.cn/docx/XHktdDPkKoTPbvxytjKcEfCanPg)
@@ -85,6 +87,11 @@ npm run verify:local-runtime -- --restart
 | `POST /api/projects/:id/production/initialize` | 用户显式初始化可选生产域，重复调用无额外迁移 |
 | `POST /api/projects/:id/production/context/draft` | 已初始化项目整体保存部分配置草稿 |
 | `POST /api/projects/:id/production/context/activate` | 验证完整草稿、目标和规则，追加不可变 P 版本 |
+| `POST /api/projects/:id/production/startup/check` | 只读检查未保存 ContextDraft，返回阻断、建议、提取前置与资料统计 |
+| `POST /api/projects/:id/production/startup/start` | 校验检查指纹，在已有草稿上原子建立启动并按真实条件排队 |
+| `GET /api/projects/:id/production/startup` | 当前启动状态、原任务 ID、范围新增差异；读取不写状态 |
+| `POST /api/projects/:id/production/startup/continue-extraction` | 资料审核或配置恢复后显式继续初始提取 |
+| `POST /api/projects/:id/production/startup/scope-refresh` | 未派发前明确复核新增原件/独立证据，更新初始范围但不排队 |
 | `GET /api/projects/:id` | 最新项目快照，含事实、运行、草稿、QA 与审计 |
 | `GET /api/projects/:id/revisions/:revision` | 不可变历史快照 |
 | `POST /api/projects/:id/identity/confirm` | 员工明确确认产品身份，仅允许首次确认 |

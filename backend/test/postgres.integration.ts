@@ -12,13 +12,16 @@ import { LocalObjects } from '../src/objects.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { initializeProduction } from '../src/production.js';
-import { activateContext, bindRulePackVersion, saveContextDraft, type RulePack } from '../src/production-context.js';
+import { activateContext, bindRulePackVersion, saveContextDraft, type ProductionCatalog, type RulePack } from '../src/production-context.js';
 import { context, rule } from './fixtures/production-context.js';
 import { scopedContext, scopedRule, headerScope } from './fixtures/scoped-rules.js';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { IngestionWorker } from '../src/ingestion-worker.js';
 import { parseMaterial } from '../src/material-parser.js';
 import { availableConfirmedFacts, evidenceIsAvailable } from '../src/material-source-gates.js';
+import type { StartupCheck, StartupStatus } from '../src/production-startup.js';
+import type { StartupCommandResponse } from '../src/startup-routes.js';
+import { buildStructuredRequest } from '../src/openrouter.js';
 
 const configuredUrl = process.env.TEST_DATABASE_URL;
 if (!configuredUrl) throw new Error('TEST_DATABASE_URL is required: real PostgreSQL integration tests cannot be skipped.');
@@ -62,6 +65,203 @@ async function isolated(action: (db: Database, peer: Database, reconnect: (onIdl
 
 const command = (p?: Project, idempotencyKey = randomUUID()) => ({
   expectedProjectVersion: p?.version ?? 0, expectedRevision: p?.revision ?? 0, idempotencyKey,
+});
+
+async function startupHttpServices(databases: Database[], catalogs?: ProductionCatalog[]) {
+  const directory = await mkdtemp(join(tmpdir(), 'tujiang-pg-startup-'));
+  const objects = new LocalObjects(directory);
+  const token = randomUUID(); const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+  const stores = databases.map(db => new Store(db));
+  const catalog: ProductionCatalog = { rulePacks: [rule], scopedRulePacks: [scopedRule] };
+  const apps = stores.map((store, index) => buildApp(store, objects, { actor: 'pg-startup-employee', token,
+    productionCatalog: catalogs?.[index] ?? catalog, startupExecution: { mode: 'synthetic', workerEnabled: true } }));
+  const urls = await Promise.all(apps.map(app => app.listen({ host: '127.0.0.1', port: 0 })));
+  const request = (index: number, path: string, body?: unknown) => fetch(`${urls[index]}${path}`, {
+    method: body === undefined ? 'GET' : 'POST', headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  const write = async (p: Project, route: string, body: Record<string, unknown> = {}, index = 0) => {
+    const response = await request(index, `/api/projects/${p.id}/${route}`, { ...command(p), ...body });
+    const value = await response.json(); assert.ok(response.ok, JSON.stringify(value)); return value as Project;
+  };
+  const create = async (index = 0) => {
+    const response = await request(index, '/api/projects', { ...command(), name: 'Synthetic PostgreSQL startup project' });
+    assert.equal(response.status, 201); return response.json() as Promise<Project>;
+  };
+  const check = async (p: Project, index = 0) => {
+    const response = await request(index, `/api/projects/${p.id}/production/startup/check`, { context: scopedContext });
+    assert.equal(response.status, 200); return response.json() as Promise<StartupCheck>;
+  };
+  const status = async (p: Project, index = 0) => {
+    const response = await request(index, `/api/projects/${p.id}/production/startup`); assert.equal(response.status, 200);
+    return (await response.json() as { startup: StartupStatus | null }).startup;
+  };
+  const evidence = (p: Project, index = 0) => write(p, 'evidence', { documentName: 'synthetic-pg.txt', locator: 'line 1',
+    usage: 'product_evidence', text: 'Synthetic capacity: 10 kg' }, index);
+  const upload = async (p: Project, fileName: string, text: string, index = 0) => {
+    if (!p.production) p = await write(p, 'production/initialize', {}, index);
+    return write(p, 'production/materials', { fileName, mimeType: fileName.endsWith('.json') ? 'application/json' : 'text/plain',
+      contentBase64: Buffer.from(text, 'utf8').toString('base64'), source: { kind: 'local_upload' } }, index);
+  };
+  return { objects, stores, apps, urls, token, headers, catalog, request, create, check, status, write, evidence, upload,
+    async close() { await Promise.all(apps.map(app => app.close())); await rm(directory, { recursive: true }); } };
+}
+
+test('real PostgreSQL over HTTP: startup serializes across services and replays exact responses after fresh pools and model completion', async () => {
+  await isolated(async (db, peer, reconnect) => {
+    await migrate(db); const s = await startupHttpServices([db, peer]);
+    const freshApps: ReturnType<typeof buildApp>[] = [];
+    try {
+      let p = await s.evidence(await s.create()); const original = structuredClone(p);
+      const beforeRevisions = (await db.query('SELECT revision FROM project_revisions')).rows;
+      const check = await s.check(p); assert.equal(check.canQueueExtraction, true);
+      assert.deepEqual((await db.query('SELECT revision FROM project_revisions')).rows, beforeRevisions);
+      const path = `/api/projects/${p.id}/production/startup/start`;
+      const bodies = [0, 1].map(() => ({ ...command(p), context: scopedContext, inputFingerprint: check.inputFingerprint }));
+      const attempts = await Promise.all(bodies.map((body, index) => s.request(index, path, body)));
+      assert.deepEqual(attempts.map(response => response.status).sort(), [200, 409]);
+      const winner = attempts.findIndex(response => response.status === 200);
+      const accepted = await attempts[winner]!.json() as StartupCommandResponse; p = accepted.project;
+      assert.equal(p.production!.context!.versions.length, 1); assert.equal(p.production!.startup!.history.length, 2);
+      assert.equal(p.runs.length, 1); assert.equal(accepted.startup.runId, p.runs[0]!.id); assert.equal(accepted.startup.state, 'queued');
+      assert.deepEqual(p.facts, []); assert.deepEqual(p.production!.objects, []); assert.equal(p.storyboard, undefined);
+      assert.equal(p.identity!.confirmedBy, 'pg-startup-employee');
+      assert.deepEqual(await (await s.request(1 - winner, path, bodies[winner])).json(), accepted);
+      const beforeNoop = structuredClone(p); const currentCheck = await s.check(p, 1);
+      const noop = await s.request(1, path, { ...command(p), context: scopedContext, inputFingerprint: currentCheck.inputFingerprint });
+      assert.equal(noop.status, 200); assert.deepEqual((await noop.json() as StartupCommandResponse).project, beforeNoop);
+      assert.deepEqual(await s.stores[0]!.get(p.id), beforeNoop);
+      const freshDb = await reconnect(); const freshStore = new Store(freshDb);
+      const fresh = buildApp(freshStore, s.objects, { actor: 'pg-startup-employee', token: s.token, productionCatalog: s.catalog });
+      freshApps.push(fresh); const freshUrl = await fresh.listen({ host: '127.0.0.1', port: 0 });
+      assert.deepEqual(await freshStore.get(p.id), p);
+      let calls = 0;
+      await new Worker(s.stores[1]!, { generate: async (skill, project, _observe, run) => {
+        calls++; const input = JSON.parse(buildStructuredRequest(skill, project, 'synthetic-pg-startup', 1000, run).messages[1]!.content);
+        assert.deepEqual(input.evidence.map((value: { id: string }) => value.id), [original.evidence[0]!.id]);
+        return { facts: [{ attribute: 'capacity', role: 'core', value: '10 kg', evidenceId: input.evidence[0].id, quote: '10 kg' }] };
+      } }).tick();
+      p = await freshStore.get(p.id); assert.equal(calls, 1); assert.equal(p.runs[0]!.runStatus, 'succeeded');
+      assert.equal(p.facts[0]!.status, 'candidate'); assert.equal(p.facts[0]!.locked, false); assert.equal(p.facts[0]!.confirmedBy, undefined);
+      const replay = await fetch(`${freshUrl}${path}`, { method: 'POST', headers: s.headers, body: JSON.stringify(bodies[winner]) });
+      assert.equal(replay.status, 200); assert.deepEqual(await replay.json(), accepted);
+      const current = await (await fetch(`${freshUrl}/api/projects/${p.id}/production/startup`, { headers: s.headers })).json();
+      assert.equal(current.startup.state, 'succeeded'); assert.equal(current.startup.modelExecution.status, 'unavailable');
+      const saved = await db.query<{ state: Project }>('SELECT state FROM project_revisions WHERE project_id=$1 AND revision=$2', [original.id, original.revision]);
+      assert.deepEqual(saved.rows[0]!.state, original);
+    } finally { await Promise.all(freshApps.map(app => app.close())); await s.close(); }
+  });
+});
+
+test('real PostgreSQL over HTTP: startup scope refresh recovers parse failures and explicit continue queues only reviewed sources', async () => {
+  await isolated(async (db, peer, reconnect) => {
+    await migrate(db); const s = await startupHttpServices([db, peer]);
+    try {
+      let p = await s.upload(await s.create(), 'broken.json', '{invalid JSON');
+      await new IngestionWorker(s.stores[1]!, s.objects).tick(); p = await s.stores[0]!.get(p.id);
+      const broken = structuredClone(p.production!.materials![0]!); assert.equal(broken.parse.runStatus, 'failed');
+      const check = await s.check(p); assert.equal(check.canStart, true); assert.equal(check.statistics.parseFailed, 1);
+      const startupPath = `/api/projects/${p.id}/production/startup`;
+      const response = await s.request(0, `${startupPath}/start`, { ...command(p), context: scopedContext, inputFingerprint: check.inputFingerprint });
+      assert.equal(response.status, 200); const started = await response.json() as StartupCommandResponse; p = started.project;
+      assert.equal(started.startup.state, 'awaiting_product_evidence'); assert.equal(started.startup.runId, null);
+      p = await s.upload(p, 'corrected.txt', 'Corrected capacity: 10 kg', 1); const correctId = p.production!.materials![1]!.id;
+      const earlierProposal = (await s.status(p, 1))!.scopeRefresh;
+      const stale = { ...command(p), inputFingerprint: earlierProposal.inputFingerprint, reason: 'Reviewed corrected original' };
+      p = await s.upload(p, 'later.txt', 'Later unreviewed material', 0);
+      assert.equal((await s.request(1, `${startupPath}/scope-refresh`, stale)).status, 409);
+      const wrongFingerprint = await s.request(1, `${startupPath}/scope-refresh`, { ...stale, ...command(p) });
+      assert.equal(wrongFingerprint.status, 409); assert.equal((await wrongFingerprint.json()).error.code, 'STARTUP_SCOPE_CHECK_CHANGED');
+      const beforeContinue = structuredClone(p);
+      const waiting = await s.request(0, `${startupPath}/continue-extraction`, command(p));
+      assert.equal(waiting.status, 200); assert.deepEqual((await waiting.json() as StartupCommandResponse).project, beforeContinue);
+      const proposal = (await s.status(p, 1))!.scopeRefresh; assert.equal(proposal.canRefresh, true);
+      assert.equal(proposal.addedMaterialIds.length, 2); assert.deepEqual(proposal.retainedMaterialIds, [broken.id]);
+      const refreshBodies = [0, 1].map(() => ({ ...command(p), inputFingerprint: proposal.inputFingerprint, reason: 'Employee reviewed both new originals for this first batch' }));
+      const refreshed = await Promise.all(refreshBodies.map((body, index) => s.request(index, `${startupPath}/scope-refresh`, body)));
+      assert.deepEqual(refreshed.map(response => response.status).sort(), [200, 409]);
+      const winner = refreshed.findIndex(response => response.status === 200);
+      const refreshReceipt = await refreshed[winner]!.json() as StartupCommandResponse; p = refreshReceipt.project;
+      assert.equal(p.runs.length, 0); assert.equal(p.production!.startup!.scope.version, 2);
+      assert.deepEqual(p.production!.materials!.find(material => material.id === broken.id), broken);
+      const parser = new IngestionWorker(s.stores[1]!, s.objects); while (await parser.tick()) { /* finish each original independently */ }
+      p = await s.stores[0]!.get(p.id); assert.equal((await s.status(p))!.state, 'awaiting_usage_review');
+      const correct = p.production!.materials!.find(material => material.id === correctId)!;
+      p = await s.write(p, `production/materials/${correct.id}/usage`, { reason: 'Employee checked corrected product source',
+        decisions: correct.blocks.map(block => ({ blockId: block.id, usage: 'product_evidence' })) }, 1);
+      assert.equal(p.runs.length, 0); assert.equal((await s.status(p))!.state, 'ready_to_extract');
+      const continueBodies = [command(p), command(p)];
+      const continued = await Promise.all(continueBodies.map((body, index) => s.request(index, `${startupPath}/continue-extraction`, body)));
+      assert.deepEqual(continued.map(response => response.status).sort(), [200, 409]);
+      p = await s.stores[0]!.get(p.id); assert.equal(p.runs.length, 1);
+      assert.deepEqual(p.runs[0]!.startupInput!.evidence.map(ref => ref.id), [p.evidence[0]!.id]);
+      assert.equal(p.evidence[0]!.materialSource!.materialId, correctId);
+      const fresh = new Store(await reconnect()); assert.deepEqual(await fresh.get(p.id), p);
+      assert.deepEqual(await (await s.request(1 - winner, `${startupPath}/scope-refresh`, refreshBodies[winner])).json(), refreshReceipt);
+      const noop = await s.request(1, `${startupPath}/continue-extraction`, command(p));
+      assert.equal(noop.status, 200); assert.deepEqual((await noop.json() as StartupCommandResponse).project, p);
+      const locked = await s.request(0, `${startupPath}/scope-refresh`, { ...command(p), inputFingerprint: (await s.status(p))!.scopeRefresh.inputFingerprint, reason: 'Cannot rewrite a queued batch' });
+      assert.equal((await locked.json()).error.code, 'STARTUP_SCOPE_LOCKED');
+    } finally { await s.close(); }
+  });
+});
+
+test('real PostgreSQL over HTTP: conflicting same-version rules cannot partially start separate projects', async () => {
+  await isolated(async (db, peer) => {
+    await migrate(db);
+    const changed = { ...scopedRule, publication: { ...scopedRule.publication, actor: 'different-synthetic-reviewer' } };
+    const s = await startupHttpServices([db, peer], [
+      { rulePacks: [], scopedRulePacks: [scopedRule] }, { rulePacks: [], scopedRulePacks: [changed] },
+    ]);
+    try {
+      const projects = [await s.evidence(await s.create(0), 0), await s.evidence(await s.create(1), 1)];
+      const checks = await Promise.all(projects.map((p, index) => s.check(p, index)));
+      const beforeReceipts = (await db.query('SELECT key FROM command_receipts')).rows.length;
+      const attempts = await Promise.all(projects.map((p, index) => s.request(index, `/api/projects/${p.id}/production/startup/start`,
+        { ...command(p), context: scopedContext, inputFingerprint: checks[index]!.inputFingerprint })));
+      assert.deepEqual(attempts.map(response => response.status).sort(), [200, 409]);
+      const loser = attempts.findIndex(response => response.status === 409);
+      const error = (await attempts[loser]!.json()).error;
+      assert.ok(['RULE_PACK_VERSION_CHANGED', 'STARTUP_BLOCKED'].includes(error.code));
+      assert.deepEqual(await s.stores[loser]!.get(projects[loser]!.id), projects[loser]);
+      const winner = await attempts[1 - loser]!.json() as StartupCommandResponse;
+      assert.equal(winner.project.production!.context!.versions.length, 1); assert.equal(winner.project.runs.length, 1);
+      assert.equal((await db.query('SELECT key FROM command_receipts')).rows.length, beforeReceipts + 1);
+      const registered = await db.query<{ sha256: string }>('SELECT sha256 FROM production_rule_packs');
+      assert.equal(registered.rows.length, 1); assert.equal(registered.rows[0]!.sha256, winner.project.production!.startup!.rulePackSha256);
+      assert.equal((await db.query('SELECT revision FROM project_revisions WHERE project_id=$1', [projects[loser]!.id])).rows.length, projects[loser]!.revision);
+    } finally { await s.close(); }
+  });
+});
+
+test('real PostgreSQL over HTTP: startup transaction rolls back P, identity, rule registration, run and revisions when receipt persistence fails', async () => {
+  await isolated(async (db, peer) => {
+    await migrate(db); let failReceipt = false;
+    const interrupted: Database = { ...db, transaction: action => db.transaction(tx => action({
+      async query<T extends Record<string, unknown>>(sql: string, params?: unknown[]) {
+        if (failReceipt && sql.startsWith('INSERT INTO command_receipts')) { failReceipt = false; throw new Error('Synthetic receipt persistence failure'); }
+        return tx.query<T>(sql, params);
+      },
+    })) };
+    const s = await startupHttpServices([interrupted, peer]);
+    try {
+      const p = await s.evidence(await s.create()); const check = await s.check(p);
+      const beforeReceipts = (await db.query('SELECT key FROM command_receipts')).rows;
+      const beforeRevisions = (await db.query('SELECT project_id,revision,state FROM project_revisions ORDER BY revision')).rows;
+      const body = { ...command(p), context: scopedContext, inputFingerprint: check.inputFingerprint };
+      const path = `/api/projects/${p.id}/production/startup/start`;
+      failReceipt = true; const response = await s.request(0, path, body);
+      assert.equal(response.status, 500); assert.equal((await response.json()).error.code, 'INTERNAL_ERROR');
+      assert.deepEqual(await s.stores[1]!.get(p.id), p);
+      assert.deepEqual((await db.query('SELECT key FROM command_receipts')).rows, beforeReceipts);
+      assert.deepEqual((await db.query('SELECT project_id,revision,state FROM project_revisions ORDER BY revision')).rows, beforeRevisions);
+      assert.equal((await db.query('SELECT id FROM production_rule_packs')).rows.length, 0);
+      const recovered = await s.request(1, path, body); assert.equal(recovered.status, 200);
+      const accepted = await recovered.json() as StartupCommandResponse;
+      assert.equal(accepted.project.production!.context!.versions.length, 1); assert.equal(accepted.project.runs.length, 1);
+      assert.equal(accepted.project.identity!.productName, scopedContext.productBrief.productName);
+      assert.deepEqual(await (await s.request(0, path, body)).json(), accepted);
+    } finally { await s.close(); }
+  });
 });
 
 test('real PostgreSQL: HTTP production initialization preserves legacy snapshots and receipts', async () => {

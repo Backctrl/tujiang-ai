@@ -4,6 +4,7 @@ import { CONTRACT_VERSION, draftState, type Fact, type Project, type Skill, type
 import { AppError } from './errors.js';
 import { audit } from './store.js';
 import { availableConfirmedFacts, availableEvidence, evidenceIsAvailable, factSourceIsCurrent, recordMaterialExtraction } from './material-source-gates.js';
+import { validateStartupRun } from './startup-scope.js';
 
 export function createProject(name: string): Project {
   return { id: randomUUID(), name, version: 1, revision: 1, inputRevision: 1, currentSectionId: null, contractVersion: CONTRACT_VERSION,
@@ -45,8 +46,9 @@ export function reviewFact(p: Project, factId: string, action: 'confirm' | 'reje
   refreshConflicts(p);
   audit(p, `fact.${action}`, actor, { factId, reason, evidenceId: fact.evidenceId });
 }
-export function checkSkillInputs(p: Project, skill: Skill) {
-  if (skill === 'extract-facts' && !availableEvidence(p).length) throw new AppError('EVIDENCE_REQUIRED', 409);
+export function checkSkillInputs(p: Project, skill: Skill, run?: AgentRun) {
+  const selected = run ? validateStartupRun(p, run) : undefined;
+  if (skill === 'extract-facts' && !(selected ?? availableEvidence(p)).length) throw new AppError('EVIDENCE_REQUIRED', 409);
   if (skill === 'plan-section') {
     if (!p.identity) throw new AppError('CONFIRMED_PRODUCT_IDENTITY_REQUIRED', 409);
     if (!availableConfirmedFacts(p).some(f => f.role === 'core')) throw new AppError('CONFIRMED_CORE_FACT_REQUIRED', 409);
@@ -63,7 +65,7 @@ export function retryRun(p: Project, id: string) {
   if (!run) throw new AppError('RUN_NOT_FOUND', 404);
   if (run.runStatus !== 'failed' || run.queueStatus !== 'done') throw new AppError('RUN_NOT_RETRYABLE', 409);
   if (p.runs.some(r => r.queueStatus !== 'done')) throw new AppError('RUN_ALREADY_ACTIVE', 409);
-  checkSkillInputs(p, run.skill);
+  checkSkillInputs(p, run.skill, run);
   run.queueStatus = 'queued'; run.runStatus = 'idle'; run.freshness = 'current';
   delete run.errorCode; delete run.output;
 }
@@ -73,10 +75,11 @@ export function applyOutput(p: Project, run: AgentRun, raw: unknown) {
     : run.contextInputRevision !== p.inputRevision;
   if (run.contextVersion !== p.version || inputChanged) throw new AppError('STALE_INPUT', 409);
   if (run.skill === 'extract-facts') {
-    checkSkillInputs(p, run.skill);
+    checkSkillInputs(p, run.skill, run);
+    const selected = validateStartupRun(p, run) ?? availableEvidence(p);
     const output = extractionSchema.parse(raw);
     const facts = output.facts.map(f => {
-      const evidence = p.evidence.find(e => e.id === f.evidenceId);
+      const evidence = selected.find(e => e.id === f.evidenceId);
       const start = evidence?.text.indexOf(f.quote) ?? -1;
       if (!evidence || !evidenceIsAvailable(p, evidence) || start < 0) throw new AppError('INVALID_EVIDENCE_REFERENCE');
       return { ...f, id: randomUUID(), start, end: start + f.quote.length, sourceRunId: run.id,
@@ -86,7 +89,7 @@ export function applyOutput(p: Project, run: AgentRun, raw: unknown) {
     for (const fact of facts) if (!p.facts.some(f => key(f.attribute) === key(fact.attribute) && key(f.value) === key(fact.value)
       && (f.evidenceId === fact.evidenceId || factSourceIsCurrent(p, f)))) p.facts.push(fact);
     refreshConflicts(p);
-    recordMaterialExtraction(p, availableEvidence(p).map(e => e.id), run.requestedBy, run.id);
+    recordMaterialExtraction(p, selected.map(e => e.id), run.requestedBy, run.id);
   } else {
     checkSkillInputs(p, run.skill);
     const output = planSchema.parse(raw);
