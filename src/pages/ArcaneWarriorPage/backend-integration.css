@@ -38,6 +38,27 @@
 .connected-workbench .story-agent > label, .connected-workbench .fact-queue .inspector-block > label { display: flex; align-items: flex-start; gap: 8px; margin: 12px 0; font-size: 12px; line-height: 1.7; }
 .connected-workbench .story-agent > label input, .connected-workbench .fact-queue .inspector-block > label input { margin-top: 4px; }
 .connected-workbench .setup-check .check-lead, .connected-workbench .check-row .lucide-circle { color: var(--ink-2); }
+/* Setup keeps five anchors and one continuous form; the other stages retain their layouts. */
+.connected-workbench .setup-workbench { grid-template-columns: 170px minmax(0, 1fr) 278px; min-width: 0; }
+.connected-workbench .setup-workbench .setup-main { grid-template-columns: minmax(0, 1fr); align-content: start; min-width: 0; }
+.connected-workbench .setup-workbench .setup-section { grid-column: 1 / -1; min-width: 0; scroll-margin-top: 10px; }
+.connected-workbench .setup-workbench .setup-sources > .inspector-block { grid-column: 1 / -1; }
+.connected-workbench .setup-workbench .setup-steps button { grid-template-columns: 28px minmax(0, 1fr); }
+.connected-workbench .setup-workbench .setup-check .check-result span { display: block; font-size: 11px; line-height: 1.8; }
+.connected-workbench .setup-workbench .setup-check .check-result p { margin: 0; font-size: 11px; line-height: 1.8; }
+.connected-workbench .setup-workbench .setup-check .check-result .button { justify-self: start; }
+.connected-workbench .setup-workbench .setup-section details { min-width: 0; }
+.connected-workbench .setup-workbench .setup-section summary { font-size: 12px; line-height: 1.8; cursor: pointer; }
+.connected-workbench .setup-workbench .setup-section select { min-width: 0; max-width: 100%; }
+.connected-workbench .setup-workbench .context-rule-item { padding-block: 12px; border-bottom: 1px solid var(--line); font-size: 12px; line-height: 1.8; }
+.connected-workbench .setup-workbench .context-raw-draft { max-height: 240px; overflow: auto; white-space: pre-wrap; font-size: 11px; }
+.connected-workbench .setup-workbench .setup-project-entry { min-width: 0; padding: 15px 16px; }
+.connected-workbench .setup-workbench .setup-project-entry > summary { cursor: pointer; font-size: 12px; line-height: 1.8; }
+.connected-workbench .setup-workbench .setup-project-entry > .form-grid { margin-top: 14px; }
+.connected-workbench .setup-workbench .form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.connected-workbench .setup-workbench .setup-form-grid { grid-template-columns: minmax(0, 1.3fr) minmax(0, .7fr); }
+.connected-workbench .setup-workbench .form-grid > label { min-width: 0; }
+.connected-workbench .setup-workbench .setup-sources { grid-template-columns: 220px minmax(0, 1fr); }
 .connected-workbench .fact-inspector .inspector-block textarea { width: 100%; min-height: 65px; padding: 9px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); font: inherit; }
 .connected-workbench .fact-queue { min-height: 0; overflow: auto; }
 .connected-workbench .fact-row > span { min-width: 0; overflow-wrap: anywhere; }

@@ -4,7 +4,7 @@ import { readDraft, draftKey } from './project-drafts.js'
 import { useProjectSnapshot } from './useProjectSnapshot.js'
 import { ApiError, errorMessage, StageAApi } from './stage-a-api.js'
 import type { Project, ProjectSummary } from './stage-a-api.js'
-import type { RulePack } from '../../../backend/src/production-context.js'
+import type { RuleCatalog } from './rule-catalog.js'
 import type { Material } from '../../../backend/src/production-materials.js'
 import { executeMaterialOperation, prepareMaterialRetry, prepareMaterialUpload, verifyOriginal, type MaterialWriteOutcome } from './material-intake.js'
 import { materialIntakeStorage, type MaterialLocalEntry, type MaterialOperation } from './material-storage.js'
@@ -21,7 +21,12 @@ export function useProjectSession() {
   const { project, getLatestProject, receiveSnapshot } = useProjectSnapshot()
   const currentId = useRef<string | null>(null)
   const [projects, setProjects] = useState<ProjectSummary[]>([])
-  const [catalog, setCatalog] = useState<RulePack[] | null>(null)
+  const [ruleCatalog, setRuleCatalog] = useState<RuleCatalog | null>(null)
+  const catalogRef = useRef<RuleCatalog | null>(null)
+  const getLatestCatalog = useCallback(() => catalogRef.current, [])
+  const publishCatalog = useCallback((value: RuleCatalog | null) => { catalogRef.current = value; setRuleCatalog(value) }, [])
+  const catalog = ruleCatalog?.rulePacks ?? null
+  const scopedCatalog = ruleCatalog?.scopedRulePacks ?? null
   const [catalogLoading, setCatalogLoading] = useState(false)
   const [catalogError, setCatalogError] = useState('')
   const [catalogRequest, setCatalogRequest] = useState(0)
@@ -32,7 +37,7 @@ export function useProjectSession() {
   const [authExpired, updateAuthExpired] = useState(false)
   const authExpiredRef = useRef(false)
   const setAuthExpired = useCallback((value: boolean) => { authExpiredRef.current = value; updateAuthExpired(value) }, [])
-  const setToken = (value: string) => { tokenRef.current = value; updateToken(value) }
+  const setToken = (value: string) => { tokenRef.current = value; publishCatalog(null); updateToken(value) }
   const [busy, setBusy] = useState(false)
   const busyRef = useRef(false)
   const [error, setError] = useState('')
@@ -120,19 +125,19 @@ export function useProjectSession() {
     await perform(() => api().get(id), '已打开项目，恢复该项目的本地草稿。', false)
   }
   useEffect(() => {
-    setCatalog(null); setCatalogError(''); setCatalogLoading(false)
+    publishCatalog(null); setCatalogError(''); setCatalogLoading(false)
     if (!project?.id || !token.trim() || authExpired) return
     let disposed = false
     setCatalogLoading(true)
-    void new StageAApi(token).catalog().then(rules => {
-      if (!disposed) setCatalog(rules)
+    void new StageAApi(token).ruleCatalog().then(rules => {
+      if (!disposed && tokenRef.current === token && currentId.current === project.id) publishCatalog(rules)
     }).catch(err => {
-      if (disposed) return
+      if (disposed || tokenRef.current !== token || currentId.current !== project.id) return
       setCatalogError(errorMessage(err))
       if (err instanceof ApiError && err.status === 401) { setAuthExpired(true); setRunConsent(false); setError(errorMessage(err)) }
     }).finally(() => { if (!disposed) setCatalogLoading(false) })
     return () => { disposed = true }
-  }, [project?.id, token, authExpired, catalogRequest, setAuthExpired])
+  }, [project?.id, token, authExpired, catalogRequest, setAuthExpired, publishCatalog])
   const reloadCatalog = () => { if (!catalogLoading && token.trim() && !authExpired) setCatalogRequest(value => value + 1) }
   useEffect(() => {
     const id = project?.id
@@ -286,7 +291,7 @@ export function useProjectSession() {
   const hasConflict = project?.facts.some(f => f.issueSeverity === 'blocker') ?? false
   const canPlan = canWrite && !!project?.identity && confirmed.some(f => f.role === 'core') && !hasConflict
   return { project, getLatestProject, projectId, setProjectId, token, setToken, authExpired, busy, error, notice, pending, conflictBefore, projects, listProjects, selectProject, canSwitch, eventsStatus,
-    catalog, catalogLoading, catalogError, reloadCatalog,
+    catalog, scopedCatalog, getLatestCatalog, catalogLoading, catalogError, reloadCatalog,
     canWrite, write, reviewWrite, readMaterialReviews, create, refresh, retry, canRetry, resolveConflict, canResolveConflict, confirmed, hasConflict, canPlan,
     recoveryLoading, recoveryError, reloadMaterialRecovery, recoveryNeedsCheck, materialActivity, uploadMaterial, retryMaterialParse, originalMaterial,
     reason, setReason, reasonValid: !!reason.trim() && reason.length <= 1000, runConsent, setRunConsent }

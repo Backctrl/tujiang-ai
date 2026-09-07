@@ -41,7 +41,7 @@ export function useReviewedDraft<T, B>(projectId: string | undefined, field: str
   const setValue = (value: T) => store(previous => ({ value, base: previous.active ? previous.base : baseFor(value), active: true }))
   // Capture before opening a replacement confirmation; accepting later must not rebase silently.
   const prepareReplacement = (value: T) => ({ value, base: baseFor(value) })
-  const replace = (prepared: ReturnType<typeof prepareReplacement>) => store({ ...prepared, active: true })
+  const replace = (prepared: { value: T; base: B | null }) => store({ ...prepared, active: true })
   const discard = () => store({ value: fallback, base: null, active: false })
   const acknowledge = () => store(previous => ({ ...previous, base: baseFor(previous.value) }))
   return { value: stored.value, active: stored.active, setValue, prepareReplacement, replace, discard, acknowledge, needsReview, originalBase: stored.base, currentBase }

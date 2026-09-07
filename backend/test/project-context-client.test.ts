@@ -198,11 +198,11 @@ test('context draft restoration gates saves after upstream changes and unsubmitt
       edited.activate(); assert.equal(calls.length, 0);
       const external = structuredClone(project); external.revision++;
       external.production!.context!.draft!.productBrief!.introduction = 'External update';
-      const restored = renderContext({ ...session, project: external });
+      const restored = renderContext({ ...session, project: external, getLatestProject: () => external });
       assert.equal(restored.form.introduction, 'Local unsaved introduction');
       assert.equal(restored.local.needsReview, true); assert.equal(restored.canSave, false);
       assert.ok(restored.changes.some(change => change.includes('External update')));
-      const discarded = renderContext({ ...session, project: external }, context => context.discard());
+      const discarded = renderContext({ ...session, project: external, getLatestProject: () => external }, context => context.discard());
       assert.equal(discarded.form.introduction, 'External update');
       assert.equal(discarded.local.active, false); assert.equal(discarded.canActivate, true);
       const unrelated = structuredClone(external); unrelated.revision++; unrelated.name = 'Unrelated project rename';

@@ -1,5 +1,6 @@
 import type { Project } from '../../../backend/src/contracts.js'
 import type { RulePack } from '../../../backend/src/production-context.js'
+import type { RuleCatalog } from './rule-catalog.js'
 import type { MaterialReviewCenter } from '../../../backend/src/production-material-usage.js'
 import { contextFieldLabel, isRuleCatalog } from './project-context.js'
 import { isMaterialReviewCenter } from './material-review.js'
@@ -44,7 +45,8 @@ export class StageAApi {
     if (!isMaterialReviewCenter(data) || data.projectId !== projectId) throw new ApiError('INVALID_MATERIAL_REVIEWS', 502)
     return data
   }
-  async catalog(): Promise<RulePack[]> {
+  async catalog(): Promise<RulePack[]> { return (await this.ruleCatalog()).rulePacks }
+  async ruleCatalog(): Promise<RuleCatalog> {
     let response: Response
     try {
       response = await this.request('/api/production/catalog', { headers: { Authorization: `Bearer ${this.token}` }, redirect: 'error', signal: AbortSignal.timeout(15000) })
@@ -52,7 +54,7 @@ export class StageAApi {
     if (!response.ok) throw new ApiError(response.status === 401 ? 'UNAUTHORIZED' : 'REQUEST_FAILED', response.status)
     const data: unknown = await response.json().catch(() => { throw new ApiError('INVALID_PRODUCTION_CATALOG', 502) })
     if (!isRuleCatalog(data)) throw new ApiError('INVALID_PRODUCTION_CATALOG', 502)
-    return data.rulePacks
+    return { ...data, scopedRulePacks: data.scopedRulePacks ?? [] }
   }
   async list(): Promise<ProjectSummary[]> {
     const response = await this.request('/api/projects', { headers: { Authorization: `Bearer ${this.token}` }, redirect: 'error', signal: AbortSignal.timeout(15000) })
@@ -139,6 +141,11 @@ const messages: Record<string, string> = {
   RULE_PACK_TARGET_MISMATCH: '目标市场与所选平台规则不一致，请核对列出的目标字段。',
   CANVAS_OUTSIDE_RULE_PACK: '图片宽度或格式超出所选平台规则，请按允许值修改。',
   RULE_PACK_VERSION_CHANGED: '已使用的平台规则内容发生变化，请核验并提供新规则版本后启用。',
+  SCOPED_RULE_PACK_REQUIRED: '当前草稿含内容类型或本地制作策略，需要选择按范围核验的目标规则。',
+  SCOPED_CONTENT_TYPE_REQUIRED: '请明确选择内容类型，再启用制作配置。',
+  LOCAL_PRODUCTION_SELECTION_REQUIRED: '请明确按本地制作策略选择画布。',
+  RULE_PACK_INCOMPLETE: '当前内容类型或品类的启用规则缺失或尚未核验，请补齐对应规则。',
+  CANVAS_OUTSIDE_LOCAL_PRODUCTION_POLICY: '画布宽度或格式超出本地制作策略，请按当前策略修改。',
   UNRESOLVED_FACT_CONFLICT: '存在事实冲突。请逐条拒绝新候选，或撤回旧事实后确认新候选。',
   INVALID_EVIDENCE_REFERENCE: '引用必须是所选产品资料中连续、完全一致的原文。',
   CONFIRMED_CORE_FACT_REQUIRED: '请先确认至少一条核心事实。',
