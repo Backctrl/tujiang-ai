@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { Production } from './production.js';
 import type { FactSourceReconfirmation, FactSourceReview, MaterialProvenance, MaterialWithdrawal } from './production-material-usage.js';
 import type { StartupRunInput } from './production-startup.js';
+import type { LegacyFactBinding, StructuredFact } from './production-fact-sources.js';
 
 export const CONTRACT_VERSION = 'stage-a.1';
 export const writeSchema = z.object({
@@ -73,6 +74,9 @@ export interface Fact {
   confirmedBy?: string; confirmedAt?: string;
   correctsFactId?: string; createdBy?: string; reason?: string;
   sourceReview?: FactSourceReview; sourceReconfirmations?: FactSourceReconfirmation[];
+  structured?: StructuredFact;
+  legacyBinding?: LegacyFactBinding;
+  supersededByFactId?: string; supersededBy?: string; supersededAt?: string; supersededReason?: string;
 }
 export interface Section extends StateAxes {
   id: string; kind: 'diagnostic_draft'; sourceRunId: string; factIds: string[];

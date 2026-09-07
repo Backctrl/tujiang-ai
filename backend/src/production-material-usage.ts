@@ -26,6 +26,7 @@ export interface MaterialWithdrawal {
 export interface MaterialSourceImpact {
   affectedEvidenceIds: string[]; affectedFactIds: string[]; affectedCandidateIds: string[];
   reconfirmationRequiredFactIds: string[]; affectedSectionIds: string[]; affectedStoryboardIds: string[];
+  affectedStructuredSources?: { factId: string; sourceId: string; evidenceId: string }[];
 }
 export interface MaterialUsageDecision {
   id: string; version: number; actor: string; at: string; reason: string;
@@ -67,9 +68,13 @@ export type MaterialReviewTask =
   | { id: string; type: 'material_usage'; status: 'pending'; materialId: string; blockIds: string[] }
   | { id: string; type: 'fact_extraction'; status: 'extraction_needed'; materialId: string; blockId: string;
       evidenceId: string; usageDecisionId: string; usageVersion: number }
-  | { id: string; type: 'fact_review'; status: 'pending'; factId: string; evidenceId: string; materialId?: string }
+  | { id: string; type: 'fact_review'; status: 'pending' | 'blocked'; factId: string; evidenceId: string;
+      materialId?: string; sourceIds?: string[];
+      blockedReason?: 'INVALID_FACT_BINDING' | 'UNRESOLVED_FACT_CONFLICT' | 'BLOCKING_FACT_RISK' }
   | { id: string; type: 'fact_source_reconfirmation'; status: 'ready' | 'blocked'; factId: string;
       evidenceId: string; materialId: string; blockId: string; replacementEvidenceId?: string;
+      sourceId?: string;
+      blockedReason?: 'REPLACEMENT_EVIDENCE_REQUIRED' | 'INVALID_FACT_BINDING' | 'UNRESOLVED_FACT_CONFLICT';
       affectedSectionIds: string[]; affectedStoryboardIds: string[] };
 export interface MaterialReviewCenter {
   projectId: string; projectVersion: number; revision: number; tasks: MaterialReviewTask[];

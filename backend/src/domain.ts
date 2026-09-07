@@ -3,8 +3,9 @@ import { z } from 'zod';
 import { CONTRACT_VERSION, draftState, type Fact, type Project, type Skill, type AgentRun, type Plan, type Storyboard, type Section, extractionSchema, planSchema, candidateSchema } from './contracts.js';
 import { AppError } from './errors.js';
 import { audit } from './store.js';
-import { availableConfirmedFacts, availableEvidence, evidenceIsAvailable, factSourceIsCurrent, recordMaterialExtraction } from './material-source-gates.js';
+import { availableConfirmedFacts, availableEvidence, currentFactConflict, evidenceIsAvailable, factGovernanceHasBlockingIssue, factSourceIsCurrent, recordMaterialExtraction } from './material-source-gates.js';
 import { validateStartupRun } from './startup-scope.js';
+import { createLegacyFactBinding, rejectedFactRequiringReconsideration, structuredRiskSeverity } from './production-fact-sources.js';
 
 export function createProject(name: string): Project {
   return { id: randomUUID(), name, version: 1, revision: 1, inputRevision: 1, currentSectionId: null, contractVersion: CONTRACT_VERSION,
@@ -12,26 +13,26 @@ export function createProject(name: string): Project {
 }
 const key = (s: string) => s.normalize('NFKC').trim().toLocaleLowerCase();
 function conflicts(p: Project, f: Fact) {
-  return factSourceIsCurrent(p, f) && p.facts.some(other => other.id !== f.id && ['candidate', 'confirmed'].includes(other.status) && factSourceIsCurrent(p, other)
-    && ((key(other.attribute) === key(f.attribute) && key(other.value) !== key(f.value))
-      || (other.correctsFactId === f.id || f.correctsFactId === other.id)));
+  return !f.supersededByFactId && !!currentFactConflict(p, f);
 }
 export function refreshConflicts(p: Project) {
-  for (const f of p.facts) f.issueSeverity = ['candidate', 'confirmed'].includes(f.status) && conflicts(p, f) ? 'blocker' : 'none';
+  for (const f of p.facts) f.issueSeverity = !['candidate', 'confirmed'].includes(f.status) || f.supersededByFactId ? 'none'
+    : !factSourceIsCurrent(p, f) || conflicts(p, f) ? 'blocker' : f.structured ? structuredRiskSeverity(f.structured) : 'none';
   for (const s of p.sections) s.issueSeverity = s.factIds.some(id => {
-    const fact = p.facts.find(f => f.id === id);
-    return !fact || fact.issueSeverity === 'blocker' || !factSourceIsCurrent(p, fact);
+    return !availableConfirmedFacts(p).some(fact => fact.id === id);
   }) ? 'blocker' : 'none';
 }
 export function reviewFact(p: Project, factId: string, action: 'confirm' | 'reject' | 'retract', actor: string, reason: string) {
   const fact = p.facts.find(f => f.id === factId);
   if (!fact) throw new AppError('FACT_NOT_FOUND', 404);
   if (action === 'confirm') {
+    if (fact.structured) throw new AppError('STRUCTURED_FACT_CONFIRM_REQUIRED', 409);
     if (fact.status !== 'candidate') throw new AppError('FACT_NOT_CANDIDATE', 409);
     if (!factSourceIsCurrent(p, fact)) throw new AppError('INVALID_EVIDENCE', 409);
     if (conflicts(p, fact)) throw new AppError('UNRESOLVED_FACT_CONFLICT', 409);
     fact.status = 'confirmed'; fact.locked = true;
     fact.confirmedBy = actor; fact.confirmedAt = new Date().toISOString();
+    fact.legacyBinding = createLegacyFactBinding(fact, p.evidence.find(e => e.id === fact.evidenceId)!);
   } else if (action === 'reject') {
     if (fact.status !== 'candidate') throw new AppError('FACT_NOT_CANDIDATE', 409);
     fact.status = 'rejected';
@@ -51,8 +52,8 @@ export function checkSkillInputs(p: Project, skill: Skill, run?: AgentRun) {
   if (skill === 'extract-facts' && !(selected ?? availableEvidence(p)).length) throw new AppError('EVIDENCE_REQUIRED', 409);
   if (skill === 'plan-section') {
     if (!p.identity) throw new AppError('CONFIRMED_PRODUCT_IDENTITY_REQUIRED', 409);
+    if (factGovernanceHasBlockingIssue(p)) throw new AppError('UNRESOLVED_FACT_CONFLICT', 409);
     if (!availableConfirmedFacts(p).some(f => f.role === 'core')) throw new AppError('CONFIRMED_CORE_FACT_REQUIRED', 409);
-    if (p.facts.some(f => f.issueSeverity === 'blocker' && factSourceIsCurrent(p, f))) throw new AppError('UNRESOLVED_FACT_CONFLICT', 409);
   }
 }
 export function enqueue(p: Project, skill: Skill, actor: string) {
@@ -87,7 +88,7 @@ export function applyOutput(p: Project, run: AgentRun, raw: unknown) {
     });
     // Re-extraction cannot resurrect rejected values or mutate previously confirmed facts.
     for (const fact of facts) if (!p.facts.some(f => key(f.attribute) === key(fact.attribute) && key(f.value) === key(fact.value)
-      && (f.evidenceId === fact.evidenceId || factSourceIsCurrent(p, f)))) p.facts.push(fact);
+      && (f.status === 'rejected' || f.evidenceId === fact.evidenceId || factSourceIsCurrent(p, f)))) p.facts.push(fact);
     refreshConflicts(p);
     recordMaterialExtraction(p, selected.map(e => e.id), run.requestedBy, run.id);
   } else {
@@ -114,7 +115,7 @@ export function preflight(p: Project) {
   if (!p.identity) issues.push('CONFIRMED_PRODUCT_IDENTITY_REQUIRED');
   const current = selectedSection(p);
   if (!current) issues.push(p.sections.length ? 'SECTION_SELECTION_REQUIRED' : 'SECTION_DRAFT_REQUIRED');
-  if (p.facts.some(f => f.issueSeverity === 'blocker' && factSourceIsCurrent(p, f))) issues.push('UNRESOLVED_FACT_CONFLICT');
+  if (factGovernanceHasBlockingIssue(p)) issues.push('UNRESOLVED_FACT_CONFLICT');
   if (!p.storyboard) issues.push('CURRENT_STORYBOARD_REQUIRED');
   if (p.storyboard?.freshness === 'stale') issues.push('STALE_STORYBOARD');
   for (const s of current ? [current] : []) {
@@ -122,8 +123,8 @@ export function preflight(p: Project) {
     if (!sectionBelongsToStoryboard(p, s)) issues.push(`SECTION_OUTSIDE_STORYBOARD:${s.id}`);
     if (s.missingInputs.length) issues.push(`MISSING_INPUTS:${s.id}`);
     for (const id of s.factIds) {
-      const f = p.facts.find(fact => fact.id === id && fact.status === 'confirmed');
-      if (!f || !f.locked || !factSourceIsCurrent(p, f)) issues.push(`INVALID_FACT_EVIDENCE:${id}`);
+      const f = availableConfirmedFacts(p).find(fact => fact.id === id);
+      if (!f) issues.push(`INVALID_FACT_EVIDENCE:${id}`);
     }
   }
   p.qa = { kind: 'preflight', checkedVersion: p.version, checkedRevision: p.revision,
@@ -147,10 +148,14 @@ export function addCandidate(p: Project, input: z.infer<typeof candidateSchema>,
   const evidence = p.evidence.find(e => e.id === input.evidenceId && evidenceIsAvailable(p, e));
   const start = evidence?.text.indexOf(input.quote) ?? -1;
   if (!evidence || start < 0) throw new AppError('INVALID_EVIDENCE_REFERENCE', 409);
-  p.facts.push({ id: randomUUID(), attribute: input.attribute, role: input.role, value: input.value,
+  const fact: Fact = { id: randomUUID(), attribute: input.attribute, role: input.role, value: input.value,
     evidenceId: input.evidenceId, quote: input.quote, start, end: start + input.quote.length,
     sourceRunId: 'human', createdBy: actor, reason: input.reason, correctsFactId: input.correctsFactId,
-    status: 'candidate', locked: false, issueSeverity: 'none' });
+    status: 'candidate', locked: false, issueSeverity: 'none' };
+  const rejected = rejectedFactRequiringReconsideration(p.facts, fact);
+  if (rejected && input.correctsFactId !== rejected.id)
+    throw new AppError('REJECTED_FACT_RECONSIDERATION_REQUIRED', 409, { factId: rejected.id });
+  p.facts.push(fact);
   refreshConflicts(p);
   recordMaterialExtraction(p, [input.evidenceId], actor);
   audit(p, 'fact.candidate_saved', actor, { factId: p.facts.at(-1)!.id, correctsFactId: input.correctsFactId ?? null, reason: input.reason });
@@ -182,6 +187,7 @@ export function reconfirmFactSource(p: Project, factId: string, evidenceId: stri
   (fact.sourceReconfirmations ??= []).push({ previousEvidenceId: fact.evidenceId, evidenceId, actor, at, reason,
     decisionId: source.usageDecisionId, usageVersion: source.usageVersion });
   fact.evidenceId = evidenceId; fact.start = next.start; fact.end = next.end; delete fact.sourceReview;
+  fact.legacyBinding = createLegacyFactBinding(fact, evidence);
   p.version++;
   refreshConflicts(p);
   audit(p, 'fact.source_reconfirmed', actor, { factId, previousEvidenceId: previous.id, evidenceId,

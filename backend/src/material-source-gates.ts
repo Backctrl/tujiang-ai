@@ -2,6 +2,28 @@ import { createHash } from 'node:crypto';
 import type { Evidence, Fact, Project, Skill } from './contracts.js';
 import type { MaterialAsset, MaterialProvenance, MaterialReferenceBlock, MaterialUse } from './production-material-usage.js';
 import type { MaterialLocator } from './production-materials.js';
+import {
+  FACT_NORMALIZATION_VERSION,
+  FACT_SOURCES_CONTRACT_VERSION,
+  allStoredRisks,
+  applicabilitySchema,
+  canonicalValuesEqual,
+  decimalValueSpanIsComplete,
+  factRiskSchema,
+  factsConflict,
+  legacyFactBindingIsValid,
+  normalizeRequestedValue,
+  normalizedDisplayValue,
+  normalizedFactValueSchema,
+  parseSourceValue,
+  structuredFactCandidateBindingIsValid,
+  structuredFactCompatibilitySchema,
+  structuredFactConfirmationIsValid,
+  structuredRiskReviewIsComplete,
+  structuredRiskSeverity,
+  structuredSourceInputSchema,
+  structuredSourceMatchesEvidence,
+} from './production-fact-sources.js';
 
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
@@ -42,15 +64,177 @@ export function evidenceIsAvailable(p: Project, evidence: Evidence): boolean {
   const sha256 = createHash('sha256').update(evidence.text, 'utf8').digest('hex');
   return evidence.sha256 === sha256 && evidence.objectKey === `${sha256}.txt`;
 }
+export type FactIntegrityReason = 'INVALID_STRUCTURED_FACT_CONTRACT' | 'INVALID_STRUCTURED_FACT_VALUE'
+  | 'INVALID_STRUCTURED_FACT_SOURCE' | 'INVALID_STRUCTURED_FACT_APPLICABILITY' | 'INVALID_STRUCTURED_FACT_RISK'
+  | 'INVALID_STRUCTURED_FACT_CANDIDATE_BINDING' | 'INCOMPLETE_STRUCTURED_FACT_RISK_REVIEW'
+  | 'INVALID_STRUCTURED_FACT_CONFIRMATION_BINDING'
+  | 'INVALID_LEGACY_FACT_SOURCE' | 'LEGACY_FACT_BINDING_REQUIRED';
+export type FactEligibilityReason = FactIntegrityReason | 'FACT_NOT_CONFIRMED' | 'FACT_NOT_LOCKED' | 'FACT_SUPERSEDED'
+  | 'FACT_SOURCE_UNAVAILABLE' | 'BLOCKING_FACT_RISK' | 'UNRESOLVED_FACT_CONFLICT'
+  | 'PROJECT_FACT_INTEGRITY_FAILURE' | 'PROJECT_FACT_GOVERNANCE_BLOCKER' | 'LEGACY_FACT_NOT_STRUCTURED';
+export interface FactEligibility {
+  eligible: boolean;
+  reasons: FactEligibilityReason[];
+  formalFreezeEligible: boolean;
+  formalFreezeReasons: FactEligibilityReason[];
+}
+
+function structuredFactIntegrityReason(p: Project, fact: Fact): FactIntegrityReason | undefined {
+  const structured = fact.structured;
+  if (!structured || structured.contractVersion !== FACT_SOURCES_CONTRACT_VERSION
+    || structured.normalizationVersion !== FACT_NORMALIZATION_VERSION) return 'INVALID_STRUCTURED_FACT_CONTRACT';
+  if (!structuredFactCompatibilitySchema.safeParse(fact).success || fact.legacyBinding || fact.sourceReview
+    || fact.sourceReconfirmations || (fact.correctsFactId && (fact.correctsFactId === fact.id
+      || !p.facts.some(item => item.id === fact.correctsFactId)))) return 'INVALID_STRUCTURED_FACT_CONTRACT';
+  if (!normalizedFactValueSchema.safeParse(structured.normalizedValue).success) return 'INVALID_STRUCTURED_FACT_VALUE';
+  if (!Array.isArray(structured.sources) || structured.sources.length < 1 || structured.sources.length > 10)
+    return 'INVALID_STRUCTURED_FACT_SOURCE';
+  if (!applicabilitySchema.safeParse(structured.applicability).success) return 'INVALID_STRUCTURED_FACT_APPLICABILITY';
+  if (!Array.isArray(structured.proposedRisks) || !Array.isArray(structured.derivedRisks)
+    || structured.riskPolicy?.automaticSemanticRiskDetection !== 'not_performed'
+    || JSON.stringify(structured.riskPolicy?.manualReviewResponsibilities) !== JSON.stringify(['certification', 'efficacy', 'safety', 'scope', 'other']))
+    return 'INVALID_STRUCTURED_FACT_RISK';
+  let target: ReturnType<typeof normalizeRequestedValue>;
+  try { target = normalizeRequestedValue(structured.normalizedValue); } catch { return 'INVALID_STRUCTURED_FACT_VALUE'; }
+  const normalizedMatches = target.normalized.kind === structured.normalizedValue.kind
+    && target.normalized.value === structured.normalizedValue.value
+    && (target.normalized.kind === 'text' || (structured.normalizedValue.kind === 'decimal'
+      && target.normalized.unit === structured.normalizedValue.unit));
+  if (!normalizedMatches
+    || !canonicalValuesEqual(target.canonical, structured.canonicalValue)
+    || fact.value !== normalizedDisplayValue(structured.normalizedValue)) return 'INVALID_STRUCTURED_FACT_VALUE';
+  const sourceIds = structured.sources.map(source => source.id);
+  const sourceRanges = structured.sources.map(source => `${source.evidenceId}:${source.start}:${source.end}`);
+  if (new Set(sourceIds).size !== sourceIds.length || new Set(sourceRanges).size !== sourceRanges.length)
+    return 'INVALID_STRUCTURED_FACT_SOURCE';
+  const first = structured.sources[0]!;
+  if (fact.evidenceId !== first.evidenceId || fact.quote !== first.quote || fact.start !== first.start || fact.end !== first.end)
+    return 'INVALID_STRUCTURED_FACT_SOURCE';
+  for (const source of structured.sources) {
+    const evidence = p.evidence.find(item => item.id === source.evidenceId);
+    if (!evidence || !structuredSourceInputSchema.safeParse({ id: source.id, evidenceId: source.evidenceId,
+      quote: source.quote, start: source.start, end: source.end, valueSpan: source.valueSpan }).success
+      || typeof source.contentSha256 !== 'string' || typeof source.rawValue !== 'string'
+      || !structuredSourceMatchesEvidence(source, evidence)) return 'INVALID_STRUCTURED_FACT_SOURCE';
+    let parsed: ReturnType<typeof parseSourceValue>;
+    try { parsed = parseSourceValue(source.rawValue, structured.normalizedValue); } catch { return 'INVALID_STRUCTURED_FACT_VALUE'; }
+    if (parsed.rawUnit !== source.rawUnit || !canonicalValuesEqual(parsed.canonical, structured.canonicalValue)
+      || (structured.normalizedValue.kind === 'decimal'
+        && !decimalValueSpanIsComplete(evidence.text, source.valueSpan.start, source.valueSpan.end, parsed.rawUnit)))
+      return 'INVALID_STRUCTURED_FACT_VALUE';
+    if (source.review) {
+      if (!['invalidated', 'reconfirmation_required'].includes(source.review.status)
+        || source.review.evidenceId !== source.evidenceId || !source.review.decisionId || !Number.isInteger(source.review.usageVersion)
+        || !source.review.actor || !source.review.at || !source.review.reason) return 'INVALID_STRUCTURED_FACT_SOURCE';
+    }
+    if (source.reconfirmations && (!Array.isArray(source.reconfirmations) || source.reconfirmations.some(item =>
+      !item.previousEvidenceId || !item.evidenceId || !item.decisionId || !Number.isInteger(item.usageVersion)
+      || !item.actor || !item.at || !item.reason))) return 'INVALID_STRUCTURED_FACT_SOURCE';
+  }
+  const sources = new Map(structured.sources.map(source => [source.id, source]));
+  if (structured.applicability.models.kind === 'specified') {
+    const models = new Set<string>();
+    for (const model of structured.applicability.models.models) {
+      const source = sources.get(model.sourceId);
+      const evidence = source && p.evidence.find(item => item.id === source.evidenceId);
+      const normalized = model.id.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLowerCase();
+      if (!source || !evidence || model.end <= model.start || model.start < source.start || model.end > source.end
+        || evidence.text.slice(model.start, model.end).normalize('NFKC').trim().replace(/\s+/gu, ' ').toLowerCase() !== normalized
+        || models.has(normalized)) return 'INVALID_STRUCTURED_FACT_APPLICABILITY';
+      models.add(normalized);
+    }
+  }
+  if (structured.applicability.conditions.some(condition => new Set(condition.sourceIds).size !== condition.sourceIds.length
+    || condition.sourceIds.some(id => !sources.has(id)))) return 'INVALID_STRUCTURED_FACT_APPLICABILITY';
+  const risks = allStoredRisks(structured);
+  const riskIds = risks.map(risk => risk.id);
+  if (new Set(riskIds).size !== riskIds.length || risks.some(risk =>
+    !factRiskSchema.safeParse({ id: risk.id, kind: risk.kind, severity: risk.severity,
+      description: risk.description, sourceIds: risk.sourceIds }).success
+    || !['proposed', 'derived'].includes(risk.origin) || new Set(risk.sourceIds).size !== risk.sourceIds.length
+    || risk.sourceIds.some(id => !sources.has(id)))) return 'INVALID_STRUCTURED_FACT_RISK';
+  if (structured.proposedRisks.some(risk => risk.origin !== 'proposed')
+    || structured.derivedRisks.some(risk => risk.origin !== 'derived')) return 'INVALID_STRUCTURED_FACT_RISK';
+  if (structured.normalizedValue.kind === 'decimal') {
+    if (structured.derivedRisks.length !== 1 || structured.derivedRisks[0]!.kind !== 'numeric_claim'
+      || structured.derivedRisks[0]!.severity !== 'warning'
+      || JSON.stringify([...structured.derivedRisks[0]!.sourceIds].sort()) !== JSON.stringify([...sourceIds].sort()))
+      return 'INVALID_STRUCTURED_FACT_RISK';
+  } else if (structured.derivedRisks.length !== 0) return 'INVALID_STRUCTURED_FACT_RISK';
+  if (!structuredFactCandidateBindingIsValid(fact)) return 'INVALID_STRUCTURED_FACT_CANDIDATE_BINDING';
+  if (fact.status === 'confirmed' || fact.status === 'retracted') {
+    if ((fact.status === 'confirmed') !== fact.locked || !fact.confirmedBy || !fact.confirmedAt
+      || !structuredRiskReviewIsComplete(structured))
+      return 'INCOMPLETE_STRUCTURED_FACT_RISK_REVIEW';
+    if (structured.riskReview?.reviewer !== fact.confirmedBy || structured.riskReview.reviewedAt !== fact.confirmedAt
+      || !structuredFactConfirmationIsValid(fact)) return 'INVALID_STRUCTURED_FACT_CONFIRMATION_BINDING';
+  } else if (fact.locked || fact.confirmedBy || fact.confirmedAt
+    || structured.riskReview || structured.confirmation) return 'INVALID_STRUCTURED_FACT_CONFIRMATION_BINDING';
+  return undefined;
+}
+function structuredFactIntegrityIsValid(p: Project, fact: Fact): boolean { return !structuredFactIntegrityReason(p, fact); }
+export function factIntegrityReason(p: Project, fact: Fact): FactIntegrityReason | undefined {
+  if (fact.structured) return structuredFactIntegrityReason(p, fact);
+  const evidence = p.evidence.find(item => item.id === fact.evidenceId);
+  if (!evidence || fact.start < 0 || fact.end !== fact.start + fact.quote.length
+    || evidence.text.slice(fact.start, fact.end) !== fact.quote) return 'INVALID_LEGACY_FACT_SOURCE';
+  if (fact.status === 'confirmed' && (!fact.locked || !legacyFactBindingIsValid(fact, evidence)))
+    return 'LEGACY_FACT_BINDING_REQUIRED';
+  return undefined;
+}
+export function factIntegrityIsValid(p: Project, fact: Fact): boolean {
+  return !factIntegrityReason(p, fact);
+}
 export function factSourceIsCurrent(p: Project, fact: Fact): boolean {
+  if (fact.structured) {
+    if (!structuredFactIntegrityIsValid(p, fact)) return false;
+    return fact.structured.sources.every(source => {
+      if (source.review) return false;
+      const evidence = p.evidence.find(item => item.id === source.evidenceId);
+      return !!evidence && evidenceIsAvailable(p, evidence) && structuredSourceMatchesEvidence(source, evidence);
+    });
+  }
+  if (!factIntegrityIsValid(p, fact)) return false;
   if (fact.sourceReview) return false;
   const evidence = p.evidence.find(item => item.id === fact.evidenceId);
   return !!evidence && evidenceIsAvailable(p, evidence) && fact.start >= 0
     && fact.end === fact.start + fact.quote.length && evidence.text.slice(fact.start, fact.end) === fact.quote;
 }
 export function availableEvidence(p: Project): Evidence[] { return p.evidence.filter(item => evidenceIsAvailable(p, item)); }
+export function currentFactConflict(p: Project, fact: Fact, excludedId?: string): Fact | undefined {
+  return p.facts.find(other => other.id !== fact.id && other.id !== excludedId && !other.supersededByFactId
+    && factSourceIsCurrent(p, other) && factsConflict(fact, other));
+}
+export function evaluateFactEligibility(p: Project, fact: Fact): FactEligibility {
+  const reasons: FactEligibilityReason[] = [];
+  if (fact.status !== 'confirmed') reasons.push('FACT_NOT_CONFIRMED');
+  if (!fact.locked) reasons.push('FACT_NOT_LOCKED');
+  if (fact.supersededByFactId) reasons.push('FACT_SUPERSEDED');
+  const integrity = factIntegrityReason(p, fact);
+  if (integrity) reasons.push(integrity);
+  const active = p.facts.filter(item => ['candidate', 'confirmed'].includes(item.status) && !item.supersededByFactId);
+  if (active.some(item => item.id !== fact.id && factIntegrityReason(p, item))) reasons.push('PROJECT_FACT_INTEGRITY_FAILURE');
+  const current = active.filter(item => factSourceIsCurrent(p, item));
+  if (current.some(item => item.structured && structuredRiskSeverity(item.structured) === 'blocker')
+    || current.some(item => current.some(other => other.id !== item.id && factsConflict(item, other))))
+    reasons.push('PROJECT_FACT_GOVERNANCE_BLOCKER');
+  if (!integrity && !factSourceIsCurrent(p, fact)) reasons.push('FACT_SOURCE_UNAVAILABLE');
+  if (fact.structured && structuredRiskSeverity(fact.structured) === 'blocker') reasons.push('BLOCKING_FACT_RISK');
+  if (!integrity && currentFactConflict(p, fact)) reasons.push('UNRESOLVED_FACT_CONFLICT');
+  const unique = [...new Set(reasons)];
+  const formalFreezeReasons = fact.structured ? [...unique] : [...unique, 'LEGACY_FACT_NOT_STRUCTURED' as const];
+  return { eligible: unique.length === 0, reasons: unique,
+    formalFreezeEligible: formalFreezeReasons.length === 0, formalFreezeReasons: [...new Set(formalFreezeReasons)] };
+}
+export function factGovernanceHasBlockingIssue(p: Project): boolean {
+  const active = p.facts.filter(fact => ['candidate', 'confirmed'].includes(fact.status) && !fact.supersededByFactId);
+  if (active.some(fact => !factIntegrityIsValid(p, fact))) return true;
+  const current = active.filter(fact => factSourceIsCurrent(p, fact));
+  return current.some(fact => fact.structured && structuredRiskSeverity(fact.structured) === 'blocker')
+    || current.some(fact => current.some(other => other.id !== fact.id && factsConflict(fact, other)));
+}
 export function availableConfirmedFacts(p: Project): Fact[] {
-  return p.facts.filter(fact => fact.status === 'confirmed' && fact.locked && fact.issueSeverity === 'none' && factSourceIsCurrent(p, fact));
+  return p.facts.filter(fact => evaluateFactEligibility(p, fact).eligible);
 }
 export function materialAssetIsAvailable(p: Project, asset: MaterialAsset): boolean {
   const source = currentMaterialSource(p, asset.materialSource, 'asset', asset.id);
@@ -81,7 +265,8 @@ export function recordMaterialExtraction(p: Project, evidenceIds: string[], acto
     const extraction = source.current.extraction;
     if (!extraction || (!sourceRunId && extraction.status === 'extracted')) continue;
     extraction.status = sourceRunId ? 'extracted' : 'candidate_created';
-    extraction.candidateIds = p.facts.filter(fact => fact.evidenceId === evidenceId && factSourceIsCurrent(p, fact)).map(fact => fact.id);
+    extraction.candidateIds = p.facts.filter(fact => (fact.evidenceId === evidenceId
+      || fact.structured?.sources.some(source => source.evidenceId === evidenceId)) && factSourceIsCurrent(p, fact)).map(fact => fact.id);
     extraction.completedAt = new Date().toISOString(); extraction.completedBy = actor;
     if (sourceRunId) extraction.sourceRunId = sourceRunId;
   }

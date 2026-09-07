@@ -7,7 +7,7 @@ import { Store } from '../src/store.js';
 import { createProject, enqueue, retryRun } from '../src/domain.js';
 import { Worker } from '../src/worker.js';
 import { AppError } from '../src/errors.js';
-import type { Project } from '../src/contracts.js';
+import type { Evidence, Fact, Project } from '../src/contracts.js';
 import { buildApp } from '../src/app.js';
 import { LocalObjects } from '../src/objects.js';
 import { tmpdir } from 'node:os';
@@ -23,6 +23,7 @@ import { availableConfirmedFacts, evidenceIsAvailable } from '../src/material-so
 import type { StartupCheck, StartupStatus } from '../src/production-startup.js';
 import type { StartupCommandResponse } from '../src/startup-routes.js';
 import { buildStructuredRequest } from '../src/openrouter.js';
+import { FACT_RISK_KINDS } from '../src/production-fact-sources.js';
 
 const configuredUrl = process.env.TEST_DATABASE_URL;
 if (!configuredUrl) throw new Error('TEST_DATABASE_URL is required: real PostgreSQL integration tests cannot be skipped.');
@@ -786,5 +787,121 @@ test('real PostgreSQL: concurrent source reconfirmation retains lock history and
       assert.deepEqual(snapshot.rows[0]!.state, approvedSourceSnapshot);
       p = await write(p, 'qa/preflight'); assert.equal(p.qa!.issueSeverity, 'blocker'); assert.equal(p.qa!.exportAllowed, false);
     } finally { await Promise.all(apps.map(app => app.close())); await rm(directory, { recursive: true }); }
+  });
+});
+
+function pgStructuredSource(evidence: Evidence, quote: string, rawValue: string) {
+  const start = evidence.text.indexOf(quote); const valueStart = evidence.text.indexOf(rawValue, start);
+  assert.ok(start >= 0 && valueStart >= start && valueStart + rawValue.length <= start + quote.length);
+  return { id: randomUUID(), evidenceId: evidence.id, quote, start, end: start + quote.length,
+    valueSpan: { start: valueStart, end: valueStart + rawValue.length } };
+}
+function pgRiskReview(fact: Fact) {
+  const risks = [...fact.structured!.proposedRisks, ...fact.structured!.derivedRisks];
+  return { reason: 'Every fixed risk category was reviewed against both PostgreSQL-backed sources',
+    acknowledgedRiskIds: risks.map(risk => risk.id), riskReview: { categories: FACT_RISK_KINDS.map(kind => {
+      const reviewedRiskIds = risks.filter(risk => risk.kind === kind).map(risk => risk.id);
+      return { kind, assessment: reviewedRiskIds.length ? 'present' : 'not_found',
+        reason: reviewedRiskIds.length ? `Reviewed ${kind}` : `No ${kind} issue found`, reviewedRiskIds };
+    }) } };
+}
+
+test('real PostgreSQL over loopback: multi-source recovery is atomic, concurrent, replayable and durable across reconnect', async () => {
+  await isolated(async (db, peer, reconnect) => {
+    await migrate(db);
+    const directory = await mkdtemp(join(tmpdir(), 'tujiang-pg-structured-facts-'));
+    const objects = new LocalObjects(directory); const stores = [new Store(db), new Store(peer)];
+    const actor = 'pg-structured-fact-human'; const token = randomUUID(); const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+    const apps = stores.map(store => buildApp(store, objects, { actor, token }));
+    const urls = await Promise.all(apps.map(app => app.listen({ host: '127.0.0.1', port: 0 })));
+    let appsClosed = false;
+    const request = (index: number, path: string, body?: unknown) => fetch(`${urls[index]}${path}`, {
+      method: body === undefined ? 'GET' : 'POST', headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+    const write = async (p: Project, route: string, body: Record<string, unknown> = {}, index = 0) => {
+      const response = await request(index, `/api/projects/${p.id}/${route}`, { ...command(p), ...body });
+      const value = await response.json(); assert.ok(response.ok, JSON.stringify(value)); return value as Project;
+    };
+    try {
+      let response = await request(0, '/api/projects', { ...command(), name: 'PostgreSQL multi-source fact fixture' });
+      assert.equal(response.status, 201); let p = await response.json() as Project;
+      p = await write(p, 'production/initialize');
+      for (const [fileName, text] of [['primary.txt', 'Capacity: 10 kg'], ['secondary.txt', 'Verified capacity: 10000 g']] as const)
+        p = await write(p, 'production/materials', { fileName, mimeType: 'text/plain', contentBase64: Buffer.from(text).toString('base64'),
+          source: { kind: 'local_upload' }, usageHint: 'product_evidence' });
+      assert.equal(await new IngestionWorker(stores[0]!, objects).tick(), true);
+      assert.equal(await new IngestionWorker(stores[1]!, objects).tick(), true); p = await stores[0]!.get(p.id);
+      const decide = async (project: Project, materialIndex: number, usage: 'product_evidence' | 'reference') => {
+        const material = project.production!.materials![materialIndex]!;
+        return write(project, `production/materials/${material.id}/usage`, { reason: `PostgreSQL ${usage} decision`,
+          decisions: [{ blockId: material.blocks[0]!.id, usage }] }, materialIndex % 2);
+      };
+      const currentEvidence = (project: Project, materialIndex: number) => {
+        const material = project.production!.materials![materialIndex]!;
+        const projectionId = material.usageReview!.current[material.blocks[0]!.id]!.projectionId;
+        return project.evidence.find(item => item.id === projectionId)!;
+      };
+      p = await decide(p, 0, 'product_evidence'); p = await decide(p, 1, 'product_evidence');
+      const first = pgStructuredSource(currentEvidence(p, 0), 'Capacity: 10 kg', '10 kg');
+      const second = pgStructuredSource(currentEvidence(p, 1), 'Verified capacity: 10000 g', '10000 g');
+      const candidateKey = randomUUID(); const candidateBody = { ...command(p, candidateKey), attribute: 'capacity', role: 'core',
+        normalizedValue: { kind: 'decimal', value: '10', unit: 'kg' }, sources: [first, second],
+        applicability: { models: { kind: 'unspecified' }, conditions: [] }, reason: 'PostgreSQL multi-source candidate' };
+      const candidatePath = `/api/projects/${p.id}/facts/structured/candidates`;
+      const candidateResponses = await Promise.all([request(0, candidatePath, candidateBody), request(1, candidatePath, candidateBody)]);
+      assert.deepEqual(candidateResponses.map(item => item.status), [200, 200]);
+      const candidateReceipt = await candidateResponses[0]!.json() as Project;
+      assert.deepEqual(await candidateResponses[1]!.json(), candidateReceipt); p = candidateReceipt;
+      const fact = p.facts[0]!; p = await write(p, `facts/${fact.id}/structured/confirm`, pgRiskReview(fact));
+      const locked = structuredClone(p.facts[0]!);
+      p = await stores[0]!.command(p.id, command(p), 'test.pg.structured.dependencies', actor, current => {
+        current!.sections.push({ id: randomUUID(), kind: 'diagnostic_draft', sourceRunId: 'human', factIds: [fact.id],
+          purpose: 'dependent', missingInputs: [], issueSeverity: 'none', runStatus: 'succeeded', freshness: 'current', approvalStatus: 'draft' },
+        { id: randomUUID(), kind: 'diagnostic_draft', sourceRunId: 'human', factIds: [], purpose: 'unrelated', missingInputs: [],
+          issueSeverity: 'none', runStatus: 'succeeded', freshness: 'current', approvalStatus: 'draft' }); return current!;
+      });
+      p = await decide(p, 0, 'reference'); p = await decide(p, 1, 'reference');
+      assert.equal(availableConfirmedFacts(p).length, 0); assert.equal(p.sections[0]!.freshness, 'stale'); assert.equal(p.sections[1]!.freshness, 'current');
+      p = await decide(p, 0, 'product_evidence'); p = await decide(p, 1, 'product_evidence');
+      const replacement1 = currentEvidence(p, 0); const replacement2 = currentEvidence(p, 1);
+      const failureKey = randomUUID();
+      await db.query(`CREATE FUNCTION fail_structured_source_receipt() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.key = '${actor}:${failureKey}' THEN RAISE EXCEPTION 'synthetic receipt failure'; END IF; RETURN NEW; END $$`);
+      await db.query('CREATE TRIGGER fail_structured_source_receipt BEFORE INSERT ON command_receipts FOR EACH ROW EXECUTE FUNCTION fail_structured_source_receipt()');
+      const beforeFailure = structuredClone(p); const firstPath = `/api/projects/${p.id}/facts/${fact.id}/sources/${first.id}/reconfirm`;
+      response = await request(0, firstPath, { ...command(p, failureKey), evidenceId: replacement1.id, reason: 'Must roll back if receipt persistence fails' });
+      assert.equal(response.status, 500); assert.deepEqual(await stores[1]!.get(p.id), beforeFailure);
+      assert.equal((await db.query('SELECT key FROM command_receipts WHERE key=$1', [`${actor}:${failureKey}`])).rows.length, 0);
+      await db.query('DROP TRIGGER fail_structured_source_receipt ON command_receipts');
+      await db.query('DROP FUNCTION fail_structured_source_receipt()');
+      const sharedKey = randomUUID(); const firstBody = { ...command(p, sharedKey), evidenceId: replacement1.id, reason: 'Same original and block reconfirmed' };
+      const firstResponses = await Promise.all([request(0, firstPath, firstBody), request(1, firstPath, firstBody)]);
+      assert.deepEqual(firstResponses.map(item => item.status), [200, 200]);
+      const firstReceipt = await firstResponses[0]!.json() as Project; assert.deepEqual(await firstResponses[1]!.json(), firstReceipt); p = firstReceipt;
+      assert.equal(availableConfirmedFacts(p).length, 0, 'the unreconfirmed second source remains a hard availability gate');
+      const secondPath = `/api/projects/${p.id}/facts/${fact.id}/sources/${second.id}/reconfirm`;
+      const competing = await Promise.all([0, 1].map(index => request(index, secondPath, {
+        ...command(p), evidenceId: replacement2.id, reason: 'Competing second-source commands' })));
+      assert.deepEqual(competing.map(item => item.status).sort(), [200, 409]); p = await stores[0]!.get(p.id);
+      assert.equal(availableConfirmedFacts(p).length, 1); assert.equal(p.facts[0]!.value, locked.value);
+      assert.equal(p.facts[0]!.confirmedBy, locked.confirmedBy); assert.equal(p.facts[0]!.confirmedAt, locked.confirmedAt);
+      assert.equal(p.facts[0]!.structured!.sources[0]!.reconfirmations!.length, 1);
+      assert.equal(p.facts[0]!.structured!.sources[1]!.reconfirmations!.length, 1);
+      assert.equal(p.sections[0]!.freshness, 'stale'); assert.equal(p.sections[1]!.freshness, 'current');
+      const replay = await request(1, firstPath, firstBody); assert.equal(replay.status, 200); assert.deepEqual(await replay.json(), firstReceipt);
+      const final = structuredClone(p);
+      const revisions = (await db.query('SELECT revision,state FROM project_revisions WHERE project_id=$1 ORDER BY revision', [p.id])).rows;
+      const receipts = (await db.query('SELECT key,fingerprint,response FROM command_receipts ORDER BY key')).rows;
+      await Promise.all(apps.map(app => app.close())); appsClosed = true;
+      await Promise.all([db.close(), peer.close()]); db.close = peer.close = async () => {};
+      const fresh = await reconnect(); await Promise.all([migrate(fresh), migrate(fresh)]);
+      const restored = await new Store(fresh).get(p.id); assert.deepEqual(restored, final);
+      assert.equal(restored.facts[0]!.locked, true); assert.equal(restored.facts[0]!.confirmedAt, locked.confirmedAt);
+      assert.deepEqual((await fresh.query('SELECT revision,state FROM project_revisions WHERE project_id=$1 ORDER BY revision', [p.id])).rows, revisions);
+      assert.deepEqual((await fresh.query('SELECT key,fingerprint,response FROM command_receipts ORDER BY key')).rows, receipts);
+    } finally {
+      if (!appsClosed) await Promise.all(apps.map(app => app.close()));
+      await rm(directory, { recursive: true });
+    }
   });
 });
