@@ -39,13 +39,14 @@ async function harness(panel?: ComponentType<{ session: ProjectSession; context:
   const globals = new Map(['localStorage', 'indexedDB', 'IDBKeyRange', 'fetch', 'IS_REACT_ACT_ENVIRONMENT'].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
   const local = new Map<string, string>(), trace: Trace[] = [], navigations: { projectId: string | undefined; scope: string }[] = [], findings: StartupFinding[] = [];
   const nativeFetch = globalThis.fetch;
-  let intercept: Intercept | undefined, instance: Renderer | undefined, latest: Mounted | undefined;
+  let intercept: Intercept | undefined, eventIntercept: Intercept | undefined, instance: Renderer | undefined, latest: Mounted | undefined;
   Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: { getItem: (key: string) => local.get(key) ?? null, setItem: (key: string, value: string) => local.set(key, value), removeItem: (key: string) => local.delete(key) } });
   Object.defineProperty(globalThis, 'indexedDB', { configurable: true, value: indexedDB });
   Object.defineProperty(globalThis, 'IDBKeyRange', { configurable: true, value: IDBKeyRange });
   Object.defineProperty(globalThis, 'IS_REACT_ACT_ENVIRONMENT', { configurable: true, value: true });
   Object.defineProperty(globalThis, 'fetch', { configurable: true, value: (path: string | URL | Request, options?: RequestInit) => {
     const url = String(path);
+    if (url.includes('/events') && eventIntercept) return eventIntercept(url, options, () => nativeFetch(`${base}${url}`, options));
     if (url.includes('/events')) return new Promise<Response>((_resolve, reject) => {
       const abort = () => reject(new DOMException('Test event connection closed', 'AbortError'));
       if (options?.signal?.aborted) abort(); else options?.signal?.addEventListener('abort', abort, { once: true });
@@ -83,7 +84,7 @@ async function harness(panel?: ComponentType<{ session: ProjectSession; context:
     });
     assert.deepEqual(get().context.getCurrentInput()?.context, scopedContext, 'multiple input changes in one React batch retain all fields');
   };
-  return { f, get, local, trace, findings, navigations, mount, unmount, connect, fill, settle, root: () => instance!.root, setIntercept: (value?: Intercept) => { intercept = value; },
+  return { f, get, local, trace, findings, navigations, mount, unmount, connect, fill, settle, root: () => instance!.root, setIntercept: (value?: Intercept) => { intercept = value; }, setEventIntercept: (value?: Intercept) => { eventIntercept = value; },
     async close() { await unmount(); await clearDatabase(); for (const [key, previous] of globals) { if (previous) Object.defineProperty(globalThis, key, previous); else Reflect.deleteProperty(globalThis, key); }; await f.close(); } };
 }
 
@@ -168,6 +169,120 @@ test('mounted startup receives awaiting usage state and only a correlated succes
   } finally { await h.close(); }
 });
 
+async function completedStartup(h: Awaited<ReturnType<typeof harness>>) {
+  await h.mount(); await h.connect(); await h.fill();
+  await act(async () => { await h.get().intake.addFiles([new File(['Synthetic: 10 kg'], 'restored-startup.txt', { type: 'text/plain' })], { kind: 'local_upload' }); });
+  await h.settle(() => h.get().intake.entries.length === 1, 'local original queued');
+  await act(async () => { await h.get().intake.start(); });
+  await h.settle(() => h.get().intake.materials.length === 1 && !h.get().intake.running, 'original accepted');
+  await act(async () => { await new IngestionWorker(h.f.store, h.f.objects).tick(); });
+  await act(async () => { await h.get().session.refresh(); });
+  await act(async () => { await h.get().startup.start(); });
+  await h.settle(() => h.navigations.length === 1, 'startup receipt consumed');
+  return h.get().session.project!;
+}
+
+test('restored startup renders editable credentials and waits for an exact project GET before any business write', async () => {
+  const assets = registerHooks({ load(url, context, next) { return /\.(png|jpe?g|webp|svg)(?:\?|$)/.test(url) ? { format: 'module', source: `export default ${JSON.stringify(url)}`, shortCircuit: true } : next(url, context); } });
+  const { ProjectEntryFields } = await tsImport('../../src/pages/ArcaneWarriorPage/ProjectEntryFields.tsx', { parentURL: import.meta.url, tsconfig: fileURLToPath(new URL('../../tsconfig.app.json', import.meta.url)) }).finally(() => assets.deregister());
+  const h = await harness(ProjectEntryFields);
+  try {
+    const saved = await completedStartup(h), token = h.f.headers.authorization.slice(7);
+    const businessWrites = () => h.trace.filter(item => item.method === 'POST' && !item.path.endsWith('/check')).length;
+    const writes = businessWrites();
+    await h.unmount(); await h.mount();
+    assert.equal(h.get().session.project?.id, saved.id); assert.equal(h.get().session.project?.production?.startup?.id, saved.production!.startup!.id);
+    assert.equal(h.get().session.project?.production?.context?.activeVersion, 1); assert.equal(h.get().intake.materials.length, 1);
+    assert.equal(h.get().session.token, ''); assert.equal(h.get().session.canWrite, false); assert.equal(h.get().session.canPrepareSetup, false);
+    const credential = () => h.root().findAllByType('input').find(node => node.props.type === 'password')!;
+    assert.equal(credential().props.disabled, false, 'a restored project must not lock its empty credential field');
+    for (let length = 1; length <= token.length; length++) {
+      assert.equal(credential().props.disabled, false, 'typing the first character must not prevent completing the credential');
+      await act(async () => { (credential().props.onChange as (event: { target: { value: string } }) => void)({ target: { value: token.slice(0, length) } }); });
+      assert.equal(h.get().session.canWrite, false); assert.equal(h.get().session.canPrepareSetup, false);
+    }
+    await h.settle(() => h.get().session.catalog !== null, 'full credential reads the catalog');
+    await act(async () => { await h.get().session.listProjects(); });
+    assert.ok(h.get().session.projects.some(project => project.id === saved.id));
+    assert.equal(h.get().session.canWrite, false); assert.equal(h.get().session.canPrepareSetup, false, 'catalog and list cannot verify the restored project');
+    await act(async () => {
+      await h.get().session.write('evidence', { documentName: 'Blocked source', locator: 'line 1', usage: 'product_evidence', text: '11 kg' }, 'blocked');
+      await h.get().session.setupCommand('continue-extraction', {}, h.get().session.project!);
+      await h.get().session.ensureSetupProject(); await h.get().session.create('Blocked replacement');
+    });
+    assert.equal(businessWrites(), writes, 'both button gates and handlers block business writes before exact GET');
+    const readCurrent = h.root().findAllByType('button').find(node => content(node) === '读取当前项目')!;
+    assert.equal(readCurrent.props.disabled, false);
+    await act(async () => { (readCurrent.props.onClick as () => void)(); });
+    await h.settle(() => h.get().session.canWrite, 'the actual current-project button finishes the exact GET');
+    assert.equal(h.get().session.canPrepareSetup, true);
+    assert.equal(h.get().session.project?.id, saved.id); assert.equal(businessWrites(), writes);
+    await act(async () => { await h.get().session.write('evidence', { documentName: 'Verified source', locator: 'line 1', usage: 'product_evidence', text: '11 kg' }, 'saved'); });
+    assert.equal(businessWrites(), writes + 1);
+    await act(async () => { h.get().session.setToken('replaced-credential'); });
+    assert.equal(h.get().session.canWrite, false); assert.equal(h.get().session.canPrepareSetup, false);
+    await act(async () => { h.get().session.setToken(token); });
+    await h.settle(() => h.get().session.catalog !== null, 'replacement credential catalog');
+    await act(async () => { await h.get().session.listProjects(); });
+    assert.equal(h.get().session.canWrite, false, 'restoring the same token value still requires a new project read');
+    await act(async () => { await h.get().session.selectProject(saved.id); });
+    assert.equal(h.get().session.canWrite, true); assert.equal(h.get().session.canPrepareSetup, true, 'exact-ID open verifies this project');
+    assert.ok(!JSON.stringify([...h.local]).includes(token));
+    let flow: Awaited<ReturnType<typeof setupRecoveryStorage.readFlow>>;
+    await act(async () => { flow = await setupRecoveryStorage.readFlow(h.get().session.draftScope); });
+    assert.ok(!JSON.stringify(flow).includes(token), 'credential verification is never persisted in the recovery flow');
+  } finally { await h.close(); }
+});
+
+test('failed, mismatched and late exact project GETs revoke verification without replacing the restored project', async () => {
+  const h = await harness(); let release: (() => void) | undefined;
+  try {
+    const saved = await completedStartup(h), token = h.f.headers.authorization.slice(7);
+    let other!: Project; await act(async () => { other = await h.f.create(); });
+    for (const fault of ['401', '503', 'invalid', 'other-project', 'transport'] as const) {
+      h.setIntercept(); await act(async () => { h.get().session.setToken(''); }); await h.connect();
+      await act(async () => { await h.get().session.refresh(); }); assert.equal(h.get().session.canWrite, true);
+      h.setIntercept(async (path, options, send) => {
+        if (path !== `/api/projects/${saved.id}` || (options?.method ?? 'GET') !== 'GET') return send();
+        if (fault === '401' || fault === '503') return new Response('{}', { status: Number(fault) });
+        if (fault === 'invalid') return Response.json({ incomplete: true });
+        if (fault === 'other-project') return Response.json(other);
+        await send(); throw new Error('Exact GET response lost');
+      });
+      await act(async () => { await h.get().session.refresh(); });
+      assert.equal(h.get().session.canWrite, false, fault); assert.equal(h.get().session.canPrepareSetup, false, fault);
+      assert.equal(h.get().session.project?.id, saved.id, fault);
+    }
+    h.setIntercept(); await act(async () => { h.get().session.setToken(''); }); await h.connect();
+    await act(async () => { await h.get().session.refresh(); });
+    let held = false; const gate = new Promise<void>(resolve => { release = resolve; });
+    h.setIntercept(async (path, options, send) => { const response = await send(); if (path === `/api/projects/${saved.id}` && (options?.method ?? 'GET') === 'GET') { held = true; await gate; } return response; });
+    let pending: Promise<unknown> | undefined;
+    await act(async () => { pending = h.get().session.refresh(); }); await h.settle(() => held, 'exact GET is held');
+    await act(async () => { h.get().session.setToken('changed-while-reading'); h.get().session.setToken(token); });
+    await act(async () => { release!(); await pending; });
+    assert.equal(h.get().session.canWrite, false); assert.equal(h.get().session.canPrepareSetup, false, 'a late GET cannot verify a later credential session even after the same token is re-entered');
+    assert.equal(h.get().session.project?.id, saved.id);
+  } finally { release?.(); await h.close(); }
+});
+
+test('an SSE connection alone cannot verify a restored project until its exact project GET finishes', async () => {
+  const h = await harness(); let release: (() => void) | undefined;
+  try {
+    const saved = await completedStartup(h);
+    await h.unmount(); await h.mount();
+    const writes = h.trace.filter(item => item.method === 'POST' && !item.path.endsWith('/check')).length;
+    let held = false; const gate = new Promise<void>(resolve => { release = resolve; });
+    h.setEventIntercept((_path, _options, send) => send());
+    h.setIntercept(async (path, options, send) => { const response = await send(); if (path === `/api/projects/${saved.id}` && (options?.method ?? 'GET') === 'GET') { held = true; await gate; } return response; });
+    await h.connect(); await h.settle(() => held && h.get().session.eventsStatus === '任务状态自动更新', 'real SSE connected and its project GET is held');
+    assert.equal(h.get().session.canWrite, false); assert.equal(h.get().session.canPrepareSetup, false);
+    await act(async () => { release!(); }); await h.settle(() => h.get().session.canWrite, 'exact GET from event refresh verifies the current project');
+    assert.equal(h.get().session.canPrepareSetup, true); assert.equal(h.get().session.project?.id, saved.id);
+    assert.equal(h.trace.filter(item => item.method === 'POST' && !item.path.endsWith('/check')).length, writes);
+  } finally { release?.(); await h.close(); }
+});
+
 test('mounted existing uninitialized project uses its ID for first upload and preserves independent local drafts across project switches', async () => {
   const h = await harness();
   try {
@@ -185,6 +300,8 @@ test('mounted existing uninitialized project uses its ID for first upload and pr
     assert.equal(h.get().session.project?.identity, undefined); assert.equal(h.get().session.project?.production?.startup, undefined);
     await act(async () => { await h.get().session.newLocalProject(); });
     await h.settle(() => h.get().context.canEdit, 'new local project ready');
+    assert.equal(h.get().session.projectVerified, false, 'a new local namespace does not inherit the previous project verification');
+    assert.equal(h.get().session.canWrite, false);
     await act(async () => { h.get().context.setField('productName', 'Another local project'); });
     assert.notEqual(h.get().session.draftScope, existing.id);
     await act(async () => { await h.get().session.selectProject(existing.id); });
@@ -685,6 +802,7 @@ for (const boundary of ['GET', 'readFlow', 'selectScope', 'unmount'] as const) t
   try {
     const a = await h.f.create(), b = await h.f.create();
     await h.mount(); await h.connect(); await act(async () => { await h.get().session.selectProject(a.id); });
+    assert.equal(h.get().session.projectVerified, true);
     await act(async () => { h.get().context.setField('productName', 'Draft A stays selected'); });
     assert.equal(await setupRecoveryStorage.readSelection(), a.id);
     const gate = new Promise<void>(resolve => { release = resolve; }); let held = false;
@@ -696,10 +814,12 @@ for (const boundary of ['GET', 'readFlow', 'selectScope', 'unmount'] as const) t
     let request: Promise<unknown> | undefined;
     await act(async () => { request = h.get().session.selectProject(b.id); await delay(0); });
     await h.settle(() => held, 'project B selection paused at the requested boundary');
+    assert.equal(h.get().session.projectVerified, false, 'a pending project selection revokes the previous project verification');
     if (boundary === 'unmount') await h.unmount(); else await act(async () => { h.get().session.setToken(''); });
     await act(async () => { release!(); await request; });
     assert.equal(await setupRecoveryStorage.readSelection(), a.id, 'cancellation cannot commit durable selection B');
     assert.equal(h.get().session.project?.id, a.id); assert.equal(h.get().session.getCurrentScope(), a.id);
+    assert.equal(h.get().session.projectVerified, false); assert.equal(h.get().session.canWrite, false);
     assert.equal(h.get().context.form.productName, 'Draft A stays selected');
     assert.equal(h.trace.some(item => item.method === 'POST' && !item.path.endsWith('/check')), false);
   } finally { release?.(); setupRecoveryStorage.readFlow = readFlow; setupRecoveryStorage.selectScope = selectScope; await h.close(); }

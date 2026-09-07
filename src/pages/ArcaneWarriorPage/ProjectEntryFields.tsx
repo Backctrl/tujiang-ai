@@ -6,8 +6,9 @@ import { Button } from './WorkbenchUI'
 export function ProjectEntryFields({ session: s }: { session: ProjectSession }) {
   const identityDraft = useReviewedDraft<string | null, { revision: number; name: string }>(s.project?.id, 'productName', null, () => ({ revision: s.project?.identityRevision ?? 0, name: s.project?.identity?.productName ?? '未确认' }))
   const identityValue = identityDraft.value ?? s.project?.identity?.productName ?? ''
-  return <details className="form-panel setup-project-entry" open={!s.project}><summary><b>项目入口</b> · {s.project?.name ?? '本地新项目'}</summary>
-    <div className="form-grid setup-form-grid"><label className="wide">连接凭据<input type="password" autoComplete="off" disabled={s.busy || ((!!s.project || !!s.pending) && !s.authExpired && !s.recoveryNeedsCheck)} value={s.token} onChange={e => s.setToken(e.target.value)} placeholder="仅保存在当前页面内存" /></label>
+  return <details className="form-panel setup-project-entry" open={!s.project || !s.projectVerified}><summary><b>项目入口</b> · {s.project?.name ?? '本地新项目'}</summary>
+    <div className="form-grid setup-form-grid"><label className="wide">连接凭据<input type="password" autoComplete="off" disabled={s.busy} value={s.token} onChange={e => s.setToken(e.target.value)} placeholder="仅保存在当前页面内存" /></label>
+      {s.project && <><Button disabled={!s.token.trim() || s.busy} onClick={() => void s.refresh()}>读取当前项目</Button><p className="integration-note wide">{s.projectVerified ? '当前凭据已核验此项目。' : '输入凭据并读取当前项目后，可继续提交。凭据只保存在当前页面内存，刷新后需重新输入。'}</p></>}
       <Button disabled={!s.token.trim() || s.busy || !!s.pending} onClick={() => void s.listProjects()}>连接并读取项目列表</Button>
       <label className="wide">已有项目<select value={s.projects.some(p => p.id === s.project?.id) ? s.project?.id : ''} disabled={!s.canSwitch || !s.token.trim()} onChange={e => void s.selectProject(e.target.value)}><option value="">选择项目</option>{s.projects.map(p => <option key={p.id} value={p.id}>{p.name} · R{p.revision}</option>)}</select></label>
       <Button disabled={!s.canSwitch} onClick={s.newLocalProject}>新建本地项目草稿</Button>
