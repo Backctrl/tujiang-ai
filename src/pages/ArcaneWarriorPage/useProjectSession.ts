@@ -12,6 +12,7 @@ import { prepareReviewWrite, type ReviewKind } from './review-requests.js'
 import { executeSetupOperation, prepareSetupOperation, setupRecoveryStorage, type SetupAction, type SetupCapture, type SetupOperation, type SetupOutcome } from './setup-recovery.js'
 import type { ContextDraft } from '../../../backend/src/production-context.js'
 import type { StartupStatus } from './startup-contract.js'
+import { startupReadEnvelopeMatches, startupReadMatches } from './startup-contract.js'
 
 type SessionPending = { kind: 'standard'; run: () => Promise<Project>; label: string } | { kind: 'material'; operation: MaterialOperation; label: string; onSaved?: (project: Project) => void }
   | { kind: 'setup'; operation: SetupOperation; label: string }
@@ -27,8 +28,9 @@ function previousSetupScope() {
 }
 
 export function useProjectSession() {
+  const selectionAbortRef = useRef<AbortController | null>(null)
   const mountedRef = useRef(true)
-  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false } }, [])
+  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; selectionAbortRef.current?.abort() } }, [])
   const { project, getLatestProject, receiveSnapshot, clearSnapshot } = useProjectSnapshot()
   const [draftScope, updateDraftScope] = useState(previousSetupScope)
   const scopeRef = useRef(draftScope)
@@ -64,7 +66,7 @@ export function useProjectSession() {
   const [authExpired, updateAuthExpired] = useState(false)
   const authExpiredRef = useRef(false)
   const setAuthExpired = useCallback((value: boolean) => { authExpiredRef.current = value; updateAuthExpired(value) }, [])
-  const setToken = (value: string) => { tokenRef.current = value; publishCatalog(null); updateToken(value) }
+  const setToken = (value: string) => { selectionAbortRef.current?.abort(); tokenRef.current = value; publishCatalog(null); updateToken(value) }
   const [busy, setBusy] = useState(false)
   const busyRef = useRef(false)
   const [error, setError] = useState('')
@@ -124,7 +126,9 @@ export function useProjectSession() {
         accept(operation.before)
         setPending({ kind: 'material', operation, label: operation.label })
         setRecoveryNeedsCheck(true)
-        setNotice(`已恢复一份结果未确认的${operation.kind === 'review' ? '审核' : '材料'}请求。请输入凭据并读取最新项目核对，再使用原操作重试；不会自动提交。`)
+        if (operation.conflict) { setConflictBefore(operation.before, operation.conflict.allowsSameRevision); setError(operation.conflict.message)
+          setNotice('已恢复业务冲突的原请求与复核依据。读取最新项目、比较差异并明确复核后，才能重新提交。') }
+        else setNotice(`已恢复一份结果未确认的${operation.kind === 'review' ? '审核' : '材料'}请求。请输入凭据并读取最新项目核对，再使用原操作重试；不会自动提交。`)
       } else if (flow) {
         setSetupRestoredDraft(flow.capture); accept(flow.project)
         setNotice('已恢复此项目的本地输入与已确认回执。可读取最新项目核对；不会自动继续提交。')
@@ -134,7 +138,7 @@ export function useProjectSession() {
       if (!disposed) setRecoveryError(errorMessage(err instanceof ApiError ? err : new ApiError('LOCAL_RECOVERY_READ_FAILED', 0)))
     }).finally(() => { if (!disposed) setRecoveryLoading(false) })
     return () => { disposed = true }
-  }, [recoveryRequest, accept, setPending, setRecoveryNeedsCheck, setDraftScope])
+  }, [recoveryRequest, accept, setPending, setRecoveryNeedsCheck, setDraftScope, setConflictBefore])
   const reloadMaterialRecovery = () => { if (!busyRef.current) setRecoveryRequest(value => value + 1) }
   const canSwitchNow = () => mountedRef.current && recoveryReady.current && !busyRef.current && !pendingRef.current && !conflictRef.current
   const canWriteNow = () => canSwitchNow() && !!getLatestProject() && !!tokenRef.current.trim() && !authExpiredRef.current
@@ -182,12 +186,27 @@ export function useProjectSession() {
   }
   const selectProject = async (id: string) => {
     if (!canSwitchNow() || !tokenRef.current.trim() || !id) return
-    return perform(async () => {
-      const next = await api().get(id), flow = await setupRecoveryStorage.readFlow(id)
-      await setupRecoveryStorage.selectScope(flow?.scopeId ?? id)
-      setDraftScope(flow?.scopeId ?? id); setSetupRestoredDraft(flow?.capture); setStartupReceipt(null)
+    const requestedToken = tokenRef.current, requestedScope = scopeRef.current, requestedId = currentId.current
+    const controller = new AbortController(); selectionAbortRef.current = controller
+    const isCurrent = () => mountedRef.current && !controller.signal.aborted && tokenRef.current === requestedToken && scopeRef.current === requestedScope && currentId.current === requestedId
+    busyRef.current = true; setBusy(true); setError(''); setNotice('')
+    try {
+      const next = await new StageAApi(requestedToken).get(id)
+      if (!isCurrent()) return
+      const flow = await setupRecoveryStorage.readFlow(id)
+      if (!isCurrent()) return
+      const nextScope = flow?.scopeId ?? id
+      await setupRecoveryStorage.selectScope(nextScope, { expectedScope: requestedScope, isCurrent, signal: controller.signal })
+      if (!isCurrent()) return
+      // These synchronous publications share one React batch after all async boundaries are checked.
+      accept(next); setDraftScope(nextScope); setSetupRestoredDraft(flow?.capture); setStartupReceipt(null)
+      setAuthExpired(false); setNotice('已打开项目，恢复该项目的本地草稿。')
       return next
-    }, '已打开项目，恢复该项目的本地草稿。', false)
+    } catch (err) {
+      if (!isCurrent()) return
+      setError(errorMessage(err))
+      if (err instanceof ApiError && err.status === 401) { setAuthExpired(true); setRunConsent(false) }
+    } finally { if (selectionAbortRef.current === controller) selectionAbortRef.current = null; busyRef.current = false; if (mountedRef.current) setBusy(false) }
   }
   useEffect(() => {
     publishCatalog(null); setCatalogError(''); setCatalogLoading(false)
@@ -313,9 +332,10 @@ export function useProjectSession() {
         setError(errorMessage(outcome.error)); setNotice('')
         if (outcome.kind === 'uncertain' && outcome.operation) setPending({ kind: 'material', operation: outcome.operation, label: outcome.operation.label, onSaved })
         if (outcome.error instanceof ApiError && outcome.error.status === 401) { setAuthExpired(true); setRunConsent(false) }
-        if (outcome.kind === 'conflict') setConflictBefore(outcome.operation?.before ?? operation.before,
-          operation.kind === 'review' && outcome.error instanceof ApiError && !['VERSION_CONFLICT', 'REVISION_CONFLICT'].includes(outcome.error.code))
-        if (outcome.kind !== 'uncertain') { setPending(null); setRecoveryNeedsCheck(false) }
+        if (outcome.kind === 'conflict' && outcome.operation) {
+          setConflictBefore(outcome.operation.before, outcome.operation.conflict?.allowsSameRevision)
+          setPending({ kind: 'material', operation: outcome.operation, label: outcome.operation.label, onSaved }); setRecoveryNeedsCheck(true)
+        } else if (outcome.kind !== 'uncertain') { setPending(null); setRecoveryNeedsCheck(false) }
       }
       return outcome
     } catch (err) {
@@ -398,14 +418,16 @@ export function useProjectSession() {
     finally { busyRef.current = false; setBusy(false) }
   }
   const setupRead = async (context?: ContextDraft) => {
-    const before = getLatestProject(), requestedToken = tokenRef.current
+    const before = getLatestProject(), requestedToken = tokenRef.current, requestedScope = scopeRef.current
     if (!before || !requestedToken.trim()) throw new ApiError('UNAUTHORIZED', 401)
     try {
       const client = new StageAApi(requestedToken), result = context ? await client.startupCheck(before.id, context) : await client.startup(before.id)
-      if (result.revision > (getLatestProject()?.revision ?? 0) && getLatestProject()?.id === before.id && tokenRef.current === requestedToken) {
+      const isCurrent = () => mountedRef.current && getLatestProject()?.id === before.id && tokenRef.current === requestedToken && scopeRef.current === requestedScope
+      if (result.revision > (getLatestProject()?.revision ?? 0) && isCurrent()) {
         const next = await client.get(before.id)
-        if (getLatestProject()?.id === before.id && tokenRef.current === requestedToken) receiveSnapshot(next, before.id)
+        if (isCurrent()) receiveSnapshot(next, before.id)
       }
+      if (isCurrent() && startupReadEnvelopeMatches(result, getLatestProject()) && !startupReadMatches(result, getLatestProject())) throw new ApiError('INVALID_STARTUP_RESPONSE', 502)
       return result
     } catch (err) { if (tokenRef.current === requestedToken && err instanceof ApiError && err.status === 401) { setAuthExpired(true); setError(errorMessage(err)) }; throw err }
   }
@@ -417,7 +439,7 @@ export function useProjectSession() {
     catch { setError(errorMessage(new ApiError('LOCAL_RECOVERY_SETTLE_FAILED', 0))) }
     finally { busyRef.current = false; setBusy(false) }
   }
-  const canRetry = !!pending && !!token.trim() && !busy && !((pending.kind === 'material' || pending.kind === 'setup') && recoveryNeedsCheck) && !(pending.kind === 'setup' && setupRejected)
+  const canRetry = !!pending && !!token.trim() && !busy && !((pending.kind === 'material' || pending.kind === 'setup') && recoveryNeedsCheck) && !(pending.kind === 'setup' && setupRejected) && !(pending.kind === 'material' && pending.operation.conflict)
   const retry = () => {
     const current = pendingRef.current
     if (!current || busyRef.current || !tokenRef.current.trim()) return
@@ -427,7 +449,7 @@ export function useProjectSession() {
       return runSetupStep(current.operation).finally(() => { busyRef.current = false; setBusy(false) })
     }
     if (current.kind === 'material') {
-      if (recoveryCheckRef.current) return
+      if (recoveryCheckRef.current || current.operation.conflict) return
       return materialAttempt(() => current.operation, true, current.operation.entryId, current.onSaved)
     }
     return perform(current.run, current.label)
@@ -443,11 +465,17 @@ export function useProjectSession() {
       throw err
     }
   }
-  const canResolveConflict = !busy && !!project && !!conflictBefore && (project.revision > conflictBefore.revision
-    || (conflictAllowsSameRevision && conflictChecked && project.revision === conflictBefore.revision))
-  const resolveConflict = () => {
+  const canResolveConflict = !busy && !!project && !!conflictBefore && conflictChecked && (project.revision > conflictBefore.revision
+    || (conflictAllowsSameRevision && project.revision === conflictBefore.revision))
+  const resolveConflict = async () => {
     if (busyRef.current || !canResolveConflict || !conflictRef.current) return
-    setConflictBefore(null); setError(''); setNotice('差异已复核。请检查保留的修改，再重新提交。')
+    const current = pendingRef.current
+    busyRef.current = true; setBusy(true)
+    try {
+      if (current?.kind === 'material' && current.operation.conflict) { await materialIntakeStorage.releaseConflict(current.operation); setPending(null); setRecoveryNeedsCheck(false) }
+      setConflictBefore(null); setError(''); setNotice('差异已复核。请检查保留的修改，再重新提交。')
+    } catch { setError(errorMessage(new ApiError('LOCAL_RECOVERY_SETTLE_FAILED', 0))) }
+    finally { busyRef.current = false; setBusy(false) }
   }
   const confirmed = project?.facts.filter(f => f.status === 'confirmed') ?? []
   const hasConflict = project?.facts.some(f => f.issueSeverity === 'blocker') ?? false

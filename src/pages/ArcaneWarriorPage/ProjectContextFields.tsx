@@ -17,6 +17,9 @@ function TextField({ context: c, field, label, maxLength = 200, placeholder, wid
 
 export function ContextControls({ context: c, session: s }: Props) {
   return <>
+    {c.recoveryConflict && <div className="wide inspector-block" role="alert"><b>本地输入与恢复记录顺序不明确</b><p>两份输入均已保留。比较后明确选择要继续使用的一份，原未决请求正文不会因此改变。</p>
+      {([{ kind: 'reviewed', label: '制作配置', conflict: c.local.recovery.conflict }, { kind: 'models', label: '规则类型备份', conflict: c.backupsRecovery.conflict }] as const).map(item => item.conflict && <section key={item.kind}><b>{item.label}</b><div className="snapshot-comparison"><div><span>本地草稿 · 修订 {item.conflict.local.revision}</span><pre>{JSON.stringify(item.conflict.local.value, null, 2)}</pre></div><div><span>恢复记录 · 修订 {item.conflict.restored.revision}</span><pre>{JSON.stringify(item.conflict.restored.value, null, 2)}</pre></div></div><Button disabled={s.busy} onClick={() => c.chooseRecovery(item.kind, 'local')}>使用这份本地{item.label}</Button><Button disabled={s.busy} onClick={() => c.chooseRecovery(item.kind, 'restored')}>使用这份恢复{item.label}</Button></section>)}
+    </div>}
     {!s.project?.production ? <p className="integration-note wide">先填写配置并选择原件，输入保留在本地。首次上传或点击下方创建按钮时，保存到同一个服务端项目。</p> : !c.initialized ? <p className="integration-note wide" role="alert">当前制作配置版本与客户端不兼容，请更新后再编辑。</p> : <p className="integration-note wide">{c.activeVersion ? `${c.activeVersion.label} 已启用，版本内容已固定。` : '尚未启用制作配置。'}{c.readOnly ? ' 修改前先复制为本地草稿，再保存并启用新版本。' : ' 可以先保存未完成的草稿；创建并提取前需要补齐信息与核验规则。'}</p>}
     {!!c.state?.versions.length && <>
       <label>复制已有配置<select value={String(c.selectedCopyVersion?.version ?? '')} disabled={!s.canWrite} onChange={e => c.setCopyVersion(e.target.value)}>{c.state.versions.map(version => <option key={version.version} value={version.version}>{version.label} · {version.context.productBrief.productName}{version.version === c.state?.activeVersion ? ' · 当前启用' : ''} · {modelLabel(ruleModel(version.rulePack))}</option>)}</select></label>
@@ -29,7 +32,7 @@ export function ContextControls({ context: c, session: s }: Props) {
       <details><summary>查看保留的旧草稿</summary><pre className="context-raw-draft">{c.migrationRaw}</pre></details>
       {c.unsupported.length ? <p>有当前表单无法表示的字段：{c.unsupported.join('、')}。请先保留原输入，再选择放弃旧草稿或使用已有版本。</p> : <Button disabled={!s.canWrite} onClick={c.migrateLocal}>已检查原输入，转换为当前表单</Button>}
       <Button disabled={!s.canWrite} onClick={c.discard}>放弃本地草稿，读取当前配置</Button></div>}
-    {c.local.needsReview && !c.migrationRequired && !c.unsupported.length && <div className="wide inspector-block" role="alert"><b>制作配置草稿需要复核</b>{c.changes.map((change, index) => <p key={index}>{change}</p>)}<p>下方仍是你的本地输入。比较后可保留继续编辑，或放弃本地输入并使用当前服务端配置。</p><Button disabled={!s.canWrite} onClick={c.local.acknowledge}>已比较配置，保留本地草稿</Button><Button disabled={!s.canWrite} onClick={c.discard}>放弃本地草稿，读取当前配置</Button></div>}
+    {c.local.needsReview && !c.recoveryConflict && !c.migrationRequired && !c.unsupported.length && <div className="wide inspector-block" role="alert"><b>制作配置草稿需要复核</b>{c.changes.map((change, index) => <p key={index}>{change}</p>)}<p>下方仍是你的本地输入。比较后可保留继续编辑，或放弃本地输入并使用当前服务端配置。</p><Button disabled={!s.canWrite} onClick={c.local.acknowledge}>已比较配置，保留本地草稿</Button><Button disabled={!s.canWrite} onClick={c.discard}>放弃本地草稿，读取当前配置</Button></div>}
     {c.local.active && !c.local.needsReview && <p className="integration-note wide">本地修改尚未保存。<Button disabled={!s.canWrite} onClick={c.discard}>放弃本地修改</Button></p>}
   </>
 }

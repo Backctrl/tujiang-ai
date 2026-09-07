@@ -11,6 +11,7 @@ export type MaterialOperation = {
   id: 'active'; kind: 'upload' | 'parse-retry' | 'review'; prepared: PreparedProjectWrite; before: Project; label: string; entryId?: string;
   reviewKind?: ReviewKind;
   parseProgressRebases?: number;
+  conflict?: { code: string; message: string; allowsSameRevision: boolean };
 }
 export interface MaterialIntakeStorage {
   list(projectId: string): Promise<MaterialLocalEntry[]>
@@ -21,6 +22,7 @@ export interface MaterialIntakeStorage {
   replacePending(previous: MaterialOperation, operation: MaterialOperation): Promise<void>
   settle(operation: MaterialOperation, result: 'saved' | 'rejected' | 'conflict', message?: string): Promise<void>
   markUncertain(operation: MaterialOperation, message: string): Promise<void>
+  releaseConflict(operation: MaterialOperation): Promise<void>
   subscribe(listener: () => void): () => void
 }
 
@@ -32,6 +34,7 @@ export function validateMaterialOperation(value: unknown): MaterialOperation {
     !p || p.contractVersion !== 'stage-a.1' || typeof p.id !== 'string' || !Number.isInteger(p.revision) || !Number.isInteger(p.version) ||
     !Array.isArray(p.facts) || !Array.isArray(p.evidence) || !Array.isArray(p.runs) || !Array.isArray(p.sections) || !Array.isArray(p.audit) ||
     op.prepared.projectId !== p.id ||
+    (op.conflict !== undefined && (typeof op.conflict.code !== 'string' || typeof op.conflict.message !== 'string' || typeof op.conflict.allowsSameRevision !== 'boolean')) ||
     (op.parseProgressRebases !== undefined && (!Number.isInteger(op.parseProgressRebases) || op.parseProgressRebases < 0 || op.parseProgressRebases > 1)) ||
     !(op.kind === 'upload' && op.prepared.suffix === 'production/materials' && typeof op.entryId === 'string') &&
     !(op.kind === 'parse-retry' && /^production\/materials\/[a-f\d-]+\/parse\/retry$/i.test(op.prepared.suffix)) &&
@@ -123,7 +126,7 @@ class IndexedMaterialStorage implements MaterialIntakeStorage {
       request.onsuccess = () => {
         if (previous ? !request.result || !sameOperation(request.result as MaterialOperation, previous)
           || previous.entryId !== operation.entryId || previous.before.id !== operation.before.id
-          : request.result && !sameOperation(request.result as MaterialOperation, operation)) { tx.abort(); return }
+          : request.result && (!sameOperation(request.result as MaterialOperation, operation) || (request.result as MaterialOperation).conflict && !operation.conflict)) { tx.abort(); return }
         tx.objectStore('pending').put(operation)
         if (operation.entryId) {
           const entry = tx.objectStore('entries').get(operation.entryId)
@@ -140,11 +143,30 @@ class IndexedMaterialStorage implements MaterialIntakeStorage {
       const request = tx.objectStore('pending').get('active')
       request.onsuccess = () => {
         if (request.result && !sameOperation(request.result as MaterialOperation, operation)) { tx.abort(); return }
-        tx.objectStore('pending').delete('active')
+        if (result === 'conflict') {
+          if (!operation.conflict) { tx.abort(); return }
+          tx.objectStore('pending').put(operation)
+        } else tx.objectStore('pending').delete('active')
         if (!operation.entryId) return
         if (result === 'saved') { tx.objectStore('entries').delete(operation.entryId); return }
         const entry = tx.objectStore('entries').get(operation.entryId)
         entry.onsuccess = () => { if (entry.result) tx.objectStore('entries').put({ ...entry.result as MaterialLocalEntry, status: result, message }) }
+      }
+    })
+  }
+  releaseConflict(operation: MaterialOperation) {
+    return this.transaction<void>(['pending', 'entries'], 'readwrite', tx => {
+      const pending = tx.objectStore('pending'), request = pending.get('active')
+      request.onsuccess = () => {
+        const current = request.result as MaterialOperation | undefined
+        if (!current?.conflict || !operation.conflict || !sameOperation(current, operation)) { tx.abort(); return }
+        if (!operation.entryId) { pending.delete('active'); return }
+        const entries = tx.objectStore('entries'), entry = entries.get(operation.entryId)
+        entry.onsuccess = () => {
+          if (!entry.result || (entry.result as MaterialLocalEntry).status !== 'conflict') { tx.abort(); return }
+          entries.put({ ...entry.result as MaterialLocalEntry, status: 'waiting', message: '已复核差异，请明确重新上传。' })
+          pending.delete('active')
+        }
       }
     })
   }

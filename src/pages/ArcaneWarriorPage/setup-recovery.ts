@@ -1,17 +1,17 @@
-import { ApiError, isProjectResponse, prepareProjectWrite, type PreparedProjectWrite, type Project, type StageAApi } from './stage-a-api.js'
+import { ApiError, errorMessage, isProjectResponse, prepareProjectWrite, type PreparedProjectWrite, type Project, type StageAApi } from './stage-a-api.js'
 import { projectContextBase, type ContextBase, type ContextForm } from './project-context.js'
 import { sameJsonValue } from './project-drafts.js'
 import type { MaterialLocalEntry } from './material-storage.js'
 import type { StartupStatus } from './startup-contract.js'
 
-export type SetupCapture = { reviewed: { value: ContextForm; base: ContextBase | null; active: boolean }; models: Record<string, unknown> }
+export type SetupCapture = { reviewed: { value: ContextForm; base: ContextBase | null; active: boolean }; models: Record<string, unknown>; reviewedRevision?: number; modelsRevision?: number }
 export type SetupAction = 'create' | 'initialize' | 'start' | 'continue-extraction' | 'scope-refresh' | 'retry'
 export type SetupOperation = { id: 'active'; kind: 'setup'; action: SetupAction; scopeId: string; before: Project | null;
-  capture: SetupCapture; prepared: PreparedProjectWrite; label: string; rejected?: true }
+  capture: SetupCapture; prepared: PreparedProjectWrite; label: string; rejected?: true; rejection?: { code: string; message: string } }
 export type SetupFlow = { id: string; scopeId: string; capture: SetupCapture; project: Project }
 export interface SetupRecoveryStorage {
   readSelection(): Promise<string | undefined>
-  selectScope(scopeId: string): Promise<void>
+  selectScope(scopeId: string, guard?: { expectedScope: string; isCurrent: () => boolean; signal: AbortSignal }): Promise<void>
   readPending(): Promise<SetupOperation | undefined>
   readFlow(scopeId: string): Promise<SetupFlow | undefined>
   save(operation: SetupOperation): Promise<void>
@@ -37,6 +37,8 @@ export function validateSetupOperation(value: unknown): SetupOperation {
   const op = value as SetupOperation
   if (op.id !== 'active' || op.kind !== 'setup' || !Object.hasOwn(actions, op.action) || typeof op.scopeId !== 'string' || !op.scopeId
     || !op.capture?.reviewed || typeof op.capture.reviewed.active !== 'boolean' || !op.capture.reviewed.value || !op.capture.models
+    || [op.capture.reviewedRevision, op.capture.modelsRevision].some(revision => revision !== undefined && (!Number.isSafeInteger(revision) || revision < 0))
+    || op.rejection !== undefined && (!op.rejected || typeof op.rejection.code !== 'string' || typeof op.rejection.message !== 'string')
     || typeof op.label !== 'string' || !op.prepared || typeof op.prepared.body !== 'string' || op.rejected !== undefined && op.rejected !== true) return invalid()
   const creating = op.action === 'create'
   if (creating ? op.before !== null || op.prepared.projectId !== '' || op.prepared.suffix !== ''
@@ -75,12 +77,16 @@ class IndexedSetupRecovery implements SetupRecoveryStorage {
     }).catch(error => { this.opening = undefined; throw error })
     return this.opening
   }
-  private async transaction<T>(mode: IDBTransactionMode, action: (tx: IDBTransaction, result: (value: T) => void) => void): Promise<T> {
+  private async transaction<T>(mode: IDBTransactionMode, action: (tx: IDBTransaction, result: (value: T) => void) => void, signal?: AbortSignal): Promise<T> {
     const db = await this.open()
+    if (signal?.aborted) throw new ApiError('SETUP_INPUT_CHANGED', 0)
     return new Promise<T>((resolve, reject) => {
       const tx = db.transaction(['pending', 'entries'], mode); let value: T; let failure: unknown
-      tx.oncomplete = () => resolve(value)
-      tx.onerror = tx.onabort = () => reject(failure ?? tx.error ?? new Error('Recovery transaction failed'))
+      const abort = () => { try { tx.abort() } catch { /* The completed transaction is already settled. */ } }
+      const cleanup = () => signal?.removeEventListener('abort', abort)
+      signal?.addEventListener('abort', abort, { once: true })
+      tx.oncomplete = () => { cleanup(); resolve(value) }
+      tx.onerror = tx.onabort = () => { cleanup(); reject(failure ?? tx.error ?? new Error('Recovery transaction failed')) }
       try { action(tx, next => { value = next }) } catch (error) { failure = error; tx.abort() }
     })
   }
@@ -95,15 +101,19 @@ class IndexedSetupRecovery implements SetupRecoveryStorage {
       result(value?.scopeId as string | undefined)
     } })
   }
-  selectScope(scopeId: string) {
+  selectScope(scopeId: string, guard?: { expectedScope: string; isCurrent: () => boolean; signal: AbortSignal }) {
     return this.transaction<void>('readwrite', tx => {
       const store = tx.objectStore('pending'), request = store.get('active')
       request.onsuccess = () => {
         const current = request.result as { scopeId?: string; before?: Project } | undefined
-        if (current && (current.scopeId ?? current.before?.id) !== scopeId) { tx.abort(); return }
-        store.put({ id: 'setup:selection', scopeId })
+        if (current && (current.scopeId ?? current.before?.id) !== scopeId || guard && !guard.isCurrent()) { tx.abort(); return }
+        const selected = store.get('setup:selection')
+        selected.onsuccess = () => {
+          if (guard && (!guard.isCurrent() || selected.result?.scopeId !== guard.expectedScope)) { tx.abort(); return }
+          store.put({ id: 'setup:selection', scopeId })
+        }
       }
-    })
+    }, guard?.signal)
   }
   async readFlow(scopeId: string) {
     const value = await this.transaction<SetupFlow | undefined>('readonly', (tx, result) => {
@@ -167,7 +177,7 @@ export async function executeSetupOperation(operation: SetupOperation, api: Stag
     // Even a 409 remains durable until an explicit read and human review releases this exact request.
     const conflict = error instanceof ApiError && error.status >= 400 && error.status < 500 && error.status !== 401
     if (conflict) {
-      const rejected: SetupOperation = { ...operation, rejected: true }
+      const rejected: SetupOperation = { ...operation, rejected: true, rejection: { code: error.code, message: errorMessage(error) } }
       try { await storage.save(rejected) }
       catch { return { kind: 'paused', operation: rejected, error: new ApiError('LOCAL_SETUP_REJECTION_SAVE_FAILED', 0), conflict: true } }
       return { kind: 'paused', operation: rejected, error, conflict: true }

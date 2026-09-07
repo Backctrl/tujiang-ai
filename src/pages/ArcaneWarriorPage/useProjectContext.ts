@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { ProjectContextVersion } from '../../../backend/src/production-context.js'
 import type { Project } from './stage-a-api.js'
+import { ApiError } from './stage-a-api.js'
 import type { ProjectSession } from './useProjectSession.js'
 import { readDraft, sameJsonValue, useProjectDraft, useReviewedDraft } from './project-drafts.js'
 import { compileContextForm, contextDifferences, contextForm, contextFormDifferences, contextReadiness, normalizeContextForm, projectContextBase, scopedTargetFields, selectedRule, type ContextBase, type ContextForm } from './project-context.js'
@@ -21,11 +22,12 @@ export function useProjectContext(s: ContextSession) {
   const serverRule = serverDraft ? selectedRule(serverDraft, rules) : activeVersion?.rulePack
   const serverForm = contextForm(serverContext, serverRule ? ruleModel(serverRule) : undefined)
   const scope = s.draftScope ?? s.project?.id
-  const stored = useReviewedDraft(scope, 'productionContext', serverForm, () => projectContextBase(s.project), s.setupRestoredDraft?.reviewed)
+  const stored = useReviewedDraft(scope, 'productionContext', serverForm, () => projectContextBase(s.project), s.setupRestoredDraft?.reviewed, s.setupRestoredDraft?.reviewedRevision)
   const normalized = normalizeContextForm(stored.value, stored.originalBase)
   const migrationRequired = stored.active && normalized.migration
   const unsupported = stored.active ? normalized.unsupported : []
-  const [backups, setBackups, getBackups] = useProjectDraft<Partial<Record<RuleModel, SavedMode>>>(scope, 'productionContextModels', s.setupRestoredDraft?.models ?? {})
+  const [backups, setBackups, getBackups, getBackupsRevision, backupsRecovery] = useProjectDraft<Partial<Record<RuleModel, SavedMode>>>(scope, 'productionContextModels', {}, s.setupRestoredDraft ? { value: s.setupRestoredDraft.models, revision: s.setupRestoredDraft.modelsRevision } : undefined)
+  const recoveryConflict = !!stored.recovery.conflict || !!backupsRecovery.conflict
   const [copyVersion, setCopyVersion] = useState('')
   type Replacement = { label: string; prepared: { value: ContextForm; base: ContextBase | null }; from: SavedMode; changes: string[]; kind: 'copy' | 'model' }
   const [pendingCopy, updatePendingCopy] = useState<Replacement | null>(null)
@@ -41,7 +43,7 @@ export function useProjectContext(s: ContextSession) {
   }
   const catalogNow = () => !s.getLatestCatalog || sameJsonValue(s.getLatestCatalog(), { contractVersion: 'production.1', rulePacks: s.catalog, scopedRulePacks: s.scopedCatalog ?? [] })
   const canEditLocal = s.canEditSetup ?? s.canWrite
-  const canEdit = canEditLocal && (initialized || !s.project?.production) && !readOnly && !pendingCopy && !migrationRequired && !unsupported.length
+  const canEdit = canEditLocal && !recoveryConflict && (initialized || !s.project?.production) && !readOnly && !pendingCopy && !migrationRequired && !unsupported.length
   const compiled = compileContextForm(form)
   const versionIssues = (draft: typeof compiled.context) => {
     const selected = selectedRule(draft, rules), frozen = state?.versions.find(version => ruleKey(version.rulePack) === ruleKey(draft.rulePackRef))
@@ -51,8 +53,8 @@ export function useProjectContext(s: ContextSession) {
   const savedIssues = serverDraft ? [...contextReadiness(serverDraft, rules), ...versionIssues(serverDraft)] : []
   const rule = readOnly ? activeVersion?.rulePack : selectedRule(compiled.context, rules)
   const frozenReference = !rule && compiled.context.rulePackRef ? state?.versions.find(version => ruleKey(version.rulePack) === ruleKey(compiled.context.rulePackRef))?.rulePack : undefined
-  const canSave = s.canWrite && initialized && !pendingCopy && !migrationRequired && !unsupported.length && !stored.needsReview && !compiled.errors.length && (stored.active || (!serverDraft && !activeVersion))
-  const canActivate = s.canWrite && initialized && !pendingCopy && !!serverDraft && !stored.active && !stored.needsReview && !savedIssues.length
+  const canSave = s.canWrite && !recoveryConflict && initialized && !pendingCopy && !migrationRequired && !unsupported.length && !stored.needsReview && !compiled.errors.length && (stored.active || (!serverDraft && !activeVersion))
+  const canActivate = s.canWrite && !recoveryConflict && initialized && !pendingCopy && !!serverDraft && !stored.active && !stored.needsReview && !savedIssues.length
   const setField = (key: keyof ContextForm, value: string) => {
     if (!canEdit || !currentNow() || key === 'ruleModel') return
     const live = stored.getStored(), latestForm = live.active ? normalizeContextForm(live.value, live.base).form : form
@@ -82,7 +84,7 @@ export function useProjectContext(s: ContextSession) {
     setRule(id, version)
   }
   const archive = (value: SavedMode) => setBackups(previous => ({ ...previous, [value.form.ruleModel]: value }))
-  const canCopyVersion = (version?: ProjectContextVersion) => !!version && s.canWrite && initialized && currentNow()
+  const canCopyVersion = (version?: ProjectContextVersion) => !!version && s.canWrite && !recoveryConflict && initialized && currentNow()
     && !!state?.versions.some(item => item.version === version.version && sameJsonValue(item, version))
   const requestCopy = (version: ProjectContextVersion) => {
     if (!canCopyVersion(version)) return
@@ -109,7 +111,7 @@ export function useProjectContext(s: ContextSession) {
     if (!canEditLocal || !currentNow() || !migrationRequired || unsupported.length) return
     stored.replace({ value: normalized.form, base: stored.originalBase }); setPendingCopy(null)
   }
-  const acknowledge = () => { if (!migrationRequired && !unsupported.length && canEditLocal && currentNow()) stored.acknowledge() }
+  const acknowledge = () => { if (!recoveryConflict && !migrationRequired && !unsupported.length && canEditLocal && currentNow()) stored.acknowledge() }
   const save = () => {
     if (!canSave || !currentNow()) return
     const submitted = form
@@ -130,10 +132,13 @@ export function useProjectContext(s: ContextSession) {
     if (!s.canWrite || s.project?.production || !currentNow()) return
     void s.write('production/initialize', {}, '已开启制作配置，请填写并明确保存。')
   }
-  const local = { ...stored, acknowledge, needsReview: stored.needsReview || migrationRequired || !!unsupported.length }
-  const capture = (): SetupCapture => ({ reviewed: { ...stored.getStored(), value: normalizeContextForm(stored.getStored().value, stored.getStored().base).form }, models: getBackups() })
+  const local = { ...stored, acknowledge, needsReview: stored.needsReview || !!backupsRecovery.conflict || migrationRequired || !!unsupported.length }
+  const capture = (): SetupCapture => {
+    if (stored.recovery.getConflict() || backupsRecovery.getConflict()) throw new ApiError('LOCAL_DRAFT_RECOVERY_CONFLICT', 0)
+    return { reviewed: { ...stored.getStored(), value: normalizeContextForm(stored.getStored().value, stored.getStored().base).form }, models: getBackups(), reviewedRevision: stored.getRevision(), modelsRevision: getBackupsRevision() }
+  }
   const getCurrentInput = () => {
-    if (s.getCurrentScope && s.getCurrentScope() !== scope || pendingCopyRef.current) return undefined
+    if (s.getCurrentScope && s.getCurrentScope() !== scope || pendingCopyRef.current || stored.recovery.getConflict() || backupsRecovery.getConflict()) return undefined
     const latest = s.getLatestProject(), live = stored.getStored()
     if (live.active && !sameJsonValue(live.base, projectContextBase(latest))) return undefined
     const normalizedLive = normalizeContextForm(live.active ? live.value : form, live.base)
@@ -158,11 +163,15 @@ export function useProjectContext(s: ContextSession) {
     stored.discard()
     return true
   }
+  const chooseRecovery = (kind: 'reviewed' | 'models', source: 'local' | 'restored') => {
+    if (!currentNow()) return
+    if (kind === 'reviewed') stored.recovery.choose(source); else backupsRecovery.choose(source)
+  }
   return { initialized, state, activeVersion, serverDraft, form, model, readOnly, compatibilityBlocked: false, canEdit, canCopyVersion, local, compiled, issues, rule, rules, localeRules, setLocaleRule, frozenReference,
     canSave, canActivate, setField, setRule, applyRuleTarget, save, activate, initialize, discard, requestCopy, pendingCopy, confirmCopy, requestModel, backups,
     migrationRequired, unsupported, migrateLocal, migrationRaw: migrationRequired || unsupported.length ? JSON.stringify(stored.value, null, 2) : '',
     cancelCopy: () => setPendingCopy(null), copyVersion, setCopyVersion,
-    selectedCopyVersion: state?.versions.find(version => String(version.version) === copyVersion) ?? activeVersion, getCurrentInput, afterStartup,
+    selectedCopyVersion: state?.versions.find(version => String(version.version) === copyVersion) ?? activeVersion, getCurrentInput, afterStartup, recoveryConflict, backupsRecovery, chooseRecovery,
     changes: contextDifferences(stored.originalBase, stored.currentBase),
   }
 }

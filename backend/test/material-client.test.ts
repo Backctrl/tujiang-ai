@@ -20,6 +20,7 @@ import { useMaterialIntake } from '../../src/pages/ArcaneWarriorPage/useMaterial
 // Deterministic persistence fault injection for the actual write executor. IndexedDB and UI
 // interaction still require the separate real-browser acceptance; this is not a browser claim.
 class MemoryMaterialStorage implements MaterialIntakeStorage {
+  async releaseConflict() { this.pending = undefined; }
   entries = new Map<string, MaterialLocalEntry>();
   pending: MaterialOperation | undefined;
   replacements: MaterialOperation[] = [];

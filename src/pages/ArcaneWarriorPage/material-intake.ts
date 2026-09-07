@@ -87,6 +87,7 @@ export function onlyMaterialParseProgress(before: Project, after: Project) {
 // The durable boundary is before HTTP. Settlement removes the file and pending request atomically.
 export async function executeMaterialOperation(operation: MaterialOperation, api: Pick<StageAApi, 'executePrepared' | 'get'>, storage: MaterialIntakeStorage,
   receiveSnapshot: (project: Project) => void, replay = false, onRebased?: (operation: MaterialOperation) => void): Promise<MaterialWriteOutcome> {
+  if (operation.conflict) return { kind: 'conflict', error: new ApiError(operation.conflict.code, 409), operation }
   try { await storage.savePending(operation) }
   catch { return { kind: replay ? 'uncertain' : 'storage', error: new ApiError(replay ? 'LOCAL_RECOVERY_SETTLE_FAILED' : 'LOCAL_RECOVERY_SAVE_FAILED', 0), operation } }
   let current = operation
@@ -124,6 +125,10 @@ export async function executeMaterialOperation(operation: MaterialOperation, api
           continue
         }
       }
+      if (kind === 'conflict') current = { ...current, conflict: {
+        code: error instanceof ApiError ? error.code : 'REQUEST_FAILED', message: errorMessage(error),
+        allowsSameRevision: current.kind === 'review' && error instanceof ApiError && !['VERSION_CONFLICT', 'REVISION_CONFLICT'].includes(error.code),
+      } }
       try { await storage.settle(current, kind, errorMessage(error)) }
       catch { return uncertain(new ApiError('LOCAL_RECOVERY_SETTLE_FAILED', 0)) }
       return { kind, error, operation: current }

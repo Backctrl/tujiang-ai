@@ -146,6 +146,7 @@ const messages: Record<string, string> = {
   SETUP_INPUT_CHANGED: '本地配置或项目已变化，请重新检查后提交。',
   SETUP_REQUEST_REJECTED: '原请求已被明确拒绝。读取最新状态并复核失败原因后，再明确重新提交。',
   LOCAL_SETUP_REJECTION_SAVE_FAILED: '原请求已被拒绝，但浏览器未能保存拒绝标记。请恢复存储并读取最新状态后复核原请求。',
+  LOCAL_DRAFT_RECOVERY_CONFLICT: '本地输入与恢复记录的先后顺序不明确，请比较并选择要继续使用的输入。',
   INVALID_PRODUCTION_CATALOG: '平台规则目录暂不可用，请重新读取或联系维护人员核对。',
   PRODUCTION_NOT_INITIALIZED: '请先在项目设置明确开启制作配置，再保存草稿。',
   FILE_TOO_LARGE: '单个原件最多 10 MiB，请缩小文件后重新选择。',

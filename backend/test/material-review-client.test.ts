@@ -26,6 +26,7 @@ import type { MaterialReviewsController } from '../../src/pages/ArcaneWarriorPag
 
 // Review recovery uses the same durable executor as original uploads. Browser IndexedDB and layout are accepted separately.
 class ReviewStorage implements MaterialIntakeStorage {
+  async releaseConflict() { this.pending = undefined; }
   pending: MaterialOperation | undefined;
   failSave = false;
   failSettle = false;

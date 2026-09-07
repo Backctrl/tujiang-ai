@@ -44,6 +44,9 @@ export function startupStatusMatchesProject(status: StartupStatus, project: Proj
   if (!stored || !Array.isArray(scope?.materials) || !Array.isArray(scope.manualEvidence)) return false
   const run = project.runs.find(item => item.id === stored.runId)
   const runState = run ? run.queueStatus === 'queued' ? 'queued' : run.queueStatus === 'claimed' ? 'running' : run.runStatus === 'succeeded' ? 'succeeded' : 'failed' : null
+  const additions = (project.production?.materials ?? []).map(item => item.id).filter(id => !scope.materials.some(item => item.id === id)).sort()
+  const evidenceAdditions = project.evidence.filter(item => !item.materialSource && item.origin !== 'material' && item.usage === 'product_evidence'
+    && item.availability !== 'withdrawn' && !scope.manualEvidence.some(ref => ref.id === item.id)).map(item => item.id).sort()
   return status.id === stored.id && status.contextVersion === stored.contextVersion && status.inputFingerprint === stored.inputFingerprint
     && status.submittedAt === stored.submittedAt && status.submittedBy === stored.submittedBy && status.runId === (stored.runId ?? null)
     && status.retryRunId === (run?.queueStatus === 'done' && run.runStatus === 'failed' ? run.id : null)
@@ -52,5 +55,12 @@ export function startupStatusMatchesProject(status: StartupStatus, project: Proj
     && sameIds(status.evidenceIds, run?.startupInput?.evidence.map(item => item?.id) ?? [])
     && sameIds(status.scopeRefresh.retainedMaterialIds, status.materialIds) && sameIds(status.scopeRefresh.retainedManualEvidenceIds, status.manualEvidenceIds)
     && sameIds(status.scopeRefresh.addedMaterialIds, status.excludedMaterialIds) && sameIds(status.scopeRefresh.addedManualEvidenceIds, status.excludedManualEvidenceIds)
+    && sameIds(status.excludedMaterialIds, additions) && sameIds(status.excludedManualEvidenceIds, evidenceAdditions)
+    && (!status.scopeRefresh.canRefresh || !stored.runId && !!(additions.length + evidenceAdditions.length))
 }
-export const startupReadMatches = (value: Pick<StartupRead, 'projectId' | 'projectVersion' | 'revision'>, project: Project | null) => !!project && value.projectId === project.id && value.projectVersion === project.version && value.revision === project.revision
+export const startupReadEnvelopeMatches = (value: Pick<StartupRead, 'projectId' | 'projectVersion' | 'revision'>, project: Project | null) => !!project && value.projectId === project.id && value.projectVersion === project.version && value.revision === project.revision
+export function startupReadMatches(value: StartupRead | StartupCheck, project: Project | null) {
+  if (!project || !startupReadEnvelopeMatches(value, project)) return false
+  const status = 'existingStartup' in value ? value.existingStartup : value.startup
+  return status === null ? !project.production?.startup : startupStatusMatchesProject(status, project)
+}

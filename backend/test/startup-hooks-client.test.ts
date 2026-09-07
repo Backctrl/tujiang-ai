@@ -15,8 +15,9 @@ import { useProjectStartup, useStartupStatus } from '../../src/pages/ArcaneWarri
 import { contextForm } from '../../src/pages/ArcaneWarriorPage/project-context.js';
 import { materialIntakeStorage } from '../../src/pages/ArcaneWarriorPage/material-storage.js';
 import { setupRecoveryStorage } from '../../src/pages/ArcaneWarriorPage/setup-recovery.js';
-import type { StartupFinding } from '../../src/pages/ArcaneWarriorPage/startup-contract.js';
-import { StageAApi } from '../../src/pages/ArcaneWarriorPage/stage-a-api.js';
+import type { StartupCheck, StartupFinding, StartupRead, StartupStatus } from '../../src/pages/ArcaneWarriorPage/startup-contract.js';
+import { StageAApi, type Project } from '../../src/pages/ArcaneWarriorPage/stage-a-api.js';
+import { draftKey } from '../../src/pages/ArcaneWarriorPage/project-drafts.js';
 
 type RenderNode = { type: string | ComponentType; children: (string | RenderNode)[]; props: Record<string, unknown>; findAllByType(type: string): RenderNode[] };
 type Renderer = { root: RenderNode; unmount(): void; update(element: ReactElement): void };
@@ -32,7 +33,8 @@ async function clearDatabase() {
   await new Promise<void>((resolve, reject) => { const request = indexedDB.deleteDatabase('tujiang_material_intake_v1'); request.onsuccess = () => resolve(); request.onerror = () => reject(request.error); });
 }
 
-async function harness(panel?: ComponentType<{ session: ProjectSession; onStage: () => void }>) {
+const content = (node: string | RenderNode): string => typeof node === 'string' ? node : node.children.map(content).join('');
+async function harness(panel?: ComponentType<{ session: ProjectSession; context: Mounted['context']; onStage: () => void }>) {
   const f = await fixture(catalog, synthetic), base = await f.app.listen({ port: 0, host: '127.0.0.1' });
   const globals = new Map(['localStorage', 'indexedDB', 'IDBKeyRange', 'fetch', 'IS_REACT_ACT_ENVIRONMENT'].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
   const local = new Map<string, string>(), trace: Trace[] = [], navigations: { projectId: string | undefined; scope: string }[] = [], findings: StartupFinding[] = [];
@@ -58,7 +60,7 @@ async function harness(panel?: ComponentType<{ session: ProjectSession; onStage:
     const startup = useProjectStartup(session, context, () => navigations.push({ projectId: session.getLatestProject()?.id, scope: session.getCurrentScope() }), finding => findings.push(finding));
     const status = useStartupStatus(session);
     latest = { session, context, startup, intake, status };
-    return panel ? createElement(panel, { session, onStage: () => undefined }) : null;
+    return panel ? createElement(panel, { session, context, onStage: () => undefined }) : null;
   }
   function Probe() {
     const session = useProjectSession(), intake = useMaterialIntake(session);
@@ -270,7 +272,8 @@ for (const stage of ['create', 'initialize', 'upload', 'start'] as const) test(`
 });
 
 for (const stage of ['create', 'initialize', 'start'] as const) test(`mounted ${stage} 409 persists its rejected request across reopening and requires read, review and a new explicit submission`, async () => {
-  const h = await harness();
+  const { SetupRequestReview } = await tsImport('../../src/pages/ArcaneWarriorPage/SetupRequestReview.tsx', { parentURL: import.meta.url, tsconfig: fileURLToPath(new URL('../../tsconfig.app.json', import.meta.url)) });
+  const h = await harness(SetupRequestReview);
   try {
     await h.mount(); await h.connect(); await h.fill();
     if (stage === 'start') {
@@ -295,6 +298,11 @@ for (const stage of ['create', 'initialize', 'start'] as const) test(`mounted ${
     assert.equal(pending?.kind, 'setup'); if (pending?.kind !== 'setup') return;
     const body = pending.operation.prepared.body, original = JSON.parse(body) as { expectedRevision: number; idempotencyKey: string };
     assert.equal(pending.operation.rejected, true);
+    assert.match(content(h.root()), /冻结输入修订/);
+    assert.ok(content(h.root()).includes(stage)); assert.ok(content(h.root()).includes(original.idempotencyKey));
+    assert.ok(content(h.root()).includes(scopedContext.productBrief.productName));
+    assert.ok(content(h.root()).includes(pending.operation.rejection!.code));
+    assert.match(content(h.root()), /请先读取最新项目/);
     assert.equal(h.trace.filter(matches).length, 1, 'setup never applies the upload parser rebase exception');
     let stored: Awaited<ReturnType<typeof setupRecoveryStorage.readPending>>;
     await act(async () => { stored = await setupRecoveryStorage.readPending(); });
@@ -308,6 +316,8 @@ for (const stage of ['create', 'initialize', 'start'] as const) test(`mounted ${
     assert.ok(h.get().session.pending, 'unread request cannot be released');
     await act(async () => { await h.get().session.refresh(); await h.get().session.retry(); });
     assert.equal(h.get().session.recoveryNeedsCheck, false); assert.equal(h.get().session.canRetry, false);
+    assert.match(content(h.root()), stage === 'create' ? /已读取项目列表/ : /原请求与当前 R/);
+    if (stage !== 'create') assert.ok(content(h.root()).includes('Concurrent employee source'), 'comparison exposes the actual concurrent business change');
     assert.equal(h.trace.filter(item => item.method === 'POST' && !item.path.endsWith('/check')).length, writes, 'reopen, read and retry cannot send a rejected operation');
     assert.equal(h.get().context.form.productName, scopedContext.productBrief.productName);
     await act(async () => { await h.get().session.releaseSetupRequest(); });
@@ -326,7 +336,7 @@ for (const stage of ['create', 'initialize', 'start'] as const) test(`mounted ${
 });
 
 test('mounted upload business 409 pauses its local File, survives reopening without upload, and retries only from the reviewed snapshot', async () => {
-  const h = await harness();
+  const h = await harness(), releaseConflict = materialIntakeStorage.releaseConflict;
   try {
     await h.mount(); await h.connect(); await h.fill();
     await act(async () => { await h.get().intake.addFiles([new File(['10 kg'], 'upload-conflict.txt', { type: 'text/plain' })], { kind: 'local_upload' }); });
@@ -347,7 +357,26 @@ test('mounted upload business 409 pauses its local File, survives reopening with
     h.setIntercept(); await h.unmount(); await h.mount(); await h.connect();
     await h.settle(() => h.get().intake.entries.length === 1, 'conflicted original retained');
     assert.equal(uploads().length, 1); assert.equal(h.get().intake.entries[0]!.status, 'conflict');
-    await act(async () => { await h.get().session.refresh(); h.get().session.resolveConflict(); });
+    assert.ok(h.get().session.conflictBefore); assert.equal(h.get().session.pending?.kind, 'material');
+    assert.equal(h.get().session.canWrite, false); assert.equal(h.get().session.canRetry, false); assert.equal(h.get().session.canResolveConflict, false);
+    await act(async () => { await h.get().session.resolveConflict(); await h.get().intake.retryLocal(h.get().intake.entries[0]!); });
+    assert.equal(uploads().length, 1); assert.ok(h.get().session.pending);
+    await act(async () => { await h.get().session.refresh(); });
+    assert.equal(h.get().session.canResolveConflict, true); assert.equal(h.get().session.canWrite, false);
+    await act(async () => { await h.get().intake.retryLocal(h.get().intake.entries[0]!); await h.get().session.retry(); });
+    assert.equal(uploads().length, 1, 'reading without human resolution never reopens writing');
+    materialIntakeStorage.releaseConflict = async () => { throw new Error('Injected conflict release failure'); };
+    await act(async () => { await h.get().session.resolveConflict(); });
+    assert.ok(h.get().session.conflictBefore); assert.ok(h.get().session.pending); assert.equal(h.get().session.canWrite, false);
+    assert.equal(h.get().intake.entries[0]!.status, 'conflict'); assert.equal(uploads().length, 1);
+    await h.unmount(); await h.mount(); await h.connect();
+    assert.equal(h.get().session.canResolveConflict, false, 'failed release cannot erase the durable review gate');
+    assert.ok(h.get().session.conflictBefore); assert.equal(h.get().session.pending?.kind, 'material');
+    materialIntakeStorage.releaseConflict = releaseConflict;
+    await act(async () => { await h.get().session.refresh(); });
+    await act(async () => { await h.get().session.resolveConflict(); });
+    assert.equal(h.get().session.conflictBefore, null); assert.equal(h.get().session.pending, null);
+    await h.settle(() => h.get().intake.canStart && h.get().intake.entries[0]?.status === 'waiting', 'atomic conflict release requeues the preserved File');
     assert.equal(uploads().length, 1);
     const revision = h.get().session.project!.revision;
     await act(async () => { await h.get().intake.retryLocal(h.get().intake.entries[0]!); });
@@ -356,7 +385,7 @@ test('mounted upload business 409 pauses its local File, survives reopening with
     const next = JSON.parse(uploads()[1]!.body!) as typeof original;
     assert.notEqual(next.idempotencyKey, original.idempotencyKey); assert.equal(next.expectedRevision, revision);
     assert.equal(h.get().session.project?.production?.startup, undefined); assert.equal(h.navigations.length, 0);
-  } finally { await h.close(); }
+  } finally { materialIntakeStorage.releaseConflict = releaseConflict; await h.close(); }
 });
 
 test('startup receipt arriving before the matching project render is delivered after alignment exactly once', async () => {
@@ -528,6 +557,163 @@ test('a held startup GET is discarded after a namespace switch and a held check 
     assert.equal(h.trace.some(item => item.path.endsWith('/start')), false); assert.equal(h.navigations.length, 0);
     assert.equal(h.get().context.form.productName, scopedContext.productBrief.productName);
   } finally { release?.(); await h.close(); }
+});
+
+test('mounted GET startup and check reject shape-valid status fields that disagree with the real queued project', async t => {
+  const h = await harness();
+  try {
+    let project = await h.f.create();
+    project = await h.f.write(project, 'production/initialize');
+    project = await h.f.write(project, 'production/context/draft', { context: scopedContext });
+    project = await h.f.write(project, 'evidence', { documentName: 'Synthetic bound source', locator: 'line 1', usage: 'product_evidence', text: '10 kg' });
+    const checked = await new StageAApi(h.f.headers.authorization.slice(7)).startupCheck(project.id, scopedContext);
+    const response = await h.f.post(`/api/projects/${project.id}/production/startup/start`, { context: scopedContext, inputFingerprint: checked.inputFingerprint,
+      expectedProjectVersion: project.version, expectedRevision: project.revision, idempotencyKey: crypto.randomUUID() });
+    assert.equal(response.statusCode, 200); project = response.json<{ project: Project }>().project;
+    assert.equal(project.runs[0]!.queueStatus, 'queued');
+    await h.mount(); await h.connect(); await act(async () => { await h.get().session.selectProject(project.id); });
+    await h.settle(() => h.get().status.current && !!h.get().startup.check, 'valid queued status and check accepted');
+    const mutations: { name: string; change: (status: StartupStatus) => StartupStatus | null }[] = [
+      { name: 'missing startup', change: () => null },
+      ...(['id', 'submittedBy', 'runId', 'retryRunId'] as const).map(field => ({ name: field, change: (status: StartupStatus) => ({ ...status, [field]: crypto.randomUUID() }) })),
+      { name: 'context version', change: status => ({ ...status, contextVersion: status.contextVersion + 1 }) },
+      { name: 'input fingerprint', change: status => ({ ...status, inputFingerprint: '0'.repeat(64) }) },
+      { name: 'submitted timestamp', change: status => ({ ...status, submittedAt: '2000-01-01T00:00:00.000Z' }) },
+      { name: 'succeeded while actual run is queued', change: status => ({ ...status, state: 'succeeded' }) },
+      ...(['materialIds', 'manualEvidenceIds', 'evidenceIds', 'excludedMaterialIds', 'excludedManualEvidenceIds'] as const).map(field => ({ name: field, change: (status: StartupStatus) => ({ ...status, [field]: [crypto.randomUUID()] }) })),
+      ...(['retainedMaterialIds', 'retainedManualEvidenceIds', 'addedMaterialIds', 'addedManualEvidenceIds'] as const).map(field => ({ name: `scope ${field}`, change: (status: StartupStatus) => ({ ...status, scopeRefresh: { ...status.scopeRefresh, [field]: [crypto.randomUUID()] } }) })),
+      { name: 'scope refresh permitted for queued run', change: status => ({ ...status, scopeRefresh: { ...status.scopeRefresh, canRefresh: true } }) },
+    ];
+    for (const mutation of mutations) await t.test(mutation.name, async () => {
+      h.setIntercept(async (path, options, send) => {
+        const result = await send();
+        if (path.endsWith('/production/startup') && (options?.method ?? 'GET') === 'GET') {
+          const value = await result.json() as StartupRead; assert.ok(value.startup);
+          return Response.json({ ...value, startup: mutation.change(value.startup) });
+        }
+        if (path.endsWith('/production/startup/check') && options?.method === 'POST') {
+          const value = await result.json() as StartupCheck; assert.ok(value.existingStartup);
+          return Response.json({ ...value, existingStartup: mutation.change(value.existingStartup) });
+        }
+        return result;
+      });
+      await act(async () => { h.get().status.reload(); h.get().startup.reload(); });
+      await h.settle(() => !!h.get().status.error && !!h.get().startup.error && !h.get().status.loading && !h.get().startup.loading, 'both corrupted responses explicitly rejected');
+      assert.equal(h.get().status.current, false); assert.equal(h.get().status.status, null); assert.equal(h.get().startup.check, null);
+      const writes = h.trace.filter(item => item.path.endsWith('/start')).length;
+      await act(async () => { await h.get().startup.start(); });
+      assert.equal(h.trace.filter(item => item.path.endsWith('/start')).length, writes);
+      assert.equal(h.get().session.project?.runs[0]?.queueStatus, 'queued'); assert.equal(h.navigations.length, 0);
+    });
+    h.setIntercept(); await act(async () => { h.get().status.reload(); h.get().startup.reload(); });
+    await h.settle(() => h.get().status.current && h.get().status.status?.state === 'queued' && !!h.get().startup.check, 'valid reads recover after corrupted responses');
+  } finally { await h.close(); }
+});
+
+for (const boundary of ['GET', 'readFlow', 'selectScope', 'unmount'] as const) test(`cancelled selectProject at ${boundary} preserves the prior project, draft and durable selection`, async () => {
+  const h = await harness(), readFlow = setupRecoveryStorage.readFlow, selectScope = setupRecoveryStorage.selectScope;
+  let release: (() => void) | undefined;
+  try {
+    const a = await h.f.create(), b = await h.f.create();
+    await h.mount(); await h.connect(); await act(async () => { await h.get().session.selectProject(a.id); });
+    await act(async () => { h.get().context.setField('productName', 'Draft A stays selected'); });
+    assert.equal(await setupRecoveryStorage.readSelection(), a.id);
+    const gate = new Promise<void>(resolve => { release = resolve; }); let held = false;
+    if (boundary === 'GET' || boundary === 'unmount') h.setIntercept(async (path, options, send) => {
+      const result = await send(); if (path === `/api/projects/${b.id}` && (options?.method ?? 'GET') === 'GET') { held = true; await gate; } return result;
+    });
+    if (boundary === 'readFlow') setupRecoveryStorage.readFlow = async scope => { const flow = await readFlow.call(setupRecoveryStorage, scope); if (scope === b.id) { held = true; await gate; } return flow; };
+    if (boundary === 'selectScope') setupRecoveryStorage.selectScope = async (...args) => { if (args[0] === b.id) { held = true; await gate; } return selectScope.apply(setupRecoveryStorage, args); };
+    let request: Promise<unknown> | undefined;
+    await act(async () => { request = h.get().session.selectProject(b.id); await delay(0); });
+    await h.settle(() => held, 'project B selection paused at the requested boundary');
+    if (boundary === 'unmount') await h.unmount(); else await act(async () => { h.get().session.setToken(''); });
+    await act(async () => { release!(); await request; });
+    assert.equal(await setupRecoveryStorage.readSelection(), a.id, 'cancellation cannot commit durable selection B');
+    assert.equal(h.get().session.project?.id, a.id); assert.equal(h.get().session.getCurrentScope(), a.id);
+    assert.equal(h.get().context.form.productName, 'Draft A stays selected');
+    assert.equal(h.trace.some(item => item.method === 'POST' && !item.path.endsWith('/check')), false);
+  } finally { release?.(); setupRecoveryStorage.readFlow = readFlow; setupRecoveryStorage.selectScope = selectScope; await h.close(); }
+});
+
+test('a newer IndexedDB capture restores the latest form and model backup when localStorage reads its old value but rejects writes', async () => {
+  const h = await harness();
+  try {
+    await h.mount(); await h.connect(); await h.fill();
+    await act(async () => { h.get().context.setField('productName', 'Older local value'); h.get().context.requestModel('legacy-canvas.1'); });
+    await act(async () => { h.get().context.confirmCopy(); });
+    const scope = h.get().session.draftScope, reviewedKey = draftKey(scope, 'productionContext:reviewed'), modelsKey = draftKey(scope, 'productionContextModels');
+    const olderReviewed = h.local.get(reviewedKey)!, olderModels = h.local.get(modelsKey)!;
+    Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: { getItem: (key: string) => h.local.get(key) ?? null,
+      setItem: (key: string, value: string) => { if (key === reviewedKey || key === modelsKey) throw new Error('Quota: older value remains readable'); h.local.set(key, value); } } });
+    await act(async () => { h.get().context.setField('productName', 'Latest frozen value'); });
+    await act(async () => { h.get().context.requestModel('scoped-rules.1'); });
+    await act(async () => { h.get().context.confirmCopy(); });
+    await act(async () => { h.get().context.setField('productName', 'Latest frozen value'); });
+    h.setIntercept(async (path, options, send) => path === '/api/projects' && options?.method === 'POST' ? new Response('', { status: 401 }) : send());
+    await act(async () => { await h.get().session.ensureSetupProject(); });
+    const pending = await setupRecoveryStorage.readPending(); assert.ok(pending);
+    assert.equal(JSON.parse(pending.prepared.body).name, 'Latest frozen value');
+    assert.equal(pending.capture.reviewed.value.productName, 'Latest frozen value');
+    assert.ok(pending.capture.reviewedRevision! > JSON.parse(olderReviewed).revision); assert.ok(pending.capture.modelsRevision! > JSON.parse(olderModels).revision);
+    assert.equal(h.local.get(reviewedKey), olderReviewed); assert.equal(h.local.get(modelsKey), olderModels);
+    await h.unmount(); await h.mount();
+    assert.equal(h.get().context.form.productName, 'Latest frozen value'); assert.equal(h.get().context.local.needsReview, false);
+    assert.equal(h.get().context.backups['legacy-canvas.1']?.form.productName, 'Latest frozen value');
+    assert.equal(h.get().context.recoveryConflict, false);
+    const recovered = h.get().session.pending;
+    assert.equal(recovered?.kind === 'setup' && recovered.operation.prepared.body, pending.prepared.body);
+    assert.equal(h.trace.filter(item => item.method === 'POST').length, 1, 'recovery never submits the older visible value');
+  } finally { await h.close(); }
+});
+
+test('a newer normal local edit wins over an older completed setup flow after reopening', async () => {
+  const h = await harness();
+  try {
+    await h.mount(); await h.connect(); await h.fill();
+    await act(async () => { await h.get().session.ensureSetupProject(); });
+    const scope = h.get().session.draftScope, flow = await setupRecoveryStorage.readFlow(scope); assert.ok(flow);
+    await act(async () => { h.get().context.setField('productName', 'Later normal edit'); });
+    await act(async () => { h.get().context.requestModel('legacy-canvas.1'); });
+    await act(async () => { h.get().context.confirmCopy(); });
+    const frozen = structuredClone(flow.capture), writes = h.trace.filter(item => item.method === 'POST' && !item.path.endsWith('/check')).length;
+    await h.unmount(); await h.mount();
+    assert.equal(h.get().context.form.productName, 'Later normal edit'); assert.equal(h.get().context.local.needsReview, false);
+    assert.equal(h.get().context.backups['scoped-rules.1']?.form.productName, 'Later normal edit');
+    assert.deepEqual((await setupRecoveryStorage.readFlow(scope))?.capture, frozen, 'normal edits do not rewrite a completed request capture');
+    assert.equal(h.trace.filter(item => item.method === 'POST' && !item.path.endsWith('/check')).length, writes);
+  } finally { await h.close(); }
+});
+
+for (const format of ['same-revision', 'legacy'] as const) test(`ambiguous ${format} form and backups remain visible for explicit choice without rewriting the frozen request`, async () => {
+  const assets = registerHooks({ load(url, context, next) { return /\.(png|jpe?g|webp|svg)(?:\?|$)/.test(url) ? { format: 'module', source: `export default ${JSON.stringify(url)}`, shortCircuit: true } : next(url, context); } });
+  const { ContextControls } = await tsImport('../../src/pages/ArcaneWarriorPage/ProjectContextFields.tsx', { parentURL: import.meta.url, tsconfig: fileURLToPath(new URL('../../tsconfig.app.json', import.meta.url)) }).finally(() => assets.deregister());
+  const h = await harness(ContextControls);
+  try {
+    await h.mount(); await h.connect(); await h.fill();
+    await act(async () => { h.get().context.setField('productName', 'Frozen request name'); });
+    h.setIntercept(async (path, options, send) => path === '/api/projects' && options?.method === 'POST' ? new Response('', { status: 401 }) : send());
+    await act(async () => { await h.get().session.ensureSetupProject(); });
+    const pending = (await setupRecoveryStorage.readPending())!;
+    if (format === 'legacy') { delete pending.capture.reviewedRevision; delete pending.capture.modelsRevision; await setupRecoveryStorage.save(pending); }
+    const reviewed = { ...pending.capture.reviewed, value: { ...pending.capture.reviewed.value, productName: 'Conflicting local name' } };
+    const models = { 'legacy-canvas.1': { form: { ...reviewed.value, ruleModel: 'legacy-canvas.1', productName: 'Conflicting local backup' }, base: reviewed.base } };
+    const record = (value: unknown, revision = 0) => JSON.stringify(format === 'legacy' ? value : { draftFormat: 'tujiang-local-draft.2', value, revision });
+    h.local.set(draftKey(pending.scopeId, 'productionContext:reviewed'), record(reviewed, pending.capture.reviewedRevision));
+    h.local.set(draftKey(pending.scopeId, 'productionContextModels'), record(models, pending.capture.modelsRevision));
+    await h.unmount(); await h.mount();
+    assert.equal(h.get().context.recoveryConflict, true); assert.equal(h.get().context.local.needsReview, true);
+    assert.equal(h.get().context.canEdit, false); assert.equal(h.get().startup.canStart, false); assert.equal(h.get().context.getCurrentInput(), undefined);
+    assert.match(content(h.root()), /Frozen request name/); assert.match(content(h.root()), /Conflicting local name/); assert.match(content(h.root()), /Conflicting local backup/);
+    await act(async () => { h.get().context.chooseRecovery('reviewed', 'local'); });
+    assert.equal(h.get().context.form.productName, 'Conflicting local name'); assert.equal(h.get().context.recoveryConflict, true, 'backup conflict independently blocks use');
+    await act(async () => { h.get().context.chooseRecovery('models', 'restored'); });
+    assert.equal(h.get().context.recoveryConflict, false); assert.deepEqual(h.get().context.backups, pending.capture.models);
+    assert.ok(h.get().context.local.getRevision() > (pending.capture.reviewedRevision ?? 0));
+    assert.equal((await setupRecoveryStorage.readPending())!.prepared.body, pending.prepared.body);
+    assert.equal((await setupRecoveryStorage.readPending())!.capture.reviewed.value.productName, 'Frozen request name');
+    assert.equal(h.trace.filter(item => item.method === 'POST').length, 1);
+  } finally { await h.close(); }
 });
 
 test('mounted Facts panel lists append-only additions, retains the reason across changed proposals and requires explicit scope confirmation without queueing', async () => {
