@@ -108,7 +108,7 @@ batch-input、input-review-decision、capabilities、response 与 parsed-result 
 
 原文采用数据库内 AES-256-GCM 加密保存，密钥只由本地进程环境读取，不进入数据库、仓库或报告。新材料格式为 `artifact.2`；AAD 绑定授权、材料 ID、batch、attempt、材料类型、来源/metadata 摘要、原文/副本摘要、`redacted` 与 `byteLength`。读取使用调用方预期的归属、类型和查询 ID 验证，合法密文也不能被跨 item、跨 batch、改名或换类型引用。旧 `artifact.1` 缺少认证的脱敏标记，明确拒绝读取，不静默升级或重新批准旧批次。
 
-请求 Authorization/header 从不保存；管理和运行入口在构造账本前按环境变量名分段识别 key、token、secret、password、credential 等凭据，包括 `AWS_SECRET_ACCESS_KEY`、`PRIVATE_KEY`、`SECRET_KEY`，以及任意 `DATABASE_URL` 后缀的完整值和编码/解码密码。保护覆盖 raw、base64、hex、URL 和 JSON 常见表示，包括大小写混合的 hex、标准及 URL-safe base64 的有/无填充形式，以及百分号转义内的大小写等价形式；只折叠编码字符的大小写，普通文本仍按实际字节区分。加密器也自动保护自身密钥及其原始字节。普通数据库用户名不会单独当作秘密，合法文本中的 `postgres` 可以正常准备。输入含已知凭据时拒绝创建批次；输出回显凭据时先脱敏再留存，并记录发生脱敏和原文摘要，不能仍声称保存的是未变动的原始字节。
+请求 Authorization/header 从不保存；管理和运行入口在构造账本前按环境变量名分段识别 key、token、secret、password、credential 等凭据，包括 `AWS_SECRET_ACCESS_KEY`、`PRIVATE_KEY`、`SECRET_KEY`，以及任意 `DATABASE_URL` 后缀的完整值和编码/解码密码。保护覆盖 raw、base64、hex、URL 和 JSON 常见表示，包括大小写混合的 hex、标准及 URL-safe base64 的有/无填充形式。每个字节可用原文或百分号转义，每个字符可用原文、JSON 常规转义或 `\uXXXX`；完整、部分转义及 escape 再包一层 JSON 字符串都可识别，只折叠 escape hex 位，普通文本仍按实际字节区分。加密器也自动保护自身密钥及其原始字节；脱敏使用可逆字节视图，保留未命中的非 UTF-8 内容。普通数据库用户名不会单独当作秘密，合法文本中的 `postgres` 可以正常准备。输入含已知凭据时拒绝创建批次；输出回显凭据时先脱敏再留存，并记录发生脱敏和原文摘要，不能仍声称保存的是未变动的原始字节。
 
 普通 runner/stdout 报告只含状态、固定错误码、计数、费用、SHA 和材料 ID，不含输入正文、预期、原始输出、Key 或数据库 URL。原文通过显式本地审阅导出到受控目录，默认不打印，导出动作有审计；新管理进程也按当前已知敏感值检查旧材料，导出发生新的脱敏时更新副本摘要与 `redacted` 标记。创建导出目录前检查全部现有父目录，创建后复查并使用实际路径写入，拒绝 symlink/junction 跳转，同时允许 Windows 原生路径别名规范化。留存初始化或密钥不可用时，live 在 POST 前拒绝。
 

@@ -13,17 +13,32 @@ function byteRepresentations(bytes: Buffer) {
   return [base64, unpadded, base64.replaceAll('+', '-').replaceAll('/', '_'), bytes.toString('base64url'),
     bytes.toString('hex'), bytes.toString('hex').toUpperCase()];
 }
-function percentPattern(encoded: string) {
-  // Fold only hexadecimal digits within percent escapes, preserving all other text case exactly.
-  const tokens = encoded.match(/%[A-F0-9]{2}|./g)!;
-  return tokens.map(token => token.startsWith('%') && token.length === 3
-    ? `%${Array.from(token.slice(1), character => /[A-F]/.test(character) ? `[${character.toLowerCase()}${character}]` : character).join('')}`
-    : `\\x${token.charCodeAt(0).toString(16).padStart(2, '0')}`).join('');
+function escapeHex(hex: string) {
+  return Array.from(hex, digit => /[a-f]/i.test(digit) ? `[${digit.toLowerCase()}${digit.toUpperCase()}]` : digit).join('');
+}
+function literalBytes(bytes: ArrayLike<number>) {
+  return Array.from(bytes, byte => `\\x${byte.toString(16).padStart(2, '0')}`).join('');
+}
+function percentPattern(bytes: Uint8Array) {
+  // Every byte may be literal or escaped, including bytes which a URL encoder leaves unreserved.
+  return Array.from(bytes, byte => `(?:${literalBytes([byte])}|%${escapeHex(byte.toString(16).padStart(2, '0'))})`).join('');
+}
+function jsonPattern(value: string) {
+  return Array.from(value, character => {
+    const raw = literalBytes(Buffer.from(character));
+    // Support a JSON escape itself and that escape preserved inside one JSON string.
+    const unicode = character.split('').map(unit =>
+      `(?:\\x5c|\\x5c\\x5c)u${escapeHex(unit.charCodeAt(0).toString(16).padStart(4, '0'))}`).join('');
+    const quoted = literalBytes(Buffer.from(JSON.stringify(character).slice(1, -1)));
+    const alternatives = new Set([raw, unicode, quoted]);
+    if (character === '/') alternatives.add(literalBytes(Buffer.from('\\/')));
+    return `(?:${[...alternatives].join('|')})`;
+  }).join('');
 }
 
 export class ArtifactCipher {
   private readonly key: Buffer;
-  private secrets: string[] = [];
+  private secrets: string[] = []; // Latin-1 byte views, never case-folded plaintext.
   private binarySecrets: Buffer[] = [];
   private encodedPatterns: RegExp[] = [];
   readonly keyId: string;
@@ -49,12 +64,13 @@ export class ArtifactCipher {
       for (const bytes of decoded) {
         if (bytes.length < 16) continue;
         binary.set(bytes.toString('hex'), bytes); variants.push(...byteRepresentations(bytes)); addPattern(bytes.toString('hex'), 'gi');
+        addPattern(percentPattern(bytes), 'g');
         const utf8 = bytes.toString('utf8'); if (Buffer.from(utf8).equals(bytes)) variants.push(utf8);
       }
       for (const value of variants) {
         const encoded = encodeURIComponent(value);
-        for (const encoding of [value, JSON.stringify(value).slice(1, -1), encoded]) text.add(encoding);
-        if (encoded.includes('%')) addPattern(percentPattern(encoded), 'g');
+        for (const encoding of [value, JSON.stringify(value).slice(1, -1), encoded]) text.add(Buffer.from(encoding).toString('latin1'));
+        addPattern(percentPattern(Buffer.from(value)), 'g'); addPattern(jsonPattern(value), 'g');
       }
     }
     this.secrets = [...text].sort((left, right) => right.length - left.length);
@@ -70,14 +86,14 @@ export class ArtifactCipher {
       }
       if (chunks.length) { input = Buffer.concat([...chunks, input.subarray(offset)]); binaryRedacted = true; }
     }
-    let value = input.toString('utf8');
+    let value = input.toString('latin1');
     const original = value;
     for (const secret of this.secrets) value = value.split(secret).join('[REDACTED]');
     for (const pattern of this.encodedPatterns) value = value.replace(pattern, '[REDACTED]');
     value = value.replace(/\bsk-or-v1-[A-Za-z0-9_-]+\b/g, '[REDACTED]')
       .replace(/(authorization["']?\s*[:=]\s*["']?Bearer\s+)[^\s"',}]+/gi, '$1[REDACTED]');
-    // Keep arbitrary raw bytes byte-identical when there was no textual redaction.
-    return { bytes: value === original ? input : Buffer.from(value), redacted: binaryRedacted || value !== original };
+    // Latin-1 is a reversible byte view, so even a changed capture preserves every unmatched byte.
+    return { bytes: value === original ? input : Buffer.from(value, 'latin1'), redacted: binaryRedacted || value !== original };
   }
   seal(bytes: Uint8Array, binding: ArtifactBinding): SealedArtifact {
     const protectedBytes = this.redact(bytes);

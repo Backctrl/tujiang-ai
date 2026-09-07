@@ -51,23 +51,37 @@ async function persistedStop(f: Context, batch: Awaited<ReturnType<typeof prepar
 
 export const integrityCases: { name: string; run: (f: Context) => Promise<void> }[] = [
   { name: 'equivalent secret encodings reject inputs and scrub captures and exports without folding ordinary text case', run: async f => {
-    const secret = `Synthetic-Codec-Secret-Łÿÿ-Case+/?-${randomUUID()}`;
+    const secret = `Synthetic-Codec-Secret-Łÿÿ🌱x-Case+/?-${randomUUID()}`;
     const raw = Buffer.from(secret); const base64 = raw.toString('base64'); const hex = raw.toString('hex');
     const percent = encodeURIComponent(secret);
+    const jsonUnicode = (value: string, partial = false) => Array.from(value, (character, i) => partial && i % 2 === 0 ? character :
+      character.split('').map(unit => `\\u${unit.charCodeAt(0).toString(16).padStart(4, '0')}`).join('')).join('');
+    const percentBytes = (value: string) => Array.from(Buffer.from(value), byte => `%${byte.toString(16).padStart(2, '0')}`).join('');
+    const percentPartial = (value: string) => Array.from(value, (character, i) => i % 2 === 0 ? character : percentBytes(character)).join('');
+    const jsonVariants = [jsonUnicode(secret), jsonUnicode(secret, true),
+      jsonUnicode(secret).replace(/\\u[a-f0-9]{4}/g, value => `\\u${value.slice(2).toUpperCase()}`)];
+    for (const value of jsonVariants) assert.equal(JSON.parse(`"${value}"`), secret);
+    for (const value of [percentBytes(secret), percentPartial(secret)]) assert.equal(decodeURIComponent(value), secret);
     assert.match(base64, /=+$/); assert.notEqual(base64.replaceAll('+', '-').replaceAll('/', '_'), base64);
     const variants = [...new Set([secret, hex.toUpperCase(), Array.from(hex, (character, i) => i % 2 ? character.toUpperCase() : character).join(''),
       base64, base64.replace(/=+$/, ''), base64.replaceAll('+', '-').replaceAll('/', '_'), raw.toString('base64url'),
       percent.replace(/%[A-F0-9]{2}/g, value => value.toLowerCase()),
-      percent.replace(/%[A-F0-9]{2}/g, value => `%${value[1]!.toLowerCase()}${value[2]}`)])];
+      percent.replace(/%[A-F0-9]{2}/g, value => `%${value[1]!.toLowerCase()}${value[2]}`),
+      percentBytes(secret), percentPartial(secret), ...jsonVariants])];
+    const partiallyEscapedBytes = Buffer.concat(Array.from(raw, (byte, i) => i % 2 ? Buffer.from([byte]) : Buffer.from(`%${byte.toString(16).padStart(2, '0')}`)));
+    const variantBytes = [...variants.map(value => Buffer.from(value)), partiallyEscapedBytes];
+    const nearMiss = `${secret.slice(0, -1)}${secret.endsWith('0') ? '1' : '0'}`;
     const ordinary = [secret.toLowerCase(), Buffer.from(secret.toLowerCase()).toString('hex'),
-      Buffer.from(secret.toLowerCase()).toString('base64url'), encodeURIComponent(secret.toLowerCase()), 'Ordinary PostgreSQL postgres text'];
+      Buffer.from(secret.toLowerCase()).toString('base64url'), encodeURIComponent(secret.toLowerCase()),
+      jsonUnicode(secret.toLowerCase()), jsonUnicode(secret.toLowerCase(), true), percentBytes(secret.toLowerCase()), percentPartial(secret.toLowerCase()),
+      nearMiss, jsonUnicode(nearMiss), jsonUnicode(nearMiss, true), percentBytes(nearMiss), percentPartial(nearMiss), 'Ordinary PostgreSQL postgres text'];
     const environmentName = 'TUJIANG_EVALUATION_CODEC_SECRET'; const prior = process.env[environmentName]; process.env[environmentName] = secret;
     const priorFetch = globalThis.fetch; let network = 0;
     globalThis.fetch = async () => { network++; throw new Error('synthetic network forbidden'); };
     try {
       const manager = managementLedger(f.db); const runner = AuthorizationLedger.forRunner(f.db, new ArtifactCipher(artifactKey));
-      for (const variant of variants) {
-        const payload = corePayload(); payload.sources[0]!.bytesBase64 = Buffer.from(`source:${variant}`).toString('base64');
+      for (const variant of variantBytes) {
+        const payload = corePayload(); payload.sources[0]!.bytesBase64 = Buffer.concat([Buffer.from('source:'), variant]).toString('base64');
         await assert.rejects(manager.createBatch(randomUUID(), payload), /SENSITIVE_INPUT_DETECTED/);
       }
       for (const registered of [hex.toUpperCase(), raw.toString('base64url')]) {
@@ -80,14 +94,25 @@ export const integrityCases: { name: string; run: (f: Context) => Promise<void> 
       assert.equal((await f.db.query('SELECT 1 FROM evaluation_artifacts')).rows.length, 0);
       const payload = corePayload(); payload.sources[0]!.bytesBase64 = Buffer.from(ordinary.join('\n')).toString('base64');
       const batch = await preparedCore(manager, payload);
-      const saved = await captured({ ...f, manager, runner }, batch, 'item-1', { echoes: variants, ordinary });
-      const reviewed = await managementLedger(f.db).readArtifactForReview(saved.artifactId);
-      for (const variant of variants) assert.equal(reviewed.bytes.includes(Buffer.from(variant)), false);
+      const attempt = await runner.reserve(batch.batchId, 'item-1', batch.plan); const owner = randomUUID();
+      await runner.beginDispatch(attempt.id, owner);
+      const unrelatedBytes = Buffer.from([0xff, 0x00, 0xfe, 0x80, 0x01]);
+      const ordinaryCapture = capture({ ordinary }).bytes;
+      const response = { ...capture(goodResponse()), bytes: Buffer.concat([
+        ...variantBytes.flatMap(value => [value, Buffer.from('\n')]), Buffer.from(ordinary.join('\n')),
+        Buffer.from('\n'), capture({ echoes: variants, ordinary }).bytes, ordinaryCapture, unrelatedBytes,
+      ]) };
+      const artifactId = await runner.recordCapture(attempt.id, owner, response);
+      const reviewed = await managementLedger(f.db).readArtifactForReview(artifactId);
+      for (const variant of variantBytes) assert.equal(reviewed.bytes.includes(variant), false);
+      for (const variant of variants) assert.equal(reviewed.bytes.includes(Buffer.from(JSON.stringify(variant).slice(1, -1))), false);
       for (const value of ordinary) assert.equal(reviewed.bytes.includes(Buffer.from(value)), true);
-      assert.equal(reviewed.redacted, true); assert.equal(reviewed.originalSha256, sha256(saved.response.bytes));
+      assert.equal(reviewed.bytes.includes(ordinaryCapture), true);
+      assert.equal(reviewed.bytes.subarray(-unrelatedBytes.length).equals(unrelatedBytes), true);
+      assert.equal(reviewed.redacted, true); assert.equal(reviewed.originalSha256, sha256(response.bytes));
       const directory = await mkdtemp(join(await realpath(tmpdir()), 'tujiang-codec-export-'));
       try {
-        const exported = await exportArtifact(managementLedger(f.db), saved.artifactId, directory);
+        const exported = await exportArtifact(managementLedger(f.db), artifactId, directory);
         const bytes = await readFile(join(directory, exported.files[0]!));
         assert.deepEqual(bytes, reviewed.bytes); assert.equal(exported.redacted, true);
       } finally { await rm(directory, { recursive: true }); }
