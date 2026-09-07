@@ -2,7 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { CONTRACT_VERSION, draftState, extractionSchema, planSchema, skillSchema, type Fact } from '../src/contracts.js';
 import { applyOutput, checkSkillInputs, createProject, failureCode, refreshConflicts } from '../src/domain.js';
-import { createFactLifecycleBinding, createLegacyFactBinding } from '../src/production-fact-sources.js';
+import { createFactLifecycleBinding, createLegacyFactBinding, createLegacyFactCandidateBinding } from '../src/production-fact-sources.js';
+import { audit } from '../src/store.js';
 
 const expectedFact = z.object({ attribute: z.string().min(1), value: z.string().min(1) }).strict();
 export const fixtureSchema = z.object({
@@ -37,12 +38,37 @@ export function projectFromFixture(fixture: Fixture) {
     const evidence = project.evidence.find(e => e.id === f.evidenceId);
     const start = evidence?.text.indexOf(f.quote) ?? -1;
     if (start < 0) throw new Error('INVALID_FIXTURE_EVIDENCE');
-    const hasConfirmation = ['confirmed', 'retracted'].includes(f.status);
-    const fact: Fact = { ...f, start, end: start + f.quote.length, locked: f.status === 'confirmed', sourceRunId: 'fixture', issueSeverity: 'none',
-      ...(hasConfirmation ? { confirmedBy: 'fixture', confirmedAt: '2000-01-01T00:00:00Z' } : {}) };
-    if (hasConfirmation) fact.legacyBinding = createLegacyFactBinding(fact, evidence!);
-    fact.lifecycleBinding = createFactLifecycleBinding(fact, 'fixture', 'Loaded bounded offline fixture',
-      f.status === 'candidate' ? null : f.status === 'retracted' ? 'confirmed' : 'candidate', '2000-01-01T00:00:00Z');
+    const targetStatus = f.status;
+    const fact: Fact = { ...f, start, end: start + f.quote.length, status: 'candidate', locked: false,
+      sourceRunId: 'fixture', issueSeverity: 'none' };
+    delete fact.confirmedBy; delete fact.confirmedAt;
+    fact.legacyCandidateBinding = createLegacyFactCandidateBinding(fact);
+    fact.lifecycleBinding = createFactLifecycleBinding(fact, 'fixture', 'Loaded bounded offline fixture', null,
+      '2000-01-01T00:00:00Z');
+    audit(project, 'fact.candidate_saved', 'fixture', { factId: fact.id, reason: 'Loaded bounded offline fixture' });
+    audit(project, 'fact.candidate', 'fixture');
+    if (targetStatus === 'confirmed' || targetStatus === 'retracted') {
+      fact.status = 'confirmed'; fact.locked = true;
+      fact.confirmedBy = 'fixture'; fact.confirmedAt = '2000-01-01T00:00:00Z';
+      fact.legacyBinding = createLegacyFactBinding(fact, evidence!);
+      fact.lifecycleBinding = createFactLifecycleBinding(fact, 'fixture', 'Loaded bounded offline confirmation',
+        'candidate', fact.confirmedAt);
+      audit(project, 'fact.confirm', 'fixture', { factId: fact.id, reason: 'Loaded bounded offline confirmation' });
+      audit(project, `fact.${fact.id}.confirm`, 'fixture');
+    }
+    if (targetStatus === 'rejected') {
+      fact.status = 'rejected';
+      fact.lifecycleBinding = createFactLifecycleBinding(fact, 'fixture', 'Loaded bounded offline rejection',
+        'candidate', '2000-01-01T00:00:00Z');
+      audit(project, 'fact.reject', 'fixture', { factId: fact.id, reason: 'Loaded bounded offline rejection' });
+      audit(project, `fact.${fact.id}.reject`, 'fixture');
+    } else if (targetStatus === 'retracted') {
+      fact.status = 'retracted'; fact.locked = false;
+      fact.lifecycleBinding = createFactLifecycleBinding(fact, 'fixture', 'Loaded bounded offline retraction',
+        'confirmed', '2000-01-01T00:00:00Z');
+      audit(project, 'fact.retract', 'fixture', { factId: fact.id, reason: 'Loaded bounded offline retraction' });
+      audit(project, `fact.${fact.id}.retract`, 'fixture');
+    }
     return fact;
   });
   if (new Set(fixture.evidence.map(e => e.id)).size !== fixture.evidence.length || new Set(fixture.facts.map(f => f.id)).size !== fixture.facts.length) throw new Error('DUPLICATE_FIXTURE_ID');

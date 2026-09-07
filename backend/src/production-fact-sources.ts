@@ -1,16 +1,17 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { writeSchema, type Evidence, type Fact } from './contracts.js';
+import { writeSchema, type Evidence, type Fact, type Project } from './contracts.js';
 import { AppError } from './errors.js';
 import { isStorageText } from './production-materials.js';
 
 export const FACT_SOURCES_CONTRACT_VERSION = 'fact-sources.2' as const;
 export const FACT_NORMALIZATION_VERSION = 'fact-normalization.1' as const;
 export const FACT_RISK_REVIEW_VERSION = 'fact-risk-review.1' as const;
-export const FACT_CANDIDATE_BINDING_VERSION = 'fact-candidate-binding.1' as const;
+export const FACT_CANDIDATE_BINDING_VERSION = 'fact-candidate-binding.2' as const;
 export const FACT_CONFIRMATION_VERSION = 'fact-confirmation.1' as const;
+export const LEGACY_FACT_CANDIDATE_BINDING_VERSION = 'legacy-fact-candidate-binding.1' as const;
 export const LEGACY_FACT_BINDING_VERSION = 'legacy-fact-binding.1' as const;
-export const FACT_LIFECYCLE_BINDING_VERSION = 'fact-lifecycle-binding.1' as const;
+export const FACT_LIFECYCLE_BINDING_VERSION = 'fact-lifecycle-binding.2' as const;
 
 const storageText = (min: number, max: number) => z.string().min(min).max(max).refine(isStorageText, 'Valid Unicode required');
 const reasonText = storageText(1, 1000).refine(value => value.trim().length > 0, 'Reason required');
@@ -126,10 +127,19 @@ export const structuredFactCompatibilitySchema = z.object({
   status: z.enum(['candidate', 'confirmed', 'rejected', 'retracted']),
   locked: z.boolean(),
   issueSeverity: z.enum(['none', 'warning', 'blocker']),
+  confirmedBy: confirmationActor.optional(),
+  confirmedAt: confirmationTimestamp.optional(),
   correctsFactId: z.string().uuid().optional(),
   createdBy: storageText(1, 1000),
   reason: reasonText,
-}).passthrough().superRefine((fact, ctx) => {
+  structured: z.unknown(),
+  lifecycleBinding: z.unknown().optional(),
+  replacementTransitions: z.unknown().optional(),
+  supersededByFactId: z.string().uuid().optional(),
+  supersededBy: confirmationActor.optional(),
+  supersededAt: confirmationTimestamp.optional(),
+  supersededReason: reasonText.optional(),
+}).strict().superRefine((fact, ctx) => {
   if (fact.end !== fact.start + fact.quote.length)
     ctx.addIssue({ code: 'custom', path: ['end'], message: 'Compatibility range must match the quote' });
 });
@@ -169,9 +179,12 @@ export interface StructuredFactSource extends StructuredSourceInput {
   review?: StructuredSourceReview;
   reconfirmations?: StructuredSourceReconfirmation[];
 }
-export type CanonicalFactValue =
-  | { kind: 'text'; value: string }
-  | { kind: 'decimal'; dimension: string; numerator: string; denominator: string };
+export const canonicalFactValueSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('text'), value: storageText(1, 1000) }).strict(),
+  z.object({ kind: z.literal('decimal'), dimension: storageText(1, 100),
+    numerator: z.string().regex(/^-?\d+$/), denominator: z.string().regex(/^[1-9]\d*$/) }).strict(),
+]);
+export type CanonicalFactValue = z.infer<typeof canonicalFactValueSchema>;
 export interface StructuredFact {
   contractVersion: typeof FACT_SOURCES_CONTRACT_VERSION;
   normalizationVersion: typeof FACT_NORMALIZATION_VERSION;
@@ -194,6 +207,7 @@ export interface StructuredFactCandidateBinding {
   contractVersion: typeof FACT_CANDIDATE_BINDING_VERSION;
   factId: string;
   createdBy: string;
+  originalSources: { sourceId: string; evidenceId: string }[];
   snapshotSha256: string;
 }
 
@@ -210,6 +224,16 @@ export interface LegacyFactBinding {
   confirmedBy: string;
   confirmedAt: string;
   evidenceSha256: string;
+  snapshotSha256: string;
+}
+export interface LegacyFactCandidateBinding {
+  contractVersion: typeof LEGACY_FACT_CANDIDATE_BINDING_VERSION;
+  factId: string;
+  createdBy: string | null;
+  originalEvidenceId: string;
+  originalQuote: string;
+  originalStart: number;
+  originalEnd: number;
   snapshotSha256: string;
 }
 export const factReplacementTransitionSchema = z.object({
@@ -232,6 +256,120 @@ export interface FactLifecycleBinding {
   reason: string;
   snapshotSha256: string;
 }
+
+const sha256Text = z.string().regex(/^[a-f0-9]{64}$/);
+const storedFactStatus = z.enum(['candidate', 'confirmed', 'rejected', 'retracted']);
+export const storedSourceReviewSchema = z.object({
+  status: z.enum(['invalidated', 'reconfirmation_required']), evidenceId: z.string().uuid(),
+  decisionId: z.string().uuid(), usageVersion: z.number().int().positive(), actor: confirmationActor,
+  at: confirmationTimestamp, reason: reasonText,
+}).strict();
+export const storedSourceReconfirmationSchema = z.object({
+  previousEvidenceId: z.string().uuid(), evidenceId: z.string().uuid(), decisionId: z.string().uuid(),
+  usageVersion: z.number().int().positive(), actor: confirmationActor, at: confirmationTimestamp, reason: reasonText,
+}).strict();
+export const storedStructuredFactSourceSchema = structuredSourceInputSchema.safeExtend({
+  contentSha256: sha256Text,
+  rawValue: storageText(1, 10_000),
+  rawUnit: factUnitSchema.nullable(),
+  review: storedSourceReviewSchema.optional(),
+  reconfirmations: z.array(storedSourceReconfirmationSchema).max(1000).optional(),
+}).strict();
+const legacyCandidateBindingSchema = z.object({
+  contractVersion: z.literal(LEGACY_FACT_CANDIDATE_BINDING_VERSION), factId: z.string().uuid(),
+  createdBy: confirmationActor.nullable(), originalEvidenceId: z.string().uuid(),
+  originalQuote: storageText(1, 2000), originalStart: z.number().int().nonnegative(),
+  originalEnd: z.number().int().positive(), snapshotSha256: sha256Text,
+}).strict().superRefine((binding, ctx) => {
+  if (binding.originalEnd !== binding.originalStart + binding.originalQuote.length)
+    ctx.addIssue({ code: 'custom', path: ['originalEnd'], message: 'Original legacy range must match the quote' });
+});
+const legacyBindingSchema = z.object({
+  contractVersion: z.literal(LEGACY_FACT_BINDING_VERSION), factId: z.string().uuid(), confirmedBy: confirmationActor,
+  confirmedAt: confirmationTimestamp, evidenceSha256: sha256Text, snapshotSha256: sha256Text,
+}).strict();
+const lifecycleBindingSchema = z.object({
+  contractVersion: z.literal(FACT_LIFECYCLE_BINDING_VERSION), factId: z.string().uuid(), transitionId: z.string().uuid(),
+  previousStatus: storedFactStatus.nullable(), status: storedFactStatus, actor: confirmationActor,
+  at: confirmationTimestamp, reason: reasonText, snapshotSha256: sha256Text,
+}).strict();
+const structuredCandidateBindingSchema = z.object({
+  contractVersion: z.literal(FACT_CANDIDATE_BINDING_VERSION), factId: z.string().uuid(),
+  createdBy: confirmationActor,
+  originalSources: z.array(z.object({ sourceId: z.string().uuid(), evidenceId: z.string().uuid() }).strict()).min(1).max(10),
+  snapshotSha256: sha256Text,
+}).strict().superRefine((binding, ctx) => {
+  const sourceIds = binding.originalSources.map(source => source.sourceId);
+  if (new Set(sourceIds).size !== sourceIds.length)
+    ctx.addIssue({ code: 'custom', path: ['originalSources'], message: 'Original source IDs must be unique' });
+});
+const structuredConfirmationSchema = z.object({
+  contractVersion: z.literal(FACT_CONFIRMATION_VERSION), factId: z.string().uuid(), confirmedBy: confirmationActor,
+  confirmedAt: confirmationTimestamp, snapshotSha256: sha256Text,
+}).strict();
+const structuredCandidateBindingV1Schema = z.object({
+  contractVersion: z.literal('fact-candidate-binding.1'), factId: z.string().uuid(),
+  createdBy: confirmationActor, snapshotSha256: sha256Text,
+}).strict();
+const storedProposedFactRiskSchema = factRiskSchema.safeExtend({ origin: z.literal('proposed') }).strict();
+const storedDerivedFactRiskSchema = factRiskSchema.safeExtend({ origin: z.literal('derived') }).strict();
+const storedRiskReviewSchema = structuredRiskReviewInputSchema.safeExtend({
+  contractVersion: z.literal(FACT_RISK_REVIEW_VERSION),
+  acknowledgedRiskIds: z.array(z.string().uuid()).max(200),
+  reviewer: confirmationActor,
+  reviewedAt: confirmationTimestamp,
+}).strict();
+export const storedStructuredFactSchema = z.object({
+  contractVersion: z.literal(FACT_SOURCES_CONTRACT_VERSION),
+  normalizationVersion: z.literal(FACT_NORMALIZATION_VERSION),
+  normalizedValue: normalizedFactValueSchema,
+  canonicalValue: canonicalFactValueSchema,
+  sources: z.array(storedStructuredFactSourceSchema).min(1).max(10),
+  applicability: applicabilitySchema,
+  proposedRisks: z.array(storedProposedFactRiskSchema).max(100),
+  derivedRisks: z.array(storedDerivedFactRiskSchema).max(100),
+  riskPolicy: z.object({
+    automaticSemanticRiskDetection: z.literal('not_performed'),
+    manualReviewResponsibilities: z.tuple([
+      z.literal('certification'), z.literal('efficacy'), z.literal('safety'), z.literal('scope'), z.literal('other'),
+    ]),
+  }).strict(),
+  riskReview: storedRiskReviewSchema.optional(),
+  // V1 remains traversable so an obsolete Fact can still be quarantined when its material source is withdrawn.
+  // Current integrity and all downstream use continue to require the V2 binding checked above.
+  candidateBinding: z.union([structuredCandidateBindingSchema, structuredCandidateBindingV1Schema]),
+  confirmation: structuredConfirmationSchema.optional(),
+}).strict().superRefine((structured, ctx) => {
+  const sourceIds = structured.sources.map(source => source.id);
+  if (new Set(sourceIds).size !== sourceIds.length)
+    ctx.addIssue({ code: 'custom', path: ['sources'], message: 'Stored source IDs must be unique' });
+  const sourceRanges = structured.sources.map(source => `${source.evidenceId}:${source.start}:${source.end}`);
+  if (new Set(sourceRanges).size !== sourceRanges.length)
+    ctx.addIssue({ code: 'custom', path: ['sources'], message: 'Stored evidence ranges must be unique' });
+});
+export const legacyFactCompatibilitySchema = z.object({
+  id: z.string().uuid(),
+  attribute: storageText(1, 100).refine(value => value.trim().length > 0, 'Attribute required'),
+  role: z.enum(['core', 'supporting']),
+  value: storageText(1, 1000).refine(value => value.trim().length > 0, 'Value required'),
+  evidenceId: z.string().uuid(), quote: storageText(1, 2000),
+  start: z.number().int().nonnegative(), end: z.number().int().positive(), sourceRunId: storageText(1, 1000),
+  status: storedFactStatus, locked: z.boolean(), issueSeverity: z.enum(['none', 'warning', 'blocker']),
+  confirmedBy: confirmationActor.optional(), confirmedAt: confirmationTimestamp.optional(),
+  correctsFactId: z.string().uuid().optional(), createdBy: confirmationActor.optional(), reason: reasonText.optional(),
+  sourceReview: storedSourceReviewSchema.optional(),
+  sourceReconfirmations: z.array(storedSourceReconfirmationSchema).max(1000).optional(),
+  legacyCandidateBinding: legacyCandidateBindingSchema.optional(),
+  legacyBinding: legacyBindingSchema.optional(), lifecycleBinding: lifecycleBindingSchema.optional(),
+  replacementTransitions: z.array(factReplacementTransitionSchema).max(1000).optional(),
+  supersededByFactId: z.string().uuid().optional(), supersededBy: confirmationActor.optional(),
+  supersededAt: confirmationTimestamp.optional(), supersededReason: reasonText.optional(),
+}).strict().superRefine((fact, ctx) => {
+  if (fact.end !== fact.start + fact.quote.length)
+    ctx.addIssue({ code: 'custom', path: ['end'], message: 'Legacy range must match the quote' });
+  if ((fact.createdBy === undefined) !== (fact.reason === undefined))
+    ctx.addIssue({ code: 'custom', path: ['createdBy'], message: 'Legacy candidate attribution must be complete' });
+});
 
 interface UnitDefinition { dimension: string; numerator: bigint; denominator: bigint }
 const units: Record<FactUnit, UnitDefinition> = {
@@ -362,15 +500,24 @@ export type DecimalValueSpanIssue = 'numeric_boundary' | 'unit_omission';
 const numericGroupingSeparator = "[,︐﹐٬٫'’]";
 const numericGroupingSpace = '[ \\t\\u00a0\\u2007\\u2009\\u202f]';
 const numericSign = '[+\\-−]';
-const numericRatioSeparator = '[/⁄∕]';
-const numericJoinOperator = '[/⁄∕·⋅*×]';
+const numericRatioSeparator = '[/⁄∕:：]';
+const numericJoinOperator = '[/⁄∕·⋅∙*×]';
 const numericRangeOrQualifier = '[+\\-−–—~〜±<>≤≥≦≧≈≃^×*]';
 const currencyOrDegree = '[$€£¥₽₹₩°℃℉]';
+const defaultIgnorable = '[\\p{Default_Ignorable_Code_Point}\\p{Cf}]';
+const unitToken = `(?:${unitAliasPattern})(?!\\p{Script=Latin})`;
 export function decimalValueSpanIssue(text: string, start: number, end: number,
   rawUnit: FactUnit | null): DecimalValueSpanIssue | undefined {
   // Normalize only bounded context. Persisted spans remain exact UTF-16 offsets into the original Evidence.
-  const before = text.slice(Math.max(0, start - 64), start).normalize('NFKC');
-  const after = text.slice(end, Math.min(text.length, end + 64)).normalize('NFKC');
+  const rawBefore = text.slice(Math.max(0, start - 64), start);
+  const rawAfter = text.slice(end, Math.min(text.length, end + 64));
+  // Format/default-ignorable code points and variation selectors cannot split one numeric token invisibly.
+  if (new RegExp(`${defaultIgnorable}\\s*$`, 'u').test(rawBefore)
+    || new RegExp(`^\\s*${defaultIgnorable}`, 'u').test(rawAfter)) return 'numeric_boundary';
+  // A Unicode mark belongs to the adjacent grapheme. A persisted numeric span cannot cut through that grapheme.
+  if (/\p{M}\s*$/u.test(rawBefore) || /^\s*\p{M}/u.test(rawAfter)) return 'numeric_boundary';
+  const before = rawBefore.normalize('NFKC');
+  const after = rawAfter.normalize('NFKC');
   const splitBefore = new RegExp(`(?:[%‰‱.\\p{N}]|\\p{Script=Latin}|${numericRangeOrQualifier}|${currencyOrDegree})$`, 'u').test(before)
     || new RegExp(`\\p{N}(?:${numericGroupingSeparator}|${numericGroupingSpace})$`, 'u').test(before)
     || new RegExp(`\\p{N}[eE]${numericSign}?$`, 'u').test(before)
@@ -379,12 +526,18 @@ export function decimalValueSpanIssue(text: string, start: number, end: number,
     || new RegExp(`(?:${unitAliasPattern})\\s*$`, 'u').test(before)
     || /(?:约|近|大约|约为|至少|至多|最多|最少|不超过|不低于|不大于|不小于|大于|小于)\s*$/u.test(before)
     || new RegExp(`(?:${numericRangeOrQualifier}|${currencyOrDegree})\\s*$`, 'u').test(before);
+  const unknownCompositeUnit = rawUnit === null
+    // Keep a spaced editorial delimiter such as "10 / note" valid, but reject compact unit syntax such as "10 /box".
+    ? new RegExp(`^\\s*(?:${numericJoinOperator})\\p{L}`, 'u').test(after)
+    : new RegExp(`^\\s*(?:${numericJoinOperator})\\s*\\p{L}`, 'u').test(after);
   const splitAfter = /^\p{N}/u.test(after) || /^\.\p{N}/u.test(after)
     || new RegExp(`^(?:${numericGroupingSeparator}${numericGroupingSpace}*|${numericGroupingSpace}+)\\p{N}`, 'u').test(after)
     || new RegExp(`^[eE]${numericSign}?\\p{N}`, 'u').test(after)
     || new RegExp(`^\\s*${numericRatioSeparator}\\s*\\p{N}`, 'u').test(after)
     || new RegExp(`^\\s*${numericRangeOrQualifier}`, 'u').test(after)
-    || (rawUnit !== null && new RegExp(`^\\s*${numericJoinOperator}\\s*(?:${unitAliasPattern}|\\p{L}|\\p{N})`, 'u').test(after));
+    || new RegExp(`^\\s*${numericJoinOperator}\\s*(?:${unitToken}|\\p{N})`, 'u').test(after)
+    || unknownCompositeUnit
+    || (rawUnit !== null && new RegExp(`^\\s*(?:[;；,:，]\\s*)?(?:per\\s+\\p{L}|每\\s*\\p{L})`, 'iu').test(after));
   if (splitBefore || splitAfter) return 'numeric_boundary';
   if (rawUnit === null && (new RegExp(`^\\s*(?:(?:[\\)\\]】]\\s*)?(?:[\\(\\[【]\\s*)?(?:${unitAliasPattern}|[%‰‱])|${currencyOrDegree}\\s*\\p{L}?)`, 'u').test(after)
     || /^\p{L}/u.test(after) || /^\s+\p{L}/u.test(after)))
@@ -495,6 +648,9 @@ function candidateSemanticSnapshot(fact: Fact) {
       riskReview: undefined, candidateBinding: undefined, confirmation: undefined },
   };
 }
+function candidateBindingSnapshot(fact: Fact, originalSources: StructuredFactCandidateBinding['originalSources']) {
+  return { ...candidateSemanticSnapshot(fact), originalSources };
+}
 function confirmedSemanticSnapshot(fact: Fact) {
   const structured = fact.structured!;
   return { ...candidateSemanticSnapshot(fact),
@@ -506,10 +662,19 @@ function confirmedSemanticSnapshot(fact: Fact) {
 function sha256(value: unknown): string {
   return createHash('sha256').update(canonical(value), 'utf8').digest('hex');
 }
-const lifecycleStatusSchema = z.enum(['candidate', 'confirmed', 'rejected', 'retracted']);
 function lifecycleSnapshot(fact: Fact) {
   return {
     factId: fact.id,
+    attribute: fact.attribute,
+    role: fact.role,
+    value: fact.value,
+    evidenceId: fact.evidenceId,
+    quote: fact.quote,
+    start: fact.start,
+    end: fact.end,
+    sourceRunId: fact.sourceRunId,
+    createdBy: fact.createdBy ?? null,
+    reason: fact.reason ?? null,
     status: fact.status,
     locked: fact.locked,
     confirmedBy: fact.confirmedBy ?? null,
@@ -522,6 +687,10 @@ function lifecycleSnapshot(fact: Fact) {
     replacementTransitions: fact.replacementTransitions ?? [],
     sourceReview: fact.sourceReview ?? null,
     sourceReconfirmations: fact.sourceReconfirmations ?? [],
+    legacyCandidateBinding: fact.legacyCandidateBinding ?? null,
+    legacyBinding: fact.legacyBinding ?? null,
+    structuredCandidateBinding: fact.structured?.candidateBinding ?? null,
+    structuredConfirmation: fact.structured?.confirmation ?? null,
     structuredSources: fact.structured?.sources.map(source => ({ id: source.id, evidenceId: source.evidenceId,
       review: source.review ?? null, reconfirmations: source.reconfirmations ?? [] })) ?? [],
   };
@@ -538,8 +707,16 @@ function lifecycleBindingDigest(fact: Fact, binding: Pick<FactLifecycleBinding,
   return sha256({ lifecycle: lifecycleSnapshot(fact), binding: metadata });
 }
 export function createFactLifecycleBinding(fact: Fact, actor: string, reason: string,
-  previousStatus: Fact['status'] | null, at = new Date().toISOString()): FactLifecycleBinding {
-  if (!confirmationActor.safeParse(actor).success || !reasonText.safeParse(reason).success
+  previousStatus: Fact['status'] | null, at = new Date().toISOString(), allowInvalidPriorForQuarantine = false): FactLifecycleBinding {
+  const prior = lifecycleBindingSchema.safeParse(fact.lifecycleBinding);
+  const transitionStartsFromPersistedState = previousStatus === null
+    ? fact.lifecycleBinding === undefined
+    : prior.success && prior.data.factId === fact.id && prior.data.status === previousStatus
+      || allowInvalidPriorForQuarantine
+        && (previousStatus === 'candidate' && fact.status === 'rejected'
+          || previousStatus === 'confirmed' && fact.status === 'retracted');
+  if (!transitionStartsFromPersistedState
+    || !confirmationActor.safeParse(actor).success || !reasonText.safeParse(reason).success
     || !confirmationTimestamp.safeParse(at).success || !lifecycleTransitionAllowed(previousStatus, fact.status)
     || (previousStatus === 'candidate' && fact.status === 'confirmed'
       && (actor !== fact.confirmedBy || at !== fact.confirmedAt)))
@@ -549,56 +726,208 @@ export function createFactLifecycleBinding(fact: Fact, actor: string, reason: st
     snapshotSha256: lifecycleBindingDigest(fact, metadata) };
 }
 export function factLifecycleBindingIsValid(fact: Fact): boolean {
-  const binding = fact.lifecycleBinding;
-  return !!binding && binding.contractVersion === FACT_LIFECYCLE_BINDING_VERSION && binding.factId === fact.id
-    && z.string().uuid().safeParse(binding.transitionId).success && lifecycleStatusSchema.nullable().safeParse(binding.previousStatus).success
-    && lifecycleStatusSchema.safeParse(binding.status).success && binding.status === fact.status
-    && confirmationActor.safeParse(binding.actor).success && confirmationTimestamp.safeParse(binding.at).success
-    && reasonText.safeParse(binding.reason).success && lifecycleTransitionAllowed(binding.previousStatus, binding.status)
-    && (binding.previousStatus !== 'candidate' || binding.status !== 'confirmed'
-      || (binding.actor === fact.confirmedBy && binding.at === fact.confirmedAt))
-    && binding.snapshotSha256 === lifecycleBindingDigest(fact, binding);
+  const parsed = lifecycleBindingSchema.safeParse(fact.lifecycleBinding);
+  if (!parsed.success) return false;
+  const binding = parsed.data;
+  try {
+    const lifecycleMetadata = {
+      transitionId: binding.transitionId,
+      previousStatus: binding.previousStatus ?? null,
+      status: binding.status,
+      actor: binding.actor,
+      at: binding.at,
+      reason: binding.reason,
+    };
+    return binding.factId === fact.id && binding.status === fact.status
+      && lifecycleTransitionAllowed(binding.previousStatus, binding.status)
+      && (binding.previousStatus !== 'candidate' || binding.status !== 'confirmed'
+        || (binding.actor === fact.confirmedBy && binding.at === fact.confirmedAt))
+      && binding.snapshotSha256 === lifecycleBindingDigest(fact, lifecycleMetadata);
+  } catch { return false; }
+}
+export function factLifecycleAuditIsValid(project: Pick<Project, 'audit' | 'revision'>, fact: Fact): boolean {
+  if (!Number.isInteger(project.revision) || project.revision < 1 || !Array.isArray(project.audit)) return false;
+  if (!project.audit.every(entry => entry && typeof entry === 'object' && typeof entry.id === 'string'
+    && Number.isInteger(entry.projectVersion) && entry.projectVersion >= 1
+    && Number.isInteger(entry.revision) && entry.revision >= 1 && entry.revision <= project.revision
+    && typeof entry.type === 'string' && entry.type.length > 0
+    && typeof entry.actor === 'string' && entry.actor.length > 0
+    && typeof entry.at === 'string' && entry.at.length > 0
+    && entry.data && typeof entry.data === 'object' && !Array.isArray(entry.data))) return false;
+  if (new Set(project.audit.map(entry => entry.id)).size !== project.audit.length) return false;
+
+  // Every persisted revision writes at least one audit entry. The current revision may be temporarily absent while a
+  // Store command is still executing, before its operation audit is appended.
+  const revisions = [...new Set(project.audit.map(entry => entry.revision))].sort((a, b) => a - b);
+  const completeThrough = revisions.at(-1) === project.revision ? project.revision : project.revision - 1;
+  if (revisions.length !== completeThrough || revisions.some((revision, index) => revision !== index + 1)) return false;
+
+  const terminal = (innerTypes: readonly string[], outerType: string) => {
+    const inner = project.audit.filter(entry => innerTypes.includes(entry.type) && entry.data.factId === fact.id);
+    const outer = project.audit.filter(entry => entry.type === outerType);
+    if (inner.length > 1 || outer.length > 1) return { valid: false, occurred: false };
+    if (!inner.length && !outer.length) return { valid: true, occurred: false };
+    if (inner.length === 1 && outer.length === 1) return {
+      valid: inner[0]!.revision === outer[0]!.revision && inner[0]!.actor === outer[0]!.actor,
+      occurred: true,
+    };
+    const pendingInner = inner[0];
+    return { valid: !!pendingInner && !outer.length && pendingInner === project.audit.at(-1)
+      && pendingInner.revision === project.revision, occurred: true };
+  };
+  const legacyConfirmation = terminal(['fact.confirm'], `fact.${fact.id}.confirm`);
+  const structuredConfirmation = terminal(['fact.structured_confirmed', 'fact.structured_replaced'],
+    `fact.${fact.id}.structured.confirm`);
+  const rejection = terminal(['fact.reject'], `fact.${fact.id}.reject`);
+  const retraction = terminal(['fact.retract'], `fact.${fact.id}.retract`);
+  if (![legacyConfirmation, structuredConfirmation, rejection, retraction].every(item => item.valid)
+    || (legacyConfirmation.occurred && structuredConfirmation.occurred)) return false;
+  const wasConfirmed = legacyConfirmation.occurred || structuredConfirmation.occurred;
+  if (fact.status === 'candidate') return !wasConfirmed && !rejection.occurred && !retraction.occurred;
+  if (fact.status === 'confirmed') return wasConfirmed && !rejection.occurred && !retraction.occurred;
+  if (fact.status === 'rejected') return !wasConfirmed && rejection.occurred && !retraction.occurred;
+  return wasConfirmed && !rejection.occurred && retraction.occurred;
 }
 export function createStructuredFactCandidateBinding(fact: Fact): StructuredFactCandidateBinding {
-  if (!fact.structured || !fact.createdBy) throw new AppError('INVALID_FACT_CANDIDATE', 409);
-  return { contractVersion: FACT_CANDIDATE_BINDING_VERSION, factId: fact.id, createdBy: fact.createdBy,
-    snapshotSha256: sha256(candidateSemanticSnapshot(fact)) };
+  if (!fact.structured || !fact.createdBy || fact.status !== 'candidate' || fact.locked
+    || fact.confirmedBy !== undefined || fact.confirmedAt !== undefined
+    || fact.structured.riskReview !== undefined || fact.structured.confirmation !== undefined
+    || fact.structured.sources.some(source => source.review !== undefined || source.reconfirmations !== undefined))
+    throw new AppError('INVALID_FACT_CANDIDATE', 409);
+  const originalSources = fact.structured.sources.map(source => ({ sourceId: source.id, evidenceId: source.evidenceId }));
+  return { contractVersion: FACT_CANDIDATE_BINDING_VERSION, factId: fact.id, createdBy: fact.createdBy, originalSources,
+    snapshotSha256: sha256(candidateBindingSnapshot(fact, originalSources)) };
 }
-export function structuredFactCandidateBindingIsValid(fact: Fact): boolean {
-  const binding = fact.structured?.candidateBinding;
-  return !!binding && binding.contractVersion === FACT_CANDIDATE_BINDING_VERSION && binding.factId === fact.id
-    && binding.createdBy === fact.createdBy && binding.snapshotSha256 === sha256(candidateSemanticSnapshot(fact));
+function evidenceReconfirmationChainIsValid(currentEvidenceId: string, originalEvidenceId: string,
+  history: unknown, evidences: readonly Evidence[], evidenceMatches?: (evidence: Evidence) => boolean): boolean {
+  if (!Array.isArray(history)) return false;
+  let cursor = originalEvidenceId; const seen = new Set([cursor]);
+  let previousEvidence = evidences.find(evidence => evidence.id === cursor);
+  if (!previousEvidence || (evidenceMatches && !evidenceMatches(previousEvidence))) return false;
+  for (const item of history) {
+    const parsed = storedSourceReconfirmationSchema.safeParse(item);
+    if (!parsed.success || parsed.data.previousEvidenceId !== cursor || seen.has(parsed.data.evidenceId)) return false;
+    const nextEvidence = evidences.find(evidence => evidence.id === parsed.data.evidenceId);
+    const previousSource = previousEvidence.materialSource; const nextSource = nextEvidence?.materialSource;
+    if (!nextEvidence || !previousSource || !nextSource
+      || previousSource.materialId !== nextSource.materialId || previousSource.blockId !== nextSource.blockId
+      || previousSource.sourceSha256 !== nextSource.sourceSha256
+      || parsed.data.decisionId !== nextSource.usageDecisionId || parsed.data.usageVersion !== nextSource.usageVersion
+      || (evidenceMatches && !evidenceMatches(nextEvidence)))
+      return false;
+    cursor = parsed.data.evidenceId; seen.add(cursor);
+    previousEvidence = nextEvidence;
+  }
+  return cursor === currentEvidenceId;
+}
+function structuredSourceEvidenceChainIsValid(source: StructuredFactSource, originalEvidenceId: string,
+  evidences: readonly Evidence[]): boolean {
+  return evidenceReconfirmationChainIsValid(source.evidenceId, originalEvidenceId,
+    source.reconfirmations ?? [], evidences, evidence => {
+      try { return structuredSourceMatchesEvidence({ ...source, evidenceId: evidence.id }, evidence); }
+      catch { return false; }
+    });
+}
+export function structuredFactCandidateBindingIsValid(fact: Fact, evidences: readonly Evidence[]): boolean {
+  if (!fact.structured) return false;
+  const parsed = structuredCandidateBindingSchema.safeParse(fact.structured.candidateBinding);
+  if (!parsed.success) return false;
+  const binding = parsed.data;
+  if (binding.factId !== fact.id || binding.createdBy !== fact.createdBy
+    || binding.originalSources.length !== fact.structured.sources.length
+    || binding.snapshotSha256 !== sha256(candidateBindingSnapshot(fact, binding.originalSources))) return false;
+  return fact.structured.sources.every((source, index) => {
+    const original = binding.originalSources[index];
+    return !!original && original.sourceId === source.id
+      && structuredSourceEvidenceChainIsValid(source, original.evidenceId, evidences);
+  });
 }
 export function createStructuredFactConfirmation(fact: Fact): StructuredFactConfirmation {
   if (!fact.structured || !fact.confirmedBy || !fact.confirmedAt) throw new AppError('INVALID_FACT_CONFIRMATION', 409);
   return { contractVersion: FACT_CONFIRMATION_VERSION, factId: fact.id, confirmedBy: fact.confirmedBy,
     confirmedAt: fact.confirmedAt, snapshotSha256: sha256(confirmedSemanticSnapshot(fact)) };
 }
-export function structuredFactConfirmationIsValid(fact: Fact): boolean {
-  const binding = fact.structured?.confirmation;
-  return !!binding && binding.contractVersion === FACT_CONFIRMATION_VERSION && binding.factId === fact.id
-    && binding.confirmedBy === fact.confirmedBy && binding.confirmedAt === fact.confirmedAt
+export function structuredFactConfirmationIsValid(fact: Fact, evidences: readonly Evidence[]): boolean {
+  if (!fact.structured || !structuredFactCandidateBindingIsValid(fact, evidences)) return false;
+  const parsed = structuredConfirmationSchema.safeParse(fact.structured.confirmation);
+  if (!parsed.success) return false;
+  const binding = parsed.data;
+  return binding.factId === fact.id && binding.confirmedBy === fact.confirmedBy && binding.confirmedAt === fact.confirmedAt
     && binding.snapshotSha256 === sha256(confirmedSemanticSnapshot(fact));
 }
-function legacySnapshot(fact: Fact) {
+const legacyCandidateSnapshotSchema = z.object({
+  id: z.string().uuid(), attribute: storageText(1, 100), role: z.enum(['core', 'supporting']),
+  value: storageText(1, 1000), evidenceId: z.string().uuid(), quote: storageText(1, 2000),
+  start: z.number().int().nonnegative(), end: z.number().int().positive(), sourceRunId: storageText(1, 1000),
+  createdBy: confirmationActor.nullable(), reason: reasonText.nullable(), correctsFactId: z.string().uuid().nullable(),
+  initialStatus: z.literal('candidate'), initialLocked: z.literal(false),
+}).strict().superRefine((snapshot, ctx) => {
+  if (snapshot.end !== snapshot.start + snapshot.quote.length)
+    ctx.addIssue({ code: 'custom', path: ['end'], message: 'Legacy candidate range must match the quote' });
+  if ((snapshot.createdBy === null) !== (snapshot.reason === null))
+    ctx.addIssue({ code: 'custom', path: ['createdBy'], message: 'Legacy candidate attribution must be complete' });
+});
+function legacyCandidateSnapshot(fact: Fact, original: {
+  evidenceId: string; quote: string; start: number; end: number;
+}) {
+  return { id: fact.id, attribute: fact.attribute, role: fact.role, value: fact.value, evidenceId: original.evidenceId,
+    quote: original.quote, start: original.start, end: original.end, sourceRunId: fact.sourceRunId,
+    createdBy: fact.createdBy ?? null, reason: fact.reason ?? null, correctsFactId: fact.correctsFactId ?? null,
+    initialStatus: 'candidate' as const, initialLocked: false as const };
+}
+export function createLegacyFactCandidateBinding(fact: Fact): LegacyFactCandidateBinding {
+  const original = { evidenceId: fact.evidenceId, quote: fact.quote, start: fact.start, end: fact.end };
+  const snapshot = legacyCandidateSnapshot(fact, original);
+  if (fact.structured || fact.status !== 'candidate' || fact.locked || !legacyCandidateSnapshotSchema.safeParse(snapshot).success)
+    throw new AppError('INVALID_LEGACY_FACT_CANDIDATE', 409);
+  return { contractVersion: LEGACY_FACT_CANDIDATE_BINDING_VERSION, factId: fact.id,
+    createdBy: fact.createdBy ?? null, originalEvidenceId: original.evidenceId, originalQuote: original.quote,
+    originalStart: original.start, originalEnd: original.end, snapshotSha256: sha256(snapshot) };
+}
+export function legacyFactCandidateBindingIsValid(fact: Fact, evidences: readonly Evidence[]): boolean {
+  const parsed = legacyCandidateBindingSchema.safeParse(fact.legacyCandidateBinding);
+  if (!parsed.success) return false;
+  const binding = parsed.data;
+  const original = { evidenceId: binding.originalEvidenceId, quote: binding.originalQuote,
+    start: binding.originalStart, end: binding.originalEnd };
+  const snapshot = legacyCandidateSnapshot(fact, original);
+  const wasReconfirmed = fact.evidenceId !== binding.originalEvidenceId;
+  return binding.factId === fact.id && binding.createdBy === (fact.createdBy ?? null)
+    && fact.quote === binding.originalQuote
+    && (wasReconfirmed || (fact.start === binding.originalStart && fact.end === binding.originalEnd))
+    && legacyCandidateSnapshotSchema.safeParse(snapshot).success
+    && binding.snapshotSha256 === sha256(snapshot)
+    && evidenceReconfirmationChainIsValid(fact.evidenceId, binding.originalEvidenceId,
+      fact.sourceReconfirmations ?? [], evidences);
+}
+function legacySnapshot(fact: Fact, original: { quote: string; start: number; end: number }) {
   return { id: fact.id, attribute: fact.attribute, role: fact.role, value: fact.value,
-    quote: fact.quote, start: fact.start, end: fact.end, sourceRunId: fact.sourceRunId,
+    quote: original.quote, start: original.start, end: original.end, sourceRunId: fact.sourceRunId,
     correctsFactId: fact.correctsFactId ?? null };
 }
 export function createLegacyFactBinding(fact: Fact, evidence: Evidence): LegacyFactBinding {
+  const candidateBinding = legacyCandidateBindingSchema.safeParse(fact.legacyCandidateBinding);
   if (!confirmationActor.safeParse(fact.confirmedBy).success || !confirmationTimestamp.safeParse(fact.confirmedAt).success)
     throw new AppError('INVALID_FACT_CONFIRMATION', 409);
+  if (!candidateBinding.success || evidence.id !== candidateBinding.data.originalEvidenceId
+    || !legacyFactCandidateBindingIsValid(fact, [evidence])) throw new AppError('INVALID_LEGACY_FACT_CANDIDATE', 409);
+  const original = { quote: candidateBinding.data.originalQuote, start: candidateBinding.data.originalStart,
+    end: candidateBinding.data.originalEnd };
   const evidenceSha256 = createHash('sha256').update(evidence.text, 'utf8').digest('hex');
   return { contractVersion: LEGACY_FACT_BINDING_VERSION, factId: fact.id, confirmedBy: fact.confirmedBy!,
-    confirmedAt: fact.confirmedAt!, evidenceSha256, snapshotSha256: sha256(legacySnapshot(fact)) };
+    confirmedAt: fact.confirmedAt!, evidenceSha256, snapshotSha256: sha256(legacySnapshot(fact, original)) };
 }
 export function legacyFactBindingIsValid(fact: Fact, evidence: Evidence): boolean {
   const binding = fact.legacyBinding;
+  const candidateBinding = legacyCandidateBindingSchema.safeParse(fact.legacyCandidateBinding);
+  if (!candidateBinding.success || evidence.id !== candidateBinding.data.originalEvidenceId) return false;
+  const original = { quote: candidateBinding.data.originalQuote, start: candidateBinding.data.originalStart,
+    end: candidateBinding.data.originalEnd };
   const evidenceSha256 = createHash('sha256').update(evidence.text, 'utf8').digest('hex');
   return confirmationActor.safeParse(fact.confirmedBy).success && confirmationTimestamp.safeParse(fact.confirmedAt).success
     && !!binding && confirmationActor.safeParse(binding.confirmedBy).success
     && confirmationTimestamp.safeParse(binding.confirmedAt).success
     && binding.contractVersion === LEGACY_FACT_BINDING_VERSION && binding.factId === fact.id
     && binding.confirmedBy === fact.confirmedBy && binding.confirmedAt === fact.confirmedAt
-    && binding.evidenceSha256 === evidenceSha256 && binding.snapshotSha256 === sha256(legacySnapshot(fact));
+    && binding.evidenceSha256 === evidenceSha256 && binding.snapshotSha256 === sha256(legacySnapshot(fact, original));
 }

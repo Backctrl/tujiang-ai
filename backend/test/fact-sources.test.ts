@@ -1,17 +1,18 @@
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { fixture, command } from './helpers.js';
 import type { Evidence, Fact, Project, Section, Storyboard } from '../src/contracts.js';
 import { availableConfirmedFacts, evaluateFactEligibility, factGovernanceHasBlockingIssue, factIntegrityIsValid,
-  factIntegrityReason, skillInput,
+  factIntegrityReason, projectActiveFactIntegrityIsValid, skillInput,
   type FactIntegrityReason } from '../src/material-source-gates.js';
 import { checkSkillInputs, preflight } from '../src/domain.js';
 import { createFactLifecycleBinding, createLegacyFactBinding, createStructuredFactCandidateBinding,
-  createStructuredFactConfirmation, FACT_RISK_KINDS,
+  createStructuredFactConfirmation, factLifecycleBindingIsValid, FACT_RISK_KINDS,
   type FactRisk, type NormalizedFactValue } from '../src/production-fact-sources.js';
 import { IngestionWorker } from '../src/ingestion-worker.js';
 import { Worker } from '../src/worker.js';
+import { audit } from '../src/store.js';
 
 let f: Awaited<ReturnType<typeof fixture>>;
 before(async () => { f = await fixture(); });
@@ -70,6 +71,29 @@ async function confirm(p: Project, fact: Fact, extra: Record<string, unknown> = 
 async function details(p: Project, fact: Fact) {
   const response = await f.app.inject({ url: `/api/projects/${p.id}/facts/${fact.id}/details`, headers: f.headers });
   assert.equal(response.statusCode, 200, response.body); return response.json<Record<string, unknown>>();
+}
+function recreateStructuredProofForPersistedFixture(fact: Fact) {
+  assert.ok(fact.structured && fact.status === 'confirmed' && fact.locked && fact.confirmedBy && fact.confirmedAt
+    && fact.structured.riskReview);
+  const confirmedBy = fact.confirmedBy; const confirmedAt = fact.confirmedAt;
+  const riskReview = structuredClone(fact.structured.riskReview);
+  const sourceState = fact.structured.sources.map(source => ({
+    review: source.review === undefined ? undefined : structuredClone(source.review),
+    reconfirmations: source.reconfirmations === undefined ? undefined : structuredClone(source.reconfirmations),
+  }));
+  fact.status = 'candidate'; fact.locked = false;
+  delete fact.confirmedBy; delete fact.confirmedAt;
+  delete fact.structured.riskReview; delete fact.structured.confirmation;
+  for (const source of fact.structured.sources) { delete source.review; delete source.reconfirmations; }
+  fact.structured.candidateBinding = createStructuredFactCandidateBinding(fact);
+  fact.status = 'confirmed'; fact.locked = true; fact.confirmedBy = confirmedBy; fact.confirmedAt = confirmedAt;
+  fact.structured.sources.forEach((source, index) => {
+    const saved = sourceState[index]!;
+    if (saved.review !== undefined) source.review = saved.review;
+    if (saved.reconfirmations !== undefined) source.reconfirmations = saved.reconfirmations;
+  });
+  fact.structured.riskReview = riskReview;
+  fact.structured.confirmation = createStructuredFactConfirmation(fact);
 }
 
 test('structured risk governance derives numeric risk and requires all six server-recorded review categories', async () => {
@@ -301,6 +325,8 @@ test('replacement transitions are reciprocal, project-unique and require a locke
   predecessor.status = 'retracted'; predecessor.locked = false;
   predecessor.lifecycleBinding = createFactLifecycleBinding(predecessor, 'test-human',
     'Persisted invalid predecessor transition fixture', 'confirmed');
+  audit(unlockedPredecessor, 'fact.retract', 'test-human', { factId: predecessor.id });
+  audit(unlockedPredecessor, `fact.${predecessor.id}.retract`, 'test-human', { factId: predecessor.id });
   assert.equal(factIntegrityReason(unlockedPredecessor, predecessor), 'INVALID_FACT_SUPERSESSION');
   assert.equal(factIntegrityReason(unlockedPredecessor, unlockedPredecessor.facts[1]!), 'INVALID_FACT_SUPERSESSION');
 
@@ -333,6 +359,7 @@ test('a valid A to B to C replacement chain exposes only C and retracting C neve
   assert.ok(p.facts.every(fact => factIntegrityIsValid(p, fact)));
   assert.deepEqual(availableConfirmedFacts(p), []);
   assert.equal(factGovernanceHasBlockingIssue(p), false);
+  assert.equal(projectActiveFactIntegrityIsValid(p), true);
   assert.equal(p.facts.find(fact => fact.id === aId)!.status, 'confirmed');
   assert.equal(p.facts.find(fact => fact.id === bId)!.status, 'confirmed');
   assert.equal(p.facts.find(fact => fact.id === cId)!.status, 'retracted');
@@ -351,6 +378,7 @@ test('explicit reject and retract quarantine lifecycle-unbound active records wi
   candidateProject = await f.write(candidateProject, `facts/${candidateProject.facts[0]!.id}/reject`,
     { reason: 'Explicitly quarantine an unbound historical candidate' });
   assert.equal(candidateProject.facts[0]!.status, 'rejected'); assert.equal(factIntegrityIsValid(candidateProject, candidateProject.facts[0]!), true);
+  assert.equal(projectActiveFactIntegrityIsValid(candidateProject), true);
 
   let confirmedProject = await f.create(); confirmedProject = await addEvidence(confirmedProject, 'Material: aluminum');
   confirmedProject = await f.write(confirmedProject, 'facts/candidates', { attribute: 'material', role: 'core', value: 'aluminum',
@@ -363,6 +391,7 @@ test('explicit reject and retract quarantine lifecycle-unbound active records wi
     { reason: 'Explicitly quarantine an unbound historical confirmation' });
   assert.equal(confirmedProject.facts[0]!.status, 'retracted'); assert.equal(confirmedProject.facts[0]!.locked, false);
   assert.equal(factIntegrityIsValid(confirmedProject, confirmedProject.facts[0]!), true);
+  assert.equal(projectActiveFactIntegrityIsValid(confirmedProject), true);
 });
 
 test('retracted claims require explicit linked reconsideration', async () => {
@@ -455,9 +484,47 @@ test('multi-source withdrawal creates per-source tasks and each unchanged origin
   assert.equal(p.facts[0]!.structured!.sources[0]!.contentSha256, locked.structured!.sources[0]!.contentSha256);
   assert.equal(p.facts[0]!.structured!.sources[1]!.contentSha256, locked.structured!.sources[1]!.contentSha256);
   assert.equal(p.sections[0]!.freshness, 'stale', 'source recovery never auto-refreshes downstream work');
+  const chainMutators: { name: string; mutate: (fact: Fact) => void }[] = [
+    { name: 'discontinuous previous evidence', mutate: fact => {
+      fact.structured!.sources[0]!.reconfirmations![0]!.previousEvidenceId = randomUUID();
+    } },
+    { name: 'repeated evidence identity', mutate: fact => {
+      const source = fact.structured!.sources[0]!;
+      const originalEvidenceId = fact.structured!.candidateBinding!.originalSources[0]!.evidenceId;
+      source.reconfirmations![0]!.evidenceId = originalEvidenceId;
+      source.evidenceId = originalEvidenceId; fact.evidenceId = originalEvidenceId;
+    } },
+    { name: 'current evidence does not match final cursor', mutate: fact => {
+      const originalEvidenceId = fact.structured!.candidateBinding!.originalSources[0]!.evidenceId;
+      fact.structured!.sources[0]!.evidenceId = originalEvidenceId; fact.evidenceId = originalEvidenceId;
+    } },
+    { name: 'reconfirmation decision does not match replacement evidence', mutate: fact => {
+      fact.structured!.sources[0]!.reconfirmations![0]!.decisionId = randomUUID();
+    } },
+    { name: 'reconfirmation usage version does not match replacement evidence', mutate: fact => {
+      fact.structured!.sources[0]!.reconfirmations![0]!.usageVersion++;
+    } },
+  ];
+  for (const item of chainMutators) {
+    const changed = structuredClone(p); const fact = changed.facts[0]!; item.mutate(fact);
+    fact.lifecycleBinding = createFactLifecycleBinding(fact, 'test-human',
+      `Re-sign lifecycle after ${item.name}`, fact.status);
+    assert.equal(factIntegrityReason(changed, fact), 'INVALID_STRUCTURED_FACT_CANDIDATE_BINDING', item.name);
+    assert.equal(projectActiveFactIntegrityIsValid(changed), false, item.name);
+  }
   const historyTampered = structuredClone(p);
   historyTampered.facts[0]!.structured!.sources[0]!.reconfirmations!.pop();
-  assert.equal(factIntegrityReason(historyTampered, historyTampered.facts[0]!), 'INVALID_FACT_LIFECYCLE_BINDING');
+  assert.equal(factIntegrityReason(historyTampered, historyTampered.facts[0]!), 'INVALID_STRUCTURED_FACT_CANDIDATE_BINDING');
+  const historicalEvidenceTampered = structuredClone(p);
+  const originalEvidenceId = historicalEvidenceTampered.facts[0]!.structured!.candidateBinding!.originalSources[0]!.evidenceId;
+  const historicalEvidence = historicalEvidenceTampered.evidence.find(item => item.id === originalEvidenceId)!;
+  historicalEvidence.text += '\nTampered after the source was reconfirmed';
+  historicalEvidence.sha256 = createHash('sha256').update(historicalEvidence.text, 'utf8').digest('hex');
+  historicalEvidence.objectKey = `${historicalEvidence.sha256}.txt`;
+  assert.equal(factIntegrityReason(historicalEvidenceTampered, historicalEvidenceTampered.facts[0]!),
+    'INVALID_STRUCTURED_FACT_CANDIDATE_BINDING');
+  assert.equal(projectActiveFactIntegrityIsValid(historicalEvidenceTampered), false);
+  assert.deepEqual(availableConfirmedFacts(historicalEvidenceTampered), []);
   center = await f.app.inject({ url: `/api/projects/${p.id}/production/material-reviews`, headers: f.headers });
   assert.equal(center.json().tasks.filter((task: { type: string }) => task.type === 'fact_source_reconfirmation').length, 0);
 });
@@ -537,6 +604,48 @@ test('another invalid active fact blocks structured source recovery in tasks, de
   assert.equal(Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count), receiptCount);
 });
 
+test('unchanged structured and legacy source reconfirmations still enforce global active integrity before writing receipts', async () => {
+  for (const kind of ['structured', 'legacy'] as const) {
+    let p = await f.write(await f.create(), 'production/initialize');
+    p = await addMaterial(p, 'Capacity: 10 kg', `${kind}-target.txt`);
+    p = await addMaterial(p, 'Material: steel', `${kind}-blocker.txt`);
+    p = await decideMaterial(p, 0, 'product_evidence'); p = await decideMaterial(p, 1, 'product_evidence');
+    const targetEvidence = currentMaterialEvidence(p, 0);
+    let sourceId: string | undefined;
+    if (kind === 'structured') {
+      const targetSource = source(targetEvidence, targetEvidence.text, '10 kg'); sourceId = targetSource.id;
+      p = await saveCandidate(p, candidate([targetSource], { kind: 'decimal', value: '10', unit: 'kg' }));
+      p = await confirm(p, p.facts[0]!);
+    } else {
+      p = await f.write(p, 'facts/candidates', { attribute: 'capacity', role: 'core', value: '10 kg',
+        evidenceId: targetEvidence.id, quote: '10 kg', reason: 'Legacy unchanged recovery target' });
+      p = await f.write(p, `facts/${p.facts[0]!.id}/confirm`, { reason: 'Confirm legacy unchanged recovery target' });
+    }
+    const blockerEvidence = currentMaterialEvidence(p, 1);
+    p = await f.write(p, 'facts/candidates', { attribute: 'material', role: 'core', value: 'steel',
+      evidenceId: blockerEvidence.id, quote: 'steel', reason: 'Unrelated integrity blocker fixture' });
+    p = await f.write(p, `facts/${p.facts[1]!.id}/confirm`, { reason: 'Confirm unrelated integrity blocker fixture' });
+    const targetId = p.facts[0]!.id;
+    p = await decideMaterial(p, 0, 'reference'); p = await decideMaterial(p, 0, 'product_evidence');
+    const replacement = currentMaterialEvidence(p, 0);
+    const route = kind === 'structured'
+      ? `facts/${targetId}/sources/${sourceId!}/reconfirm` : `facts/${targetId}/source/reconfirm`;
+    p = await f.write(p, route, { evidenceId: replacement.id, reason: 'Complete the first source recovery' });
+    p = await f.store.command(p.id, command(p), `test.reconfirm.no-change.invalid-other.${kind}`, 'test-human', current => {
+      delete current!.facts[1]!.lifecycleBinding; return current!;
+    });
+    const before = structuredClone(p);
+    const receiptCount = Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count);
+    const response = await f.post(`/api/projects/${p.id}/${route}`, command(p, {
+      evidenceId: replacement.id, reason: 'A repeat click must still enforce global integrity',
+    }));
+    assert.equal(response.statusCode, 409, kind); assert.equal(response.json().error.code, 'INVALID_FACT_BINDING', kind);
+    assert.deepEqual(await f.store.get(p.id), before, `${kind} repeat must not change the project`);
+    assert.equal(Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count),
+      receiptCount, `${kind} repeat must not create a receipt`);
+  }
+});
+
 test('legacy fact details remain read-only and legacy confirmation semantics stay compatible', async () => {
   let p = await f.create(); p = await addEvidence(p, 'Capacity: 10 kg');
   p = await f.write(p, 'facts/candidates', { attribute: 'capacity', role: 'core', value: '10 kg', evidenceId: p.evidence[0]!.id,
@@ -573,6 +682,66 @@ test('historical structured facts with missing review or a stale contract versio
   const staleContract = structuredClone(p);
   (staleContract.facts[0]!.structured as { contractVersion: string }).contractVersion = 'fact-sources.0';
   assert.equal(availableConfirmedFacts(staleContract).length, 0);
+});
+
+test('malformed persisted structured payload elements fail details and confirmation closed without TypeError', async () => {
+  const mutators: { name: string; mutate: (fact: Fact) => void }[] = [
+    { name: 'structured array', mutate: fact => { Reflect.set(fact, 'structured', []); } },
+    { name: 'sources primitive', mutate: fact => { Reflect.set(fact.structured!, 'sources', 42); } },
+    { name: 'sources null element', mutate: fact => { Reflect.set(fact.structured!, 'sources', [null]); } },
+    { name: 'sources primitive element', mutate: fact => { Reflect.set(fact.structured!, 'sources', [42]); } },
+    { name: 'sources array element', mutate: fact => { Reflect.set(fact.structured!, 'sources', [[]]); } },
+    { name: 'proposed risk null element', mutate: fact => { Reflect.set(fact.structured!, 'proposedRisks', [null]); } },
+    { name: 'derived risk primitive element', mutate: fact => { Reflect.set(fact.structured!, 'derivedRisks', [42]); } },
+    { name: 'risk policy array', mutate: fact => { Reflect.set(fact.structured!, 'riskPolicy', []); } },
+    { name: 'candidate binding array', mutate: fact => { Reflect.set(fact.structured!, 'candidateBinding', []); } },
+    { name: 'risk review primitive', mutate: fact => { Reflect.set(fact.structured!, 'riskReview', 42); } },
+    { name: 'confirmation array', mutate: fact => { Reflect.set(fact.structured!, 'confirmation', []); } },
+    { name: 'applicability null', mutate: fact => { Reflect.set(fact.structured!, 'applicability', null); } },
+    { name: 'structured unknown property', mutate: fact => { Reflect.set(fact.structured!, 'untrustedExtension', true); } },
+    { name: 'fact unknown property', mutate: fact => { Reflect.set(fact, 'untrustedExtension', true); } },
+    { name: 'legacy field present as null', mutate: fact => { Reflect.set(fact, 'legacyBinding', null); } },
+    { name: 'lifecycle unknown property', mutate: fact => { Reflect.set(fact.lifecycleBinding!, 'untrustedExtension', true); } },
+    { name: 'source review invalid timestamp', mutate: fact => {
+      const source = fact.structured!.sources[0]!;
+      Reflect.set(source, 'review', { status: 'reconfirmation_required', evidenceId: source.evidenceId,
+        decisionId: randomUUID(), usageVersion: 1, actor: 'test-human', at: 'not-a-timestamp', reason: 'Persisted corruption' });
+      fact.lifecycleBinding = createFactLifecycleBinding(fact, 'test-human', 'Persist malformed source review', fact.status);
+    } },
+    { name: 'source review invalid actor type', mutate: fact => {
+      const source = fact.structured!.sources[0]!;
+      Reflect.set(source, 'review', { status: 'reconfirmation_required', evidenceId: source.evidenceId,
+        decisionId: randomUUID(), usageVersion: 1, actor: 42, at: new Date().toISOString(), reason: 'Persisted corruption' });
+      fact.lifecycleBinding = createFactLifecycleBinding(fact, 'test-human', 'Persist malformed source review', fact.status);
+    } },
+    { name: 'source review unknown property', mutate: fact => {
+      const source = fact.structured!.sources[0]!;
+      Reflect.set(source, 'review', { status: 'reconfirmation_required', evidenceId: source.evidenceId,
+        decisionId: randomUUID(), usageVersion: 1, actor: 'test-human', at: new Date().toISOString(), reason: 'Persisted corruption',
+        untrustedExtension: true });
+      fact.lifecycleBinding = createFactLifecycleBinding(fact, 'test-human', 'Persist malformed source review', fact.status);
+    } },
+  ];
+  for (const item of mutators) {
+    let p = await f.create(); p = await addEvidence(p, 'Capacity: 10 kg');
+    p = await saveCandidate(p, candidate([source(p.evidence[0]!, 'Capacity: 10 kg', '10 kg')],
+      { kind: 'decimal', value: '10', unit: 'kg' }));
+    const review = completeRiskReview(p.facts[0]!);
+    p = await f.store.command(p.id, command(p), `test.structured-malformed.${item.name}`, 'test-human', current => {
+      item.mutate(current!.facts[0]!); return current!;
+    });
+    const before = structuredClone(p);
+    const receiptCount = Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count);
+    const detailResponse = await f.app.inject({ url: `/api/projects/${p.id}/facts/${p.facts[0]!.id}/details`, headers: f.headers });
+    assert.equal(detailResponse.statusCode, 200, `${item.name}: ${detailResponse.body}`);
+    assert.equal(detailResponse.json().integrityValid, false, item.name);
+    const response = await f.post(`/api/projects/${p.id}/facts/${p.facts[0]!.id}/structured/confirm`, command(p, review));
+    assert.equal(response.statusCode, 409, `${item.name}: ${response.body}`);
+    assert.equal(response.json().error.code, 'INVALID_FACT_BINDING', item.name);
+    assert.deepEqual(await f.store.get(p.id), before, item.name);
+    assert.equal(Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count),
+      receiptCount, `${item.name} must not create a receipt`);
+  }
 });
 
 test('numeric value spans use complete token boundaries and preserve Unicode or parenthesized units atomically', async () => {
@@ -654,6 +823,24 @@ test('numeric value spans use complete token boundaries and preserve Unicode or 
     { text: 'Value: 10bananas', raw: '10', value: '10', unit: 'count' as const, code: 'VALUE_SPAN_OMITS_UNIT' },
     { text: 'Value: 10 bananas', raw: '10', value: '10', unit: 'count' as const, code: 'VALUE_SPAN_OMITS_UNIT' },
     { text: 'Value: 10 unknownUnit', raw: '10', value: '10', unit: 'count' as const, code: 'VALUE_SPAN_OMITS_UNIT' },
+    { text: 'Count: 10/kg', raw: '10', value: '10', unit: 'count' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Count: 10⁄kg', raw: '10', value: '10', unit: 'count' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Count: 10∕kg', raw: '10', value: '10', unit: 'count' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Count: 10·kg', raw: '10', value: '10', unit: 'count' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Count: 10⋅kg', raw: '10', value: '10', unit: 'count' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: `Count: 5\u030110`, raw: '10', value: '10', unit: 'count' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: `Count: 10\u0301kg`, raw: '10', value: '10', unit: 'count' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: `Count: 10 \u0301kg`, raw: '10', value: '10', unit: 'count' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Rate: 10/box', raw: '10', value: '10', unit: 'count' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Rate: 10 /box', raw: '10', value: '10', unit: 'count' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Rate: 10 kg·mol', raw: '10 kg', value: '10', unit: 'kg' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Rate: 10 kg∙mol', raw: '10 kg', value: '10', unit: 'kg' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Ratio: 10:20', raw: '10', value: '10', unit: 'count' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Density: 10 kg per m²', raw: '10 kg', value: '10', unit: 'kg' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Density: 10 kg每平方米', raw: '10 kg', value: '10', unit: 'kg' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Density: 10 kg；per m²', raw: '10 kg', value: '10', unit: 'kg' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Density: 10 kg​/m²', raw: '10 kg', value: '10', unit: 'kg' as const, code: 'INCOMPLETE_VALUE_SPAN' },
+    { text: 'Weight: 10 kg​5', raw: '10 kg', value: '10', unit: 'kg' as const, code: 'INCOMPLETE_VALUE_SPAN' },
   ];
   for (const item of rejected) {
     let p = await f.create(); p = await addEvidence(p, item.text); const before = structuredClone(p);
@@ -664,6 +851,34 @@ test('numeric value spans use complete token boundaries and preserve Unicode or 
     assert.deepEqual(await f.store.get(p.id), before, item.text);
     assert.equal(Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count),
       receiptCount, `${item.text} must not create a receipt`);
+  }
+  const invisibleSeparators = [
+    ['soft hyphen', '\u00ad'], ['combining grapheme joiner', '\u034f'], ['arabic letter mark', '\u061c'],
+    ['mongolian free variation selector', '\u180b'], ['zero width space', '\u200b'], ['zero width non-joiner', '\u200c'],
+    ['zero width joiner', '\u200d'], ['left-to-right mark', '\u200e'], ['right-to-left mark', '\u200f'],
+    ['left-to-right embedding', '\u202a'], ['right-to-left embedding', '\u202b'], ['pop directional formatting', '\u202c'],
+    ['left-to-right override', '\u202d'], ['right-to-left override', '\u202e'], ['word joiner', '\u2060'],
+    ['left-to-right isolate', '\u2066'], ['right-to-left isolate', '\u2067'], ['first strong isolate', '\u2068'],
+    ['pop directional isolate', '\u2069'], ['text variation selector', '\ufe0e'], ['emoji variation selector', '\ufe0f'],
+    ['byte order mark', '\ufeff'], ['supplementary variation selector', '\u{e0100}'],
+  ] as const;
+  for (const [name, separator] of invisibleSeparators) {
+    for (const [position, text] of [
+      ['before digit', `Count: 5${separator}10`],
+      ['after digit', `Count: 10${separator}5`],
+      ['before unit', `Count: 10${separator}kg`],
+      ['before operator', `Count: 10${separator}/kg`],
+    ] as const) {
+      let p = await f.create(); p = await addEvidence(p, text); const before = structuredClone(p);
+      const receiptCount = Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count);
+      const response = await f.post(`/api/projects/${p.id}/facts/structured/candidates`, command(p,
+        candidate([source(p.evidence[0]!, text, '10')], { kind: 'decimal', value: '10', unit: 'count' })));
+      assert.equal(response.statusCode, 409, `${name} ${position}`);
+      assert.equal(response.json().error.code, 'INCOMPLETE_VALUE_SPAN', `${name} ${position}`);
+      assert.deepEqual(await f.store.get(p.id), before, `${name} ${position}`);
+      assert.equal(Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count),
+        receiptCount, `${name} ${position} must not create a receipt`);
+    }
   }
 });
 
@@ -736,9 +951,12 @@ test('persisted structured confirmation binding rejects field, evidence identity
     { name: 'display value', reason: 'INVALID_STRUCTURED_FACT_VALUE', mutate: fact => { fact.value = '11 kg'; } },
     { name: 'normalized value', reason: 'INVALID_STRUCTURED_FACT_VALUE', mutate: fact => { fact.structured!.normalizedValue = { kind: 'decimal', value: '11', unit: 'kg' }; } },
     { name: 'canonical value', reason: 'INVALID_STRUCTURED_FACT_VALUE', mutate: fact => { fact.structured!.canonicalValue = { kind: 'decimal', dimension: 'mass', numerator: '11', denominator: '1' }; } },
+    { name: 'canonical zero denominator', reason: 'INVALID_STRUCTURED_FACT_VALUE', mutate: fact => {
+      fact.structured!.canonicalValue = { kind: 'decimal', dimension: 'mass', numerator: '0', denominator: '0' };
+    } },
     { name: 'raw value', reason: 'INVALID_STRUCTURED_FACT_SOURCE', mutate: fact => { fact.structured!.sources[0]!.rawValue = '11 kg'; } },
     { name: 'raw unit', reason: 'INVALID_STRUCTURED_FACT_VALUE', mutate: fact => { fact.structured!.sources[0]!.rawUnit = 'g'; } },
-    { name: 'same-text evidence identity', reason: 'INVALID_FACT_LIFECYCLE_BINDING', mutate: (fact, evidenceId) => {
+    { name: 'same-text evidence identity', reason: 'INVALID_STRUCTURED_FACT_CANDIDATE_BINDING', mutate: (fact, evidenceId) => {
       fact.evidenceId = evidenceId; fact.structured!.sources[0]!.evidenceId = evidenceId;
     } },
     { name: 'risk source anchor', reason: 'INVALID_STRUCTURED_FACT_RISK', mutate: fact => { fact.structured!.derivedRisks[0]!.sourceIds = [randomUUID()]; } },
@@ -773,6 +991,66 @@ test('persisted structured confirmation binding rejects field, evidence identity
   }
 });
 
+test('structured source identity cannot be replaced by same-text evidence and legitimized by a same-status lifecycle binding', async () => {
+  let p = await f.create(); p = await addEvidence(p, 'Capacity: 10 kg', 'original.txt');
+  p = await addEvidence(p, 'Capacity: 10 kg', 'unrelated-duplicate.txt');
+  p = await saveCandidate(p, candidate([source(p.evidence[0]!, 'Capacity: 10 kg', '10 kg')],
+    { kind: 'decimal', value: '10', unit: 'kg' })); p = await confirm(p, p.facts[0]!);
+  const originalCandidateBinding = structuredClone(p.facts[0]!.structured!.candidateBinding);
+  const originalConfirmation = structuredClone(p.facts[0]!.structured!.confirmation);
+  p = await f.store.command(p.id, command(p), 'test.fact.same-text-evidence-rebind', 'test-human', current => {
+    const fact = current!.facts[0]!; const duplicateEvidenceId = current!.evidence[1]!.id;
+    fact.evidenceId = duplicateEvidenceId; fact.structured!.sources[0]!.evidenceId = duplicateEvidenceId;
+    fact.lifecycleBinding = createFactLifecycleBinding(fact, 'test-human',
+      'Attempt to bless an unrelated evidence identity', fact.status);
+    return current!;
+  });
+  assert.deepEqual(p.facts[0]!.structured!.candidateBinding, originalCandidateBinding);
+  assert.deepEqual(p.facts[0]!.structured!.confirmation, originalConfirmation);
+  assert.equal(factIntegrityReason(p, p.facts[0]!), 'INVALID_STRUCTURED_FACT_CANDIDATE_BINDING');
+  assert.equal(projectActiveFactIntegrityIsValid(p), false);
+  assert.deepEqual(availableConfirmedFacts(p), []);
+});
+
+test('forged structured and legacy reconfirmation chains cannot cross material lineage', async () => {
+  for (const kind of ['structured', 'legacy'] as const) {
+    let p = await f.write(await f.create(), 'production/initialize');
+    p = await addMaterial(p, 'Capacity: 10 kg', `${kind}-original.txt`);
+    p = await addMaterial(p, 'Capacity: 10 kg\nUnrelated lot: B', `${kind}-unrelated.txt`);
+    p = await decideMaterial(p, 0, 'product_evidence'); p = await decideMaterial(p, 1, 'product_evidence');
+    const original = currentMaterialEvidence(p, 0); const unrelated = currentMaterialEvidence(p, 1);
+    if (kind === 'structured') {
+      p = await saveCandidate(p, candidate([source(original, original.text, '10 kg')],
+        { kind: 'decimal', value: '10', unit: 'kg' })); p = await confirm(p, p.facts[0]!);
+    } else {
+      p = await f.write(p, 'facts/candidates', { attribute: 'capacity', role: 'core', value: '10 kg',
+        evidenceId: original.id, quote: '10 kg', reason: 'Legacy cross-lineage fixture' });
+      p = await f.write(p, `facts/${p.facts[0]!.id}/confirm`, { reason: 'Confirm legacy cross-lineage fixture' });
+    }
+    p = await f.store.command(p.id, command(p), `test.fact.cross-material-chain.${kind}`, 'test-human', current => {
+      const fact = current!.facts[0]!; const replacement = current!.evidence.find(item => item.id === unrelated.id)!;
+      const provenance = replacement.materialSource!;
+      const reconfirmation = { previousEvidenceId: original.id, evidenceId: replacement.id,
+        decisionId: provenance.usageDecisionId, usageVersion: provenance.usageVersion,
+        actor: 'test-human', at: new Date().toISOString(), reason: 'Forged cross-material chain' };
+      fact.evidenceId = replacement.id;
+      if (fact.structured) {
+        fact.structured.sources[0]!.evidenceId = replacement.id;
+        fact.structured.sources[0]!.reconfirmations = [reconfirmation];
+      } else {
+        fact.sourceReconfirmations = [reconfirmation];
+      }
+      fact.lifecycleBinding = createFactLifecycleBinding(fact, 'test-human',
+        'Attempt to bless a cross-material evidence chain', fact.status);
+      return current!;
+    });
+    assert.equal(factIntegrityReason(p, p.facts[0]!), kind === 'structured'
+      ? 'INVALID_STRUCTURED_FACT_CANDIDATE_BINDING' : 'INVALID_LEGACY_FACT_CANDIDATE_BINDING', kind);
+    assert.equal(projectActiveFactIntegrityIsValid(p), false, kind);
+    assert.deepEqual(availableConfirmedFacts(p), [], kind);
+  }
+});
+
 test('lifecycle binding digest covers every transition field and confirmation attribution', async () => {
   let p = await f.create(); p = await addEvidence(p, 'Material: steel');
   p = await saveCandidate(p, candidate([source(p.evidence[0]!, 'Material: steel', 'steel')],
@@ -785,10 +1063,28 @@ test('lifecycle binding digest covers every transition field and confirmation at
     { name: 'actor', mutate: binding => { binding.actor = 'different-human'; } },
     { name: 'at', mutate: binding => { binding.at = new Date(Date.parse(binding.at) + 1000).toISOString(); } },
     { name: 'reason', mutate: binding => { binding.reason = 'Different persisted transition reason'; } },
+    { name: 'unknown property', mutate: binding => { Reflect.set(binding, 'untrustedExtension', true); } },
   ];
   for (const item of mutators) {
     const changed = structuredClone(p); item.mutate(changed.facts[0]!.lifecycleBinding!);
     assert.equal(factIntegrityReason(changed, changed.facts[0]!), 'INVALID_FACT_LIFECYCLE_BINDING', item.name);
+  }
+  const semanticMutators: { name: string; mutate: (fact: Fact) => void }[] = [
+    { name: 'fact attribute', mutate: fact => { fact.attribute = 'forged-attribute'; } },
+    { name: 'fact role', mutate: fact => { fact.role = 'supporting'; } },
+    { name: 'fact value', mutate: fact => { fact.value = 'forged-value'; } },
+    { name: 'fact evidenceId', mutate: fact => { fact.evidenceId = randomUUID(); } },
+    { name: 'fact quote', mutate: fact => { fact.quote = 'forged quote'; } },
+    { name: 'fact start', mutate: fact => { fact.start++; } },
+    { name: 'fact end', mutate: fact => { fact.end++; } },
+    { name: 'fact sourceRunId', mutate: fact => { fact.sourceRunId = randomUUID(); } },
+    { name: 'fact createdBy', mutate: fact => { fact.createdBy = 'forged-creator'; } },
+    { name: 'fact reason', mutate: fact => { fact.reason = 'Forged candidate reason'; } },
+    { name: 'fact correction', mutate: fact => { fact.correctsFactId = randomUUID(); } },
+  ];
+  for (const item of semanticMutators) {
+    const changed = structuredClone(p); item.mutate(changed.facts[0]!);
+    assert.equal(factLifecycleBindingIsValid(changed.facts[0]!), false, item.name);
   }
   assert.throws(() => createFactLifecycleBinding(p.facts[0]!, 'different-human',
     'Mismatched confirmation actor', 'candidate', p.facts[0]!.confirmedAt));
@@ -887,6 +1183,125 @@ test('invalid candidate lifecycle and arbitrary supersession stay visible and bl
   assert.equal(Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count), receiptCount);
 });
 
+test('a forged inactive status cannot hide an active lifecycle record from the project integrity guard', async () => {
+  let p = await f.create(); p = await addEvidence(p, 'Capacity: 10 kg'); p = await addEvidence(p, 'Capacity: 12 kg');
+  p = await saveCandidate(p, candidate([source(p.evidence[0]!, 'Capacity: 10 kg', '10 kg')],
+    { kind: 'decimal', value: '10', unit: 'kg' })); p = await confirm(p, p.facts[0]!);
+  p = await saveCandidate(p, candidate([source(p.evidence[1]!, 'Capacity: 12 kg', '12 kg')],
+    { kind: 'decimal', value: '12', unit: 'kg' }));
+  const targetId = p.facts[1]!.id;
+  p = await f.store.command(p.id, command(p), 'test.lifecycle.hide-active-as-rejected', 'test-human', current => {
+    current!.facts[0]!.status = 'rejected';
+    return current!;
+  });
+  assert.equal(p.facts[0]!.lifecycleBinding!.status, 'confirmed');
+  assert.equal(projectActiveFactIntegrityIsValid(p), false);
+  assert.equal(factGovernanceHasBlockingIssue(p), true);
+  assert.ok(evaluateFactEligibility(p, p.facts[1]!).reasons.includes('PROJECT_FACT_INTEGRITY_FAILURE'));
+  const before = structuredClone(p);
+  const receiptCount = Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count);
+  const response = await f.post(`/api/projects/${p.id}/facts/${targetId}/structured/confirm`,
+    command(p, completeRiskReview(p.facts[1]!)));
+  assert.equal(response.statusCode, 409); assert.equal(response.json().error.code, 'INVALID_FACT_BINDING');
+  assert.deepEqual(await f.store.get(p.id), before);
+  assert.equal(Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count), receiptCount);
+});
+
+test('a confirmed fact cannot erase its confirmation history and re-sign as a rejected candidate', async () => {
+  let p = await f.create(); p = await addEvidence(p, 'Capacity: 10 kg'); p = await addEvidence(p, 'Capacity: 12 kg');
+  p = await saveCandidate(p, candidate([source(p.evidence[0]!, 'Capacity: 10 kg', '10 kg')],
+    { kind: 'decimal', value: '10', unit: 'kg' })); p = await confirm(p, p.facts[0]!);
+  p = await saveCandidate(p, candidate([source(p.evidence[1]!, 'Capacity: 12 kg', '12 kg')],
+    { kind: 'decimal', value: '12', unit: 'kg' }));
+  const targetId = p.facts[1]!.id;
+  const forged = structuredClone(p); const hidden = forged.facts[0]!;
+  hidden.status = 'rejected'; hidden.locked = false;
+  delete hidden.confirmedBy; delete hidden.confirmedAt;
+  delete hidden.structured!.riskReview; delete hidden.structured!.confirmation;
+  assert.throws(() => createFactLifecycleBinding(hidden, 'test-human',
+    'A confirmed lifecycle cannot claim candidate ancestry', 'candidate'));
+
+  // Even a two-step attempt to discard the current envelope and create a fresh candidate branch must remain visible
+  // through the persisted project audit. Hashes are never treated as permission to erase an accepted transition.
+  hidden.status = 'candidate'; delete hidden.lifecycleBinding;
+  hidden.lifecycleBinding = createFactLifecycleBinding(hidden, 'test-human', 'Attempt to restart lifecycle history', null);
+  hidden.status = 'rejected';
+  hidden.lifecycleBinding = createFactLifecycleBinding(hidden, 'test-human', 'Attempt to hide prior confirmation', 'candidate');
+  assert.equal(factLifecycleBindingIsValid(hidden), true);
+  assert.equal(factIntegrityReason(forged, hidden), 'INVALID_FACT_LIFECYCLE_BINDING');
+  assert.equal(projectActiveFactIntegrityIsValid(forged), false);
+  assert.deepEqual(availableConfirmedFacts(forged), []);
+  p = await f.store.command(p.id, command(p), 'test.lifecycle.erase-confirmation-history', 'test-human', current => {
+    current!.facts[0] = structuredClone(hidden); return current!;
+  });
+  assert.equal(factIntegrityReason(p, p.facts[0]!), 'INVALID_FACT_LIFECYCLE_BINDING');
+  const before = structuredClone(p);
+  const response = await f.post(`/api/projects/${p.id}/facts/${targetId}/structured/confirm`,
+    command(p, completeRiskReview(p.facts[1]!)));
+  assert.equal(response.statusCode, 409); assert.equal(response.json().error.code, 'INVALID_FACT_BINDING');
+  assert.deepEqual(await f.store.get(p.id), before);
+});
+
+test('deleting a lifecycle domain event or its whole command revision cannot erase confirmation history', async () => {
+  for (const removeWholeCommand of [false, true]) {
+    let p = await f.create(); p = await addEvidence(p, 'Capacity: 10 kg'); p = await addEvidence(p, 'Capacity: 12 kg');
+    p = await saveCandidate(p, candidate([source(p.evidence[0]!, 'Capacity: 10 kg', '10 kg')],
+      { kind: 'decimal', value: '10', unit: 'kg' })); p = await confirm(p, p.facts[0]!);
+    const hiddenId = p.facts[0]!.id;
+    p = await saveCandidate(p, candidate([source(p.evidence[1]!, 'Capacity: 12 kg', '12 kg')],
+      { kind: 'decimal', value: '12', unit: 'kg' }));
+    const targetId = p.facts[1]!.id;
+    p = await f.store.command(p.id, command(p), `test.lifecycle.delete-audit-${removeWholeCommand}`, 'test-human', current => {
+      const hidden = current!.facts[0]!;
+      hidden.status = 'candidate'; hidden.locked = false;
+      delete hidden.confirmedBy; delete hidden.confirmedAt;
+      delete hidden.structured!.riskReview; delete hidden.structured!.confirmation; delete hidden.lifecycleBinding;
+      hidden.lifecycleBinding = createFactLifecycleBinding(hidden, 'test-human', 'Restart after deleting confirmation audit', null);
+      hidden.status = 'rejected';
+      hidden.lifecycleBinding = createFactLifecycleBinding(hidden, 'test-human', 'Hide deleted confirmation audit', 'candidate');
+      current!.audit = current!.audit.filter(entry => entry.type !== 'fact.structured_confirmed'
+        && (!removeWholeCommand || entry.type !== `fact.${hiddenId}.structured.confirm`));
+      return current!;
+    });
+    assert.equal(factIntegrityReason(p, p.facts[0]!), 'INVALID_FACT_LIFECYCLE_BINDING',
+      removeWholeCommand ? 'deleted command revision' : 'deleted domain event');
+    assert.equal(projectActiveFactIntegrityIsValid(p), false);
+    const before = structuredClone(p);
+    const receiptCount = Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count);
+    const response = await f.post(`/api/projects/${p.id}/facts/${targetId}/structured/confirm`,
+      command(p, completeRiskReview(p.facts[1]!)));
+    assert.equal(response.statusCode, 409, response.body);
+    assert.equal(response.json().error.code, 'INVALID_FACT_BINDING');
+    assert.deepEqual(await f.store.get(p.id), before);
+    assert.equal(Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count), receiptCount);
+  }
+});
+
+test('a valid inactive lifecycle envelope cannot quarantine malformed fact content implicitly', async () => {
+  let p = await f.create(); p = await addEvidence(p, 'Capacity: 10 kg'); p = await addEvidence(p, 'Capacity: 12 kg');
+  p = await saveCandidate(p, candidate([source(p.evidence[0]!, 'Capacity: 10 kg', '10 kg')],
+    { kind: 'decimal', value: '10', unit: 'kg' }));
+  p = await saveCandidate(p, candidate([source(p.evidence[1]!, 'Capacity: 12 kg', '12 kg')],
+    { kind: 'decimal', value: '12', unit: 'kg' }));
+  const targetId = p.facts[1]!.id;
+  p = await f.store.command(p.id, command(p), 'test.lifecycle.hide-malformed-as-rejected', 'test-human', current => {
+    const hidden = current!.facts[0]!; hidden.status = 'rejected';
+    Reflect.set(hidden.structured!, 'untrustedExtension', true);
+    hidden.lifecycleBinding = createFactLifecycleBinding(hidden, 'test-human',
+      'Forge a syntactically valid candidate-to-rejected transition', 'candidate');
+    return current!;
+  });
+  assert.equal(factLifecycleBindingIsValid(p.facts[0]!), true,
+    'the lifecycle envelope alone is valid so the project guard must also validate inactive fact content');
+  assert.equal(factIntegrityIsValid(p, p.facts[0]!), false);
+  assert.equal(projectActiveFactIntegrityIsValid(p), false);
+  const before = structuredClone(p);
+  const response = await f.post(`/api/projects/${p.id}/facts/${targetId}/structured/confirm`,
+    command(p, completeRiskReview(p.facts[1]!)));
+  assert.equal(response.statusCode, 409); assert.equal(response.json().error.code, 'INVALID_FACT_BINDING');
+  assert.deepEqual(await f.store.get(p.id), before);
+});
+
 test('current applicability recomputes conflicts without trusting cached issueSeverity', async () => {
   let p = await f.create(); p = await addEvidence(p, 'Model A power: high'); p = await addEvidence(p, 'Model B power: low');
   const a = source(p.evidence[0]!, 'Model A power: high', 'high');
@@ -897,8 +1312,9 @@ test('current applicability recomputes conflicts without trusting cached issueSe
     applicability: modelApplicability(b, 'Model B', p.evidence[1]!) })); p = await confirm(p, p.facts[1]!);
   p = await f.store.command(p.id, command(p), 'test.fact.scope.migration', 'test-human', current => {
     current!.facts[1]!.structured!.applicability = { models: { kind: 'all' }, conditions: [] };
-    current!.facts[1]!.structured!.candidateBinding = createStructuredFactCandidateBinding(current!.facts[1]!);
-    current!.facts[1]!.structured!.confirmation = createStructuredFactConfirmation(current!.facts[1]!);
+    recreateStructuredProofForPersistedFixture(current!.facts[1]!);
+    current!.facts[1]!.lifecycleBinding = createFactLifecycleBinding(current!.facts[1]!, 'test-human',
+      'Persisted applicability migration fixture', current!.facts[1]!.status);
     current!.facts[0]!.issueSeverity = 'none'; current!.facts[1]!.issueSeverity = 'none'; return current!;
   });
   assert.equal(factGovernanceHasBlockingIssue(p), true);
@@ -928,6 +1344,86 @@ test('legacy addCandidate shares rejected-history reconsideration and unbound pe
   assert.equal(factGovernanceHasBlockingIssue(historical), true);
 });
 
+test('legacy candidates require a strict persisted shape and immutable candidate proof before confirmation', async () => {
+  const mutators: { name: string; mutate: (fact: Fact, duplicateEvidenceId: string) => void }[] = [
+    { name: 'id', mutate: fact => { fact.id = randomUUID(); } },
+    { name: 'attribute', mutate: fact => { fact.attribute = 'forged attribute'; } },
+    { name: 'attribute type', mutate: fact => { Reflect.set(fact, 'attribute', 42); } },
+    { name: 'role', mutate: fact => { Reflect.set(fact, 'role', 'administrator'); } },
+    { name: 'value', mutate: fact => { fact.value = 'bronze'; } },
+    { name: 'same-text evidence identity', mutate: (fact, evidenceId) => { fact.evidenceId = evidenceId; } },
+    { name: 'quote', mutate: fact => { fact.quote = 'Material'; } },
+    { name: 'start', mutate: fact => { fact.start = 0; } },
+    { name: 'end', mutate: fact => { fact.end++; } },
+    { name: 'sourceRunId', mutate: fact => { fact.sourceRunId = randomUUID(); } },
+    { name: 'createdBy', mutate: fact => { fact.createdBy = 'forged-creator'; } },
+    { name: 'reason', mutate: fact => { fact.reason = 'Forged candidate reason'; } },
+    { name: 'correctsFactId', mutate: fact => { fact.correctsFactId = randomUUID(); } },
+    { name: 'candidate lock', mutate: fact => { fact.locked = true; } },
+    { name: 'candidate binding', mutate: fact => { Reflect.deleteProperty(fact, 'legacyCandidateBinding'); } },
+    { name: 'unknown property', mutate: fact => { Reflect.set(fact, 'forgedProperty', true); } },
+  ];
+  for (const item of mutators) {
+    let p = await f.create(); p = await addEvidence(p, 'Material: steel', 'original.txt');
+    p = await addEvidence(p, 'Material: steel', 'same-text.txt');
+    p = await f.write(p, 'facts/candidates', { attribute: 'material', role: 'core', value: 'steel',
+      evidenceId: p.evidence[0]!.id, quote: 'steel', reason: 'Bound legacy candidate fixture' });
+    p = await f.store.command(p.id, command(p), `test.legacy-candidate-shape.${item.name}`, 'test-human', current => {
+      item.mutate(current!.facts[0]!, current!.evidence[1]!.id); return current!;
+    });
+    const fact = p.facts[0]!;
+    assert.equal(factIntegrityIsValid(p, fact), false, item.name);
+    const detailResponse = await f.app.inject({ url: `/api/projects/${p.id}/facts/${String(fact.id)}/details`, headers: f.headers });
+    assert.equal(detailResponse.statusCode, 200, `${item.name}: ${detailResponse.body}`);
+    assert.equal(detailResponse.json().integrityValid, false, item.name);
+    const before = structuredClone(p);
+    const receiptCount = Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count);
+    const response = await f.post(`/api/projects/${p.id}/facts/${String(fact.id)}/confirm`, command(p, {
+      reason: 'Persisted candidate must validate before confirmation',
+    }));
+    assert.equal(response.statusCode, 409, `${item.name}: ${response.body}`);
+    assert.equal(response.json().error.code, 'INVALID_FACT_BINDING', item.name);
+    assert.deepEqual(await f.store.get(p.id), before, item.name);
+    assert.equal(Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count),
+      receiptCount, `${item.name} must not create a receipt`);
+  }
+});
+
+test('malformed persisted legacy fact fields fail every confirmed consumer closed without TypeError', async () => {
+  let p = await f.create(); p = await f.write(p, 'identity/confirm', { productName: 'Malformed legacy fixture' });
+  p = await addEvidence(p, 'Material: steel');
+  p = await f.write(p, 'facts/candidates', { attribute: 'material', role: 'core', value: 'steel',
+    evidenceId: p.evidence[0]!.id, quote: 'steel', reason: 'Confirmed malformed legacy fixture' });
+  p = await f.write(p, `facts/${p.facts[0]!.id}/confirm`, { reason: 'Confirm before persisted corruption' });
+  const factId = p.facts[0]!.id;
+  p = await f.store.command(p.id, command(p), 'test.legacy-malformed-runtime-shape', 'test-human', current => {
+    current!.storyboard = seedStoryboard(randomUUID(), [factId]);
+    current!.sections.push(seedSection(randomUUID(), [factId])); current!.currentSectionId = current!.sections[0]!.id;
+    Reflect.set(current!.facts[0]!, 'attribute', 42); return current!;
+  });
+  const persisted = structuredClone(p);
+  assert.equal(factIntegrityIsValid(p, p.facts[0]!), false);
+  assert.deepEqual(availableConfirmedFacts(p), []);
+  assert.deepEqual(skillInput(p, 'plan-section').confirmedFacts, []);
+  assert.throws(() => checkSkillInputs(p, 'plan-section'), error =>
+    typeof error === 'object' && error !== null && Reflect.get(error, 'statusCode') === 409);
+  const detailResponse = await f.app.inject({ url: `/api/projects/${p.id}/facts/${factId}/details`, headers: f.headers });
+  assert.equal(detailResponse.statusCode, 200, detailResponse.body);
+  assert.equal(detailResponse.json().integrityValid, false);
+  const checked = structuredClone(p); preflight(checked);
+  assert.equal(checked.qa!.issueSeverity, 'blocker');
+  assert.ok(checked.qa!.issues.includes('UNRESOLVED_FACT_CONFLICT'));
+  assert.ok(checked.qa!.issues.includes(`INVALID_FACT_EVIDENCE:${factId}`));
+  const receiptCount = Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count);
+  const response = await f.post(`/api/projects/${p.id}/storyboard/draft`, command(p, {
+    chapters: [{ role: 'feature', purpose: 'must reject malformed legacy data', factIds: [factId] }],
+    reason: 'Malformed legacy data must not reach a write path',
+  }));
+  assert.equal(response.statusCode, 409, response.body);
+  assert.deepEqual(await f.store.get(p.id), persisted);
+  assert.equal(Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count), receiptCount);
+});
+
 test('legacy confirmation attribution cannot be deleted from both fact and binding without failing every consumer closed', async () => {
   const mutators: { name: string; mutate: (fact: Fact) => void }[] = [
     { name: 'actor', mutate: fact => { delete fact.confirmedBy; delete (fact.legacyBinding as Partial<NonNullable<Fact['legacyBinding']>>).confirmedBy; } },
@@ -953,7 +1449,7 @@ test('legacy confirmation attribution cannot be deleted from both fact and bindi
     });
     const persisted = structuredClone(p);
     assert.deepEqual(availableConfirmedFacts(p), [], item.name);
-    assert.ok(evaluateFactEligibility(p, p.facts[0]!).reasons.includes('LEGACY_FACT_BINDING_REQUIRED'), item.name);
+    assert.ok(evaluateFactEligibility(p, p.facts[0]!).reasons.includes('INVALID_LEGACY_FACT_CONTRACT'), item.name);
     assert.deepEqual(skillInput(p, 'plan-section').confirmedFacts, [], item.name);
     assert.throws(() => checkSkillInputs(p, 'plan-section'), item.name);
     const checked = structuredClone(p); preflight(checked);
@@ -979,8 +1475,9 @@ test('material review center blocks a conflicting source recovery and exposes in
   p = await f.store.command(p.id, command(p), 'test.fact.scope.review-center', 'test-human', current => {
     const fact = current!.facts[1]!; const sourceId = fact.structured!.sources[0]!.id;
     fact.structured!.applicability = { models: { kind: 'specified', models: [{ id: 'Model A', sourceId, start: 0, end: 7 }] }, conditions: [] };
-    fact.structured!.candidateBinding = createStructuredFactCandidateBinding(fact);
-    fact.structured!.confirmation = createStructuredFactConfirmation(fact); fact.issueSeverity = 'none'; return current!;
+    recreateStructuredProofForPersistedFixture(fact); fact.issueSeverity = 'none';
+    fact.lifecycleBinding = createFactLifecycleBinding(fact, 'test-human',
+      'Persisted applicability review fixture', fact.status); return current!;
   });
   let response = await f.app.inject({ url: `/api/projects/${p.id}/production/material-reviews`, headers: f.headers });
   assert.equal(response.statusCode, 200);

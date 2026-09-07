@@ -229,7 +229,61 @@ test('purpose withdrawal preserves locked facts and receipts, marks only depende
   assert.equal(p.qa!.issueSeverity, 'blocker'); assert.equal(p.qa!.exportAllowed, false);
 });
 
-test('legacy source reconfirmation validates the prospective clone and rejects changed replacement text atomically', async () => {
+test('legacy source reconfirmation preserves the original proof when an unchanged quote moves in a new source version', async () => {
+  let p = await confirmed(); const factId = p.facts[0]!.id;
+  const originalFact = structuredClone(p.facts[0]!);
+  p = await usage(p, [[0, 'reference']]);
+  p = await usage(p, [[0, 'product_evidence']]);
+  const replacementId = evidenceFor(p).id; const blockId = material(p).blocks[0]!.id;
+  const prefix = 'Revision header: verified. ';
+  p = await f.store.command(p.id, command(p), 'test.legacy.shifted-replacement-range', 'test-human', current => {
+    const evidence = current!.evidence.find(item => item.id === replacementId)!;
+    const block = material(current!).blocks.find(item => item.id === blockId)!;
+    const shifted = `${prefix}${evidence.text}`; const sha256 = createHash('sha256').update(shifted).digest('hex');
+    evidence.text = shifted; evidence.sha256 = sha256; evidence.objectKey = `${sha256}.txt`;
+    block.text = shifted;
+    return current!;
+  });
+  const task = (await center(p)).tasks.find(item => item.type === 'fact_source_reconfirmation' && item.factId === factId);
+  assert.equal(task?.status, 'ready');
+  p = await f.write(p, `facts/${factId}/source/reconfirm`, {
+    reason: 'Same quoted claim remains valid after a source preface was added', evidenceId: replacementId,
+  });
+  const fact = p.facts.find(item => item.id === factId)!; const replacement = p.evidence.find(item => item.id === replacementId)!;
+  assert.equal(fact.start, replacement.text.indexOf(fact.quote));
+  assert.equal(fact.start, originalFact.start + prefix.length);
+  assert.deepEqual(fact.legacyCandidateBinding, originalFact.legacyCandidateBinding);
+  assert.deepEqual(fact.legacyBinding, originalFact.legacyBinding);
+  assert.deepEqual(availableConfirmedFacts(p).map(item => item.id), [factId, p.facts[1]!.id]);
+});
+
+test('legacy source reconfirmation rejects a replacement whose repeated quote has no unique lineage position', async () => {
+  let p = await confirmed(); const factId = p.facts[0]!.id;
+  p = await usage(p, [[0, 'reference']]);
+  p = await usage(p, [[0, 'product_evidence']]);
+  const replacement = evidenceFor(p); const blockId = material(p).blocks[0]!.id;
+  p = await f.store.command(p.id, command(p), 'test.legacy.ambiguous-replacement-range', 'test-human', current => {
+    const evidence = current!.evidence.find(item => item.id === replacement.id)!;
+    const block = material(current!).blocks.find(item => item.id === blockId)!;
+    const repeated = 'Capacity: 10 kg; repeated claim: 10 kg';
+    const sha256 = createHash('sha256').update(repeated).digest('hex');
+    evidence.text = repeated; evidence.sha256 = sha256; evidence.objectKey = `${sha256}.txt`;
+    block.text = repeated;
+    return current!;
+  });
+  const task = (await center(p)).tasks.find(item => item.type === 'fact_source_reconfirmation' && item.factId === factId);
+  assert.equal(task?.status, 'blocked'); assert.equal(task?.blockedReason, 'INVALID_FACT_BINDING');
+  const before = structuredClone(p);
+  const receiptCount = Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count);
+  const response = await f.post(`/api/projects/${p.id}/facts/${factId}/source/reconfirm`, command(p, {
+    reason: 'A repeated quote cannot prove which occurrence preserves the original claim', evidenceId: replacement.id,
+  }));
+  assert.equal(response.statusCode, 409); assert.equal(response.json().error.code, 'INVALID_RECONFIRMATION_SOURCE');
+  assert.deepEqual(await f.store.get(p.id), before);
+  assert.equal(Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count), receiptCount);
+});
+
+test('legacy source reconfirmation validates the prospective clone and rejects a changed quoted claim atomically', async () => {
   let p = await confirmed(); const factId = p.facts[0]!.id;
   p = await usage(p, [[0, 'reference']]);
   p = await usage(p, [[0, 'product_evidence']]);
@@ -237,7 +291,7 @@ test('legacy source reconfirmation validates the prospective clone and rejects c
   p = await f.store.command(p.id, command(p), 'test.legacy.changed-replacement-text', 'test-human', current => {
     const evidence = current!.evidence.find(item => item.id === replacement.id)!;
     const block = material(current!).blocks.find(item => item.id === blockId)!;
-    const changed = `${evidence.text}!`; const sha256 = createHash('sha256').update(changed).digest('hex');
+    const changed = evidence.text.replace('10 kg', '11 kg'); const sha256 = createHash('sha256').update(changed).digest('hex');
     evidence.text = changed; evidence.sha256 = sha256; evidence.objectKey = `${sha256}.txt`;
     block.text = changed;
     return current!;
@@ -245,13 +299,13 @@ test('legacy source reconfirmation validates the prospective clone and rejects c
   assert.equal(evidenceIsAvailable(p, p.evidence.find(item => item.id === replacement.id)!), true);
   const task = (await center(p)).tasks.find(item => item.type === 'fact_source_reconfirmation' && item.factId === factId);
   assert.equal(task?.status, 'blocked');
-  assert.equal(task?.blockedReason, 'INVALID_FACT_BINDING');
+  assert.equal(task?.blockedReason, 'REPLACEMENT_EVIDENCE_REQUIRED');
   const before = structuredClone(p);
   const receiptCount = Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count);
   const response = await f.post(`/api/projects/${p.id}/facts/${factId}/source/reconfirm`, command(p, {
-    reason: 'Changed full text must not inherit the original confirmation proof', evidenceId: replacement.id,
+    reason: 'Changed quoted claim must not inherit the original confirmation proof', evidenceId: replacement.id,
   }));
-  assert.equal(response.statusCode, 409); assert.equal(response.json().error.code, 'INVALID_FACT_BINDING');
+  assert.equal(response.statusCode, 409); assert.equal(response.json().error.code, 'INVALID_RECONFIRMATION_SOURCE');
   assert.deepEqual(await f.store.get(p.id), before);
   assert.equal(Number((await f.db.query('SELECT count(*) AS count FROM command_receipts')).rows[0]!.count), receiptCount);
 });

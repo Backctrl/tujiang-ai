@@ -2,9 +2,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { Evidence, Fact, Project } from './contracts.js';
 import { refreshConflicts } from './domain.js';
 import { AppError } from './errors.js';
-import { availableConfirmedFacts, currentFactConflict, evaluateFactEligibility, evidenceIsAvailable,
+import { assertProjectFactPersistenceReadable, availableConfirmedFacts, currentFactConflict, evaluateFactEligibility, evidenceIsAvailable,
   factIntegrityIsValid, factSourceIsCurrent, factSupersessionIsEffective, projectActiveFactIntegrityIsValid,
-  recordMaterialExtraction } from './material-source-gates.js';
+  projectEvidenceCollectionIsValid, recordMaterialExtraction } from './material-source-gates.js';
 import type { MaterialWithdrawal } from './production-material-usage.js';
 import {
   FACT_NORMALIZATION_VERSION,
@@ -27,6 +27,8 @@ import {
   rejectedFactRequiringReconsideration,
   structuredRiskReviewIsComplete,
   structuredRiskSeverity,
+  storedStructuredFactSchema,
+  structuredFactCompatibilitySchema,
   structuredSourceMatchesEvidence,
   type StructuredFact,
   type StructuredFactCandidateInput,
@@ -112,6 +114,8 @@ function markFactDependentsStale(p: Project, factId: string) {
 }
 
 export function addStructuredFactCandidate(p: Project, input: StructuredFactCandidateInput, actor: string): Fact {
+  assertProjectFactPersistenceReadable(p);
+  if (!projectActiveFactIntegrityIsValid(p)) throw new AppError('INVALID_FACT_BINDING', 409);
   const correction = input.correctsFactId ? p.facts.find(fact => fact.id === input.correctsFactId) : undefined;
   if (input.correctsFactId && !correction) throw new AppError('FACT_NOT_FOUND', 404);
   const target = normalizeRequestedValue(input.normalizedValue);
@@ -178,11 +182,12 @@ function storedRiskReview(fact: Fact, input: StructuredFactConfirmInput, actor: 
   return review;
 }
 export function confirmStructuredFact(p: Project, factId: string, input: StructuredFactConfirmInput, actor: string): Fact {
+  assertProjectFactPersistenceReadable(p);
+  if (!projectActiveFactIntegrityIsValid(p)) throw new AppError('INVALID_FACT_BINDING', 409);
   const fact = p.facts.find(item => item.id === factId);
   if (!fact) throw new AppError('FACT_NOT_FOUND', 404);
   if (!fact.structured) throw new AppError('STRUCTURED_FACT_REQUIRED', 409);
   if (fact.status !== 'candidate') throw new AppError('FACT_NOT_CANDIDATE', 409);
-  if (!projectActiveFactIntegrityIsValid(p)) throw new AppError('INVALID_FACT_BINDING', 409);
   if (!factSourceIsCurrent(p, fact)) throw new AppError('INVALID_EVIDENCE', 409);
   if (structuredRiskSeverity(fact.structured) === 'blocker') throw new AppError('BLOCKING_FACT_RISK', 409);
   const review = storedRiskReview(fact, input, actor);
@@ -213,15 +218,16 @@ export function confirmStructuredFact(p: Project, factId: string, input: Structu
   }
   fact.lifecycleBinding = createFactLifecycleBinding(fact, actor, input.reason, 'candidate', review.reviewedAt);
   p.version++;
-  refreshConflicts(p);
   audit(p, replaced ? 'fact.structured_replaced' : 'fact.structured_confirmed', actor, {
     factId: fact.id, replaceFactId: replaced?.id ?? null, reason: input.reason,
     riskReviewVersion: review.contractVersion, riskReviewer: review.reviewer,
   });
+  refreshConflicts(p);
   return fact;
 }
 
 export function structuredSourceReconfirmIsUnchanged(p: Project, factId: string, sourceId: string, evidenceId: string): boolean {
+  if (!projectActiveFactIntegrityIsValid(p)) return false;
   const fact = p.facts.find(item => item.id === factId);
   const source = fact?.structured?.sources.find(item => item.id === sourceId);
   return !!fact && fact.status === 'confirmed' && fact.locked && !!source && source.evidenceId === evidenceId && !source.review
@@ -243,10 +249,11 @@ function validateReplacementEvidence(p: Project, source: StructuredFactSource, e
   return evidence;
 }
 export function reconfirmStructuredFactSource(p: Project, factId: string, sourceId: string, input: StructuredFactSourceReconfirmInput, actor: string) {
+  assertProjectFactPersistenceReadable(p);
+  if (!projectActiveFactIntegrityIsValid(p)) throw new AppError('INVALID_FACT_BINDING', 409);
   const fact = p.facts.find(item => item.id === factId);
   if (!fact) throw new AppError('FACT_NOT_FOUND', 404);
   if (!fact.structured || fact.status !== 'confirmed' || !fact.locked) throw new AppError('STRUCTURED_FACT_REQUIRED', 409);
-  if (!projectActiveFactIntegrityIsValid(p)) throw new AppError('INVALID_FACT_BINDING', 409);
   const source = fact.structured.sources.find(item => item.id === sourceId);
   if (!source) throw new AppError('FACT_SOURCE_NOT_FOUND', 404);
   if (structuredSourceReconfirmIsUnchanged(p, factId, sourceId, input.evidenceId)) return;
@@ -275,13 +282,34 @@ export function reconfirmStructuredFactSource(p: Project, factId: string, source
     decisionId: materialSource.usageDecisionId, usageVersion: materialSource.usageVersion, reason: input.reason });
 }
 
+function structuredSourcesForTraversal(fact: Fact): StructuredFactSource[] | undefined {
+  const structured = Reflect.get(fact, 'structured');
+  if (structured === undefined) return;
+  const compatible = structuredFactCompatibilitySchema.safeParse(fact);
+  const parsed = storedStructuredFactSchema.safeParse(structured);
+  if (!compatible.success || !parsed.success)
+    throw new AppError('INVALID_FACT_BINDING', 409);
+  const confirmedOrRetracted = fact.status === 'confirmed' || fact.status === 'retracted';
+  if (confirmedOrRetracted) {
+    if ((fact.status === 'confirmed') !== fact.locked || !fact.confirmedBy || !fact.confirmedAt
+      || !parsed.data.riskReview || !parsed.data.confirmation)
+      throw new AppError('INVALID_FACT_BINDING', 409);
+  } else if (fact.locked || fact.confirmedBy !== undefined || fact.confirmedAt !== undefined
+    || parsed.data.riskReview !== undefined || parsed.data.confirmation !== undefined) {
+    throw new AppError('INVALID_FACT_BINDING', 409);
+  }
+  return Reflect.get(structured, 'sources') as StructuredFactSource[];
+}
+
 export function invalidateStructuredFactSources(p: Project, evidenceIds: string[], withdrawal: MaterialWithdrawal) {
+  assertProjectFactPersistenceReadable(p);
   const affected: { factId: string; sourceId: string; evidenceId: string }[] = [];
   const ids = new Set(evidenceIds);
   for (const fact of p.facts) {
-    if (!fact.structured || !['candidate', 'confirmed'].includes(fact.status)) continue;
+    const sources = structuredSourcesForTraversal(fact);
+    if (!sources || !['candidate', 'confirmed'].includes(fact.status)) continue;
     const lifecycleWasValid = factLifecycleBindingIsValid(fact);
-    for (const source of fact.structured.sources) {
+    for (const source of sources) {
       if (!ids.has(source.evidenceId) || source.review) continue;
       source.review = { ...withdrawal, evidenceId: source.evidenceId,
         status: fact.status === 'confirmed' && fact.locked ? 'reconfirmation_required' : 'invalidated' };
@@ -293,21 +321,30 @@ export function invalidateStructuredFactSources(p: Project, evidenceIds: string[
   return affected;
 }
 export function replacementEvidenceForStructuredSource(p: Project, source: StructuredFactSource): Evidence | undefined {
-  const previous = p.evidence.find(item => item.id === source.evidenceId);
-  if (!previous?.materialSource) return;
-  return p.evidence.find(item => item.id !== source.evidenceId && evidenceIsAvailable(p, item)
-    && item.materialSource?.materialId === previous.materialSource!.materialId
-    && item.materialSource.blockId === previous.materialSource!.blockId
-    && item.materialSource.sourceSha256 === previous.materialSource!.sourceSha256
-    && item.sha256 === source.contentSha256 && contentSha256(item) === source.contentSha256
-    && structuredSourceMatchesEvidence({ ...source, evidenceId: item.id }, item));
+  if (!projectEvidenceCollectionIsValid(p)) return;
+  try {
+    const previous = p.evidence.find(item => item.id === source.evidenceId);
+    if (!previous?.materialSource) return;
+    return p.evidence.find(item => item.id !== source.evidenceId && evidenceIsAvailable(p, item)
+      && item.materialSource?.materialId === previous.materialSource!.materialId
+      && item.materialSource.blockId === previous.materialSource!.blockId
+      && item.materialSource.sourceSha256 === previous.materialSource!.sourceSha256
+      && item.sha256 === source.contentSha256 && contentSha256(item) === source.contentSha256
+      && structuredSourceMatchesEvidence({ ...source, evidenceId: item.id }, item));
+  } catch { return; }
 }
 export function structuredSourceReconfirmationBlockReason(p: Project, fact: Fact, source: StructuredFactSource,
   evidence: Evidence): 'INVALID_FACT_BINDING' | 'UNRESOLVED_FACT_CONFLICT' | undefined {
   if (!projectActiveFactIntegrityIsValid(p)) return 'INVALID_FACT_BINDING';
   const candidate = structuredClone(fact);
   const candidateSource = candidate.structured?.sources.find(item => item.id === source.id);
-  if (!candidate.structured || !candidateSource) return 'INVALID_FACT_BINDING';
+  if (!candidate.structured || !candidateSource || !source.review || !evidence.materialSource)
+    return 'INVALID_FACT_BINDING';
+  (candidateSource.reconfirmations ??= []).push({
+    previousEvidenceId: source.evidenceId, evidenceId: evidence.id,
+    decisionId: evidence.materialSource.usageDecisionId, usageVersion: evidence.materialSource.usageVersion,
+    actor: source.review.actor, at: source.review.at, reason: source.review.reason,
+  });
   candidateSource.evidenceId = evidence.id;
   delete candidateSource.review;
   if (candidate.structured.sources[0]!.id === source.id) candidate.evidenceId = evidence.id;
@@ -320,14 +357,18 @@ export function structuredSourceReconfirmationBlockReason(p: Project, fact: Fact
   return candidateConflicts(p, candidate) ? 'UNRESOLVED_FACT_CONFLICT' : undefined;
 }
 export function structuredSourceImpact(p: Project, evidenceIds: string[]) {
+  assertProjectFactPersistenceReadable(p);
   const ids = new Set(evidenceIds); const result: { factId: string; sourceId: string; evidenceId: string }[] = [];
-  for (const fact of p.facts) for (const source of fact.structured?.sources ?? [])
-    if (ids.has(source.evidenceId)) result.push({ factId: fact.id, sourceId: source.id, evidenceId: source.evidenceId });
+  for (const fact of p.facts) {
+    for (const source of structuredSourcesForTraversal(fact) ?? [])
+      if (ids.has(source.evidenceId)) result.push({ factId: fact.id, sourceId: source.id, evidenceId: source.evidenceId });
+  }
   return result;
 }
 
 export function factSourceDetails(p: Project, factId: string) {
-  const fact = p.facts.find(item => item.id === factId);
+  const fact = (Array.isArray(p.facts) ? p.facts : []).find(item => item && typeof item === 'object'
+    && Reflect.get(item, 'id') === factId);
   if (!fact) throw new AppError('FACT_NOT_FOUND', 404);
   const integrityValid = factIntegrityIsValid(p, fact);
   const projectIntegrityValid = projectActiveFactIntegrityIsValid(p);
@@ -335,7 +376,8 @@ export function factSourceDetails(p: Project, factId: string) {
   const conflictFactIds = integrityValid ? p.facts.filter(other => other.id !== fact.id && !factSupersessionIsEffective(p, other)
     && factSourceIsCurrent(p, other) && factsConflict(fact, other)).map(item => item.id) : [];
   if (!fact.structured) {
-    const evidence = p.evidence.find(item => item.id === fact.evidenceId);
+    const evidence = (Array.isArray(p.evidence) ? p.evidence : []).find(item => item && typeof item === 'object'
+      && Reflect.get(item, 'id') === fact.evidenceId);
     return { contractVersion: p.contractVersion, projectId: p.id, projectVersion: p.version, revision: p.revision,
       fact, structured: false, integrityValid, eligibility,
       currentUsable: availableConfirmedFacts(p).some(item => item.id === fact.id),
