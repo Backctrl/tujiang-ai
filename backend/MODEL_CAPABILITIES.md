@@ -37,7 +37,7 @@ OPENROUTER_PLAN_MODEL=
 
 ## 新增评测执行器（2026-09-05）
 
-`npm run evaluate:runner -- evaluation/fixtures/synthetic-run.json` 默认 dry-run，使用合成 endpoint 快照，不联网或读 Key。实现及边界见 [evaluation/README.md](evaluation/README.md)。真实模式需要显式 `--live`、环境启用、人工整理样本、明确模型/端点与预算配置；先核对当前端点能力，禁止自动重试和 fallback。预算为本地估算门，不保证服务商最终美元硬封顶，费用未知则停止。正常输出接入现有 evaluate，`businessAcceptance` 始终 false。
+`npm run evaluate:runner -- evaluation/fixtures/synthetic-run.json` 默认 dry-run，使用合成 endpoint 快照，不联网或读 Key。实现及边界见 [evaluation/README.md](evaluation/README.md)。M0 真实模式需要同一 PostgreSQL 累计授权、不可变 batch、独立 input-review、显式 `--live --batch`、环境启用及固定模型/端点与预算；普通 runner 不能登记授权或批准输入。当前仅接通事实提取，其他阶段和图片仍拒绝 live。实时能力与已审阅快照一致才能派发，禁止自动重试和 fallback。预算为本地估算门，不保证最终美元硬封顶；未知用量会持久阻断后续派发。正常输出接入现有 evaluate，`businessAcceptance` 始终 false。配置与受控原文复核见 [授权账本操作](evaluation/AUTHORIZATION-OPERATIONS.md)。
 
 本轮只有合成 fetch 协议测试与代码验证，没有真实模型运行、质量成绩或业务验收。生产 gateway 已复用 src/model-policy.ts 的能力、路由和预算检查，并保留实际 usage；完整观测和请求配置见 STAGE_A_API_HANDOFF.md。
 

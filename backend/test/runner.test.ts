@@ -2,70 +2,144 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { runEvaluation } from '../evaluation/runner.js';
+import { randomUUID } from 'node:crypto';
+import { runEvaluation, type RunnerOptions } from '../evaluation/runner.js';
 import { runCli } from '../evaluation/runner-cli.js';
+import { AuthorizationLedger } from '../evaluation/authorization-ledger.js';
+import { sha256 } from '../evaluation/authorization-contract.js';
+import { PURPOSE_LIMITS, type Purpose } from '../evaluation/authorization-contract.js';
+import { authorizedCapabilities as capabilities, authorizedConfig as config, goodResponse as good, humanFixture as human,
+  syntheticFixture as fixture, corePayload, prepared, preparedCore, withLedger } from './authorization-helpers.js';
 
 const read = (name: string) => JSON.parse(readFileSync(new URL(`../evaluation/fixtures/${name}.json`, import.meta.url), 'utf8'));
-const fixture = read('synthetic-extraction');
-const output = read('synthetic-extraction-output');
-const capabilities = read('synthetic-endpoints');
-const config = { ...read('synthetic-run').config, acceptEstimatedBudget: true };
-const human = { ...fixture, provenance: 'human-curated' };
-const good = () => ({ id: 'gen-test', model: config.modelId, provider: 'Synthetic',
-  choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(output) } }],
-  usage: { prompt_tokens: 100, completion_tokens: 100, cost: 0.001 } });
 const key = 'TEST_ONLY_SECRET';
-function mock(response: unknown = good(), caps: unknown = capabilities) {
-  const calls: { url: string; init: RequestInit | undefined }[] = [];
-  const request: typeof fetch = async (url, init) => {
-    calls.push({ url: String(url), init });
-    return Response.json(calls.length === 1 ? caps : response);
-  };
-  return { calls, options: { live: true, request, environmentEnabled: () => true, getApiKey: () => key } };
+type Mock = { f: Parameters<Parameters<typeof withLedger>[0]>[0]; batch: Awaited<ReturnType<typeof prepared>>;
+  calls: { url: string; init: RequestInit | undefined }[]; options: RunnerOptions };
+async function withMock(action: (mock: Mock) => Promise<void>, settings: {
+  config?: typeof config; fixtures?: unknown[]; response?: unknown; capabilities?: unknown; review?: boolean } = {}) {
+  return withLedger(async f => {
+    const batch = await prepared(f.manager, { config: settings.config ?? config, fixtures: settings.fixtures ?? [human], review: settings.review });
+    const calls: Mock['calls'] = [];
+    const options: RunnerOptions = { live: true, authorization: { ledger: f.runner, batchId: batch.batchId, sources: batch.sources },
+      environmentEnabled: () => true, getApiKey: () => key, request: async (url, init) => {
+        calls.push({ url: String(url), init });
+        return Response.json(init?.method === 'POST' ? settings.response ?? good() : settings.capabilities ?? capabilities);
+      } };
+    await action({ f, batch, calls, options });
+  });
 }
 
-test('dry-run makes zero requests and never accesses credentials or environment', async () => {
+test('dry-run is byte-compatible, zero-network and never touches credentials, environment or ledger', async () => {
   let accesses = 0;
-  const report = await runEvaluation(config, [fixture], { capabilities,
+  const report = await runEvaluation(read('synthetic-run').config, [fixture], { capabilities: read('synthetic-endpoints'),
     request: async () => { accesses++; throw new Error(); }, getApiKey: () => { accesses++; throw new Error(); },
     environmentEnabled: () => { accesses++; throw new Error(); } });
-  assert.equal(accesses, 0); assert.equal(report.status, 'dry_run');
-  assert.equal(report.requestsAttempted, 0); assert.equal(report.businessAcceptance, false);
-  assert.equal(report.items[0]?.estimatedCostUsd, 0.014);
-  assert.equal(report.budgetEnforcement, 'local-estimate-not-billing-cap');
+  assert.equal(accesses, 0); assert.equal(report.status, 'dry_run'); assert.equal(report.requestsAttempted, 0);
+  assert.equal(report.items[0]?.estimatedCostUsd, 0.014); assert.equal(report.businessAcceptance, false);
+  assert.equal(report.items[0]?.requestSha256, 'b5bd0d81942372f2e30133e3cc3bccdafbe5293c381f034e8a8c86629ddcf716');
 });
 
-test('live is gated by config, environment, sample provenance and key', async () => {
-  for (const [c, f, enabled, secret, expected] of [
-    [{ ...config, acceptEstimatedBudget: false }, human, true, key, 'LIVE_NOT_ENABLED'],
-    [config, human, false, key, 'LIVE_NOT_ENABLED'],
-    [config, fixture, true, key, 'LIVE_REQUIRES_HUMAN_CURATED_FIXTURES'],
-    [config, human, true, '', 'KEY_NOT_CONFIGURED'],
-  ] as const) {
-    const m = mock();
-    const report = await runEvaluation(c, [f], { ...m.options, environmentEnabled: () => enabled, getApiKey: () => secret });
-    assert.equal(report.code, expected); assert.equal(m.calls.length, 0);
+test('old live entry, arbitrary duck ledger and management ledger all fail before key or network access', async () => {
+  let accesses = 0;
+  const trap = () => { accesses++; throw new Error('must not execute'); };
+  const options = { live: true, environmentEnabled: () => true, getApiKey: trap, request: trap };
+  assert.equal((await runEvaluation(config, [human], options)).code, 'AUTHORIZATION_REQUIRED');
+  const forged = { reviewedBatch: trap, status: trap, beginDispatch: trap, reviewInput: trap };
+  assert.equal((await runEvaluation(config, [human], { ...options,
+    authorization: { ledger: forged as any, batchId: randomUUID(), sources: [] } })).code, 'AUTHORIZATION_INVALID_INSTANCE');
+  assert.equal(accesses, 0);
+  await withLedger(async f => {
+    assert.equal((await runEvaluation(config, [human], { ...options,
+      authorization: { ledger: f.manager, batchId: randomUUID(), sources: [] } })).code, 'AUTHORIZATION_INVALID_INSTANCE');
+    assert.equal(accesses, 0);
+  });
+});
+
+test('config, environment, provenance, missing key and unsupported purpose all fail locally', async () => {
+  await withMock(async m => {
+    for (const [c, input, enabled, secret, expected] of [
+      [{ ...config, acceptEstimatedBudget: false }, human, true, key, 'LIVE_NOT_ENABLED'],
+      [config, human, false, key, 'LIVE_NOT_ENABLED'],
+      [config, fixture, true, key, 'LIVE_REQUIRES_HUMAN_CURATED_FIXTURES'],
+      [config, human, true, '', 'KEY_NOT_CONFIGURED'],
+      [config, { ...human, skill: 'plan-section' }, true, key, 'PURPOSE_ADAPTER_NOT_READY'],
+    ] as const) {
+      const report = await runEvaluation(c, [input], { ...m.options, environmentEnabled: () => enabled, getApiKey: () => secret });
+      assert.equal(report.code, expected); assert.equal(m.calls.length, 0);
+    }
+  });
+});
+
+test('human-curated or approved fixture fields cannot create independent input review', async () => {
+  await withMock(async m => {
+    let keys = 0;
+    const options = { ...m.options, getApiKey: () => { keys++; return key; } };
+    assert.equal((await runEvaluation(config, [human], options)).code, 'INPUT_REVIEW_REQUIRED');
+    for (const extra of [{ approved: true }, { reviewer: 'human' }, { humanCurated: true }]) {
+      assert.equal((await runEvaluation(config, [{ ...human, ...extra }], options)).code, 'INVALID_RUN_INPUT');
+    }
+    assert.equal(keys, 0); assert.equal(m.calls.length, 0);
+    assert.equal((await m.f.db.query('SELECT * FROM evaluation_input_reviews')).rows.length, 0);
+  }, { review: false });
+});
+
+test('every unsupported stage including image is explicitly closed before reading a model credential', () => withLedger(async f => {
+  let accesses = 0; const trap = () => { accesses++; throw new Error('forbidden'); };
+  for (const purpose of Object.keys(PURPOSE_LIMITS) as Purpose[]) {
+    if (purpose === 'fact_extraction') continue;
+    const batch = await preparedCore(f.manager, corePayload(purpose));
+    const report = await runEvaluation(batch.payload.config, [human], { live: true,
+      authorization: { ledger: f.runner, batchId: batch.batchId, sources: batch.payload.sources },
+      environmentEnabled: () => true, getApiKey: trap, request: trap });
+    assert.equal(report.code, 'PURPOSE_ADAPTER_NOT_READY');
   }
+  assert.equal(accesses, 0); assert.equal((await f.runner.status()).attempts.length, 0);
+}));
+
+test('input, expected, source bytes, adapter and reviewed capability changes fail closed', async () => {
+  await withMock(async m => {
+    let keys = 0;
+    const options = { ...m.options, getApiKey: () => { keys++; return key; } };
+    const mutations = [
+      { ...human, productName: 'Changed product' },
+      { ...human, expectedFacts: [] },
+    ];
+    for (const mutation of mutations) assert.equal((await runEvaluation(config, [mutation], options)).code, 'BATCH_INPUT_CHANGED');
+    assert.equal((await runEvaluation(config, [human], { ...options, authorization: { ...options.authorization!,
+      sources: [{ ...m.batch.sources[0]!, bytesBase64: Buffer.from('changed original bytes').toString('base64') }] } })).code, 'BATCH_INPUT_CHANGED');
+    assert.equal(keys, 0); assert.equal(m.calls.length, 0);
+  });
+  const changed = structuredClone(capabilities); changed.data.endpoints[0].pricing.prompt = '0.0000011';
+  await withMock(async m => {
+    assert.equal((await runEvaluation(config, [human], m.options)).code, 'CAPABILITIES_CHANGED_REVIEW_REQUIRED');
+    assert.equal(m.calls.length, 1); assert.equal((await m.f.runner.status()).attempts.length, 0);
+  }, { capabilities: changed });
 });
 
-test('normal response uses shared prompt and strict routing then existing evaluator', async () => {
-  const m = mock(); const report = await runEvaluation(config, [human], m.options);
-  assert.equal(report.status, 'needs_human_review'); assert.equal(report.items[0]?.evaluation?.automaticChecksPassed, true);
-  assert.equal(report.businessAcceptance, false); assert.equal(report.requestsAttempted, 1); assert.equal(report.metadataRequests, 1);
-  assert.equal(report.observedCostUsd, 0.001);
-  assert.match(m.calls[0]!.url, /\/models\/synthetic\/protocol-only\/endpoints$/);
-  const body = JSON.parse(m.calls[1]!.init!.body as string);
-  assert.deepEqual(body.provider, { only: ['synthetic'], order: ['synthetic'], allow_fallbacks: false, require_parameters: true });
-  assert.equal(body.stream, false); assert.equal(body.max_tokens, 2000); assert.equal(body.response_format.type, 'json_schema');
-  assert.ok(!body.messages[1].content.includes('expectedFacts'));
-  assert.equal(m.calls[1]!.init!.redirect, 'error');
-  assert.ok(!JSON.stringify(report).includes(key)); assert.ok(!JSON.stringify(report).includes(fixture.evidence[0].text));
+test('successful live adapter uses exact reviewed request, strict route and existing evaluator', async () => {
+  await withMock(async m => {
+    const report = await runEvaluation(config, [human], m.options);
+    assert.equal(report.status, 'needs_human_review'); assert.equal(report.items[0]?.evaluation?.automaticChecksPassed, true);
+    assert.equal(report.businessAcceptance, false); assert.equal(report.requestsAttempted, 1); assert.equal(report.metadataRequests, 1);
+    assert.equal(report.observedCostUsd, 0.001);
+    assert.match(m.calls[0]!.url, /\/models\/google\/gemini-2.5-flash\/endpoints$/);
+    assert.equal(m.calls[1]!.init!.body, m.batch.payload.items[0]!.requestBody);
+    const body = JSON.parse(m.calls[1]!.init!.body as string);
+    assert.deepEqual(body.provider, { only: [config.provider], order: [config.provider], allow_fallbacks: false, require_parameters: true });
+    assert.equal(body.stream, false); assert.equal(body.max_tokens, 2000); assert.equal(body.response_format.type, 'json_schema');
+    assert.ok(!body.messages[1].content.includes('expectedFacts')); assert.equal(m.calls[1]!.init!.redirect, 'error');
+    assert.ok(!JSON.stringify(report).includes(key)); assert.ok(!JSON.stringify(report).includes(fixture.evidence[0].text));
+    const repeat = await runEvaluation(config, [human], { ...m.options, getApiKey: () => { throw new Error('no key needed'); } });
+    assert.equal(repeat.status, 'needs_human_review'); assert.equal(repeat.requestsAttempted, 0); assert.equal(repeat.metadataRequests, 0);
+    assert.equal(repeat.items[0]!.observed!.latencyMs, report.items[0]!.observed!.latencyMs);
+    assert.equal(repeat.authorization?.modalities.text.consumedRequests, 1); assert.equal(m.calls.length, 2);
+  });
 });
 
-test('capabilities, identity, capacity and prices fail closed before model dispatch', async () => {
+test('capabilities, identity, capacity and prices reject before model POST', async () => {
   const mutations: ((c: any) => void)[] = [
     c => { c.data.id = 'other/model'; }, c => { c.data.endpoints = []; },
-    c => { c.data.endpoints.push({ ...c.data.endpoints[0], tag: 'synthetic/variant' }); },
+    c => { c.data.endpoints.push({ ...c.data.endpoints[0], tag: config.provider + '/variant' }); },
     c => { c.data.endpoints[0].supported_parameters = ['response_format', 'max_tokens']; },
     c => { delete c.data.endpoints[0].pricing.prompt; }, c => { delete c.data.endpoints[0].pricing.completion; },
     c => { c.data.endpoints[0].pricing.prompt = ''; }, c => { c.data.endpoints[0].pricing.prompt = '-1'; },
@@ -75,25 +149,14 @@ test('capabilities, identity, capacity and prices fail closed before model dispa
   ];
   for (const mutate of mutations) {
     const caps = structuredClone(capabilities); mutate(caps);
-    const m = mock(good(), caps); const report = await runEvaluation(config, [human], m.options);
-    assert.equal(report.status, 'blocked'); assert.equal(m.calls.length, 1); assert.equal(report.requestsAttempted, 0);
+    await withMock(async m => { const report = await runEvaluation(config, [human], m.options);
+      assert.equal(report.status, 'blocked'); assert.equal(m.calls.length, 1); assert.equal(report.requestsAttempted, 0);
+      assert.equal((await m.f.db.query("SELECT * FROM evaluation_artifacts WHERE kind='preflight-response'")).rows.length, 1);
+    }, { capabilities: caps });
   }
 });
 
-test('local request, input, fixture and cost gates precede dispatch', async () => {
-  for (const [c, fixtures, expected] of [
-    [config, [human, human], 'REQUEST_BUDGET_EXCEEDED'],
-    [{ ...config, maxInputTokens: 1 }, [human], 'INPUT_ESTIMATE_EXCEEDS_LIMIT'],
-    [{ ...config, maxCostUsd: 0.001 }, [human], 'ESTIMATED_COST_EXCEEDS_BUDGET'],
-    [{ ...config, modelId: 'openrouter/auto' }, [human], 'INVALID_RUN_INPUT'],
-    [config, [{ ...human, evidence: [human.evidence[0], human.evidence[0]] }], 'INVALID_RUN_INPUT'],
-  ] as const) {
-    const m = mock(); const report = await runEvaluation(c, [...fixtures], m.options);
-    assert.equal(report.code, expected); assert.equal(report.requestsAttempted, 0);
-  }
-});
-
-test('truncation, refusal, malformed JSON, route mismatch and rules are distinct', async () => {
+test('truncation, refusal, malformed output, routing, usage and rules retain raw failure evidence and stop after one POST', async () => {
   const mutations: [string, (r: any) => void][] = [
     ['OUTPUT_TRUNCATED', r => { r.choices[0].finish_reason = 'length'; }],
     ['MODEL_REFUSAL', r => { r.choices[0].message.refusal = 'no'; }],
@@ -107,77 +170,107 @@ test('truncation, refusal, malformed JSON, route mismatch and rules are distinct
     ['OBSERVED_COST_EXCEEDED', r => { r.usage.cost = 1; }],
   ];
   for (const [code, mutate] of mutations) {
-    const response = good(); mutate(response); const m = mock(response);
-    const report = await runEvaluation({ ...config, maxRequests: 2 }, [human, human], m.options);
-    assert.equal(report.code, code); assert.equal(m.calls.length, 2); assert.equal(report.requestsAttempted, 1);
-    assert.ok(!JSON.stringify(report).includes(key));
-    if (code === 'USAGE_UNKNOWN') assert.equal(report.observedCostUsd, null);
+    const response = good(); mutate(response);
+    const batchConfig = { ...config, maxRequests: 2 };
+    await withMock(async m => { const report = await runEvaluation(batchConfig, [human, human], m.options);
+      assert.equal(report.code, code); assert.equal(m.calls.length, 2); assert.equal(report.requestsAttempted, 1);
+      assert.ok(!JSON.stringify(report).includes(key)); assert.ok(report.items[0]?.responseArtifactId);
+      assert.equal(report.authorization?.batches[0]?.status, 'stopped');
+      const again = await runEvaluation(batchConfig, [human, human], m.options);
+      assert.equal(again.requestsAttempted, 0); assert.equal(m.calls.length, 2);
+      if (code === 'USAGE_UNKNOWN') assert.equal(report.observedCostUsd, null);
+    }, { config: batchConfig, fixtures: [human, human], response });
   }
 });
 
-test('observed spend gates next request even if the original batch estimate passed', async () => {
-  const response = good(); response.usage.cost = 0.09;
-  const m = mock(response); const report = await runEvaluation({ ...config, maxRequests: 2 }, [human, human], m.options);
-  assert.equal(report.code, 'REMAINING_BUDGET_INSUFFICIENT'); assert.equal(m.calls.length, 2);
+test('local input and request gates execute before key access; observed spend blocks the next request', async () => {
+  await withMock(async m => {
+    for (const [c, fixtures, expected] of [
+      [config, [human, human], 'REQUEST_BUDGET_EXCEEDED'],
+      [{ ...config, maxInputTokens: 1 }, [human], 'INPUT_ESTIMATE_EXCEEDS_LIMIT'],
+      [{ ...config, modelId: 'openrouter/auto' }, [human], 'INVALID_RUN_INPUT'],
+      [config, [{ ...human, evidence: [human.evidence[0], human.evidence[0]] }], 'INVALID_RUN_INPUT'],
+    ] as const) {
+      const report = await runEvaluation(c, [...fixtures], { ...m.options, getApiKey: () => { throw new Error('no key'); } });
+      assert.equal(report.code, expected); assert.equal(report.requestsAttempted, 0);
+    }
+  });
+  const batchConfig = { ...config, maxRequests: 2 };
+  await withMock(async m => {
+    const report = await runEvaluation(batchConfig, [human, human], m.options);
+    assert.equal(report.code, 'REMAINING_BUDGET_INSUFFICIENT'); assert.equal(m.calls.length, 2);
+  }, { config: batchConfig, fixtures: [human, human], response: good(config.modelId, 0.09) });
 });
 
-test('HTTP and transport errors are redacted and never retried', async () => {
+test('HTTP and transport failures preserve scrubbed bounded captures and are never retried', async () => {
   for (const status of [401, 429, 500]) {
-    let calls = 0;
-    const report = await runEvaluation(config, [human], { ...mock().options, request: async () => {
-      calls++; return calls === 1 ? Response.json(capabilities) : new Response(key, { status });
-    } });
-    assert.equal(calls, 2); assert.equal(report.code, status === 429 ? 'RATE_LIMITED' : 'HTTP_ERROR');
-    assert.equal(report.observedCostUsd, null); assert.ok(!JSON.stringify(report).includes(key));
+    await withMock(async m => {
+      let calls = 0;
+      const report = await runEvaluation(config, [human], { ...m.options, request: async () => {
+        calls++; return calls === 1 ? Response.json(capabilities) : new Response(key, { status });
+      } });
+      assert.equal(calls, 2); assert.equal(report.code, status === 429 ? 'RATE_LIMITED' : 'HTTP_ERROR');
+      assert.equal(report.observedCostUsd, null); assert.ok(!JSON.stringify(report).includes(key));
+      const saved = await m.f.manager.readArtifactForReview(report.items[0]!.responseArtifactId!);
+      assert.equal(saved.bytes.toString(), '[REDACTED]'); assert.equal(saved.metadata.state, 'complete');
+    });
   }
-  const report = await runEvaluation(config, [human], { ...mock().options, request: async () => { throw new Error(key); } });
-  assert.equal(report.code, 'NETWORK_ERROR'); assert.ok(!JSON.stringify(report).includes(key));
+  await withMock(async m => {
+    const report = await runEvaluation(config, [human], { ...m.options, request: async () => { throw new Error(key); } });
+    assert.equal(report.code, 'NETWORK_ERROR'); assert.ok(!JSON.stringify(report).includes(key));
+    assert.equal((await m.f.runner.status()).modalities.text.consumedRequests, 0);
+  });
 });
 
-test('deadline covers stalled fetch and stalled body; oversized or malformed bodies are bounded', async () => {
-  for (const behavior of ['fetch', 'body', 'large', 'json']) {
-    let calls = 0;
-    const report = await runEvaluation({ ...config, timeoutMs: 30 }, [human], { ...mock().options,
-      request: async () => {
+test('deadline includes stalled body; partial, oversized and invalid JSON evidence distinguish unknown usage', async () => {
+  for (const behavior of ['fetch', 'body', 'prefix', 'large', 'json']) {
+    const batchConfig = { ...config, timeoutMs: 30 };
+    await withMock(async m => {
+      let calls = 0;
+      const report = await runEvaluation(batchConfig, [human], { ...m.options, request: async () => {
         calls++; if (calls === 1) return Response.json(capabilities);
         if (behavior === 'fetch') return new Promise<Response>(() => {});
         if (behavior === 'body') return new Response(new ReadableStream({ start() {} }));
+        if (behavior === 'prefix') return new Response(new ReadableStream({ start(controller) { controller.enqueue(Buffer.from('partial-data')); } }));
         return new Response(behavior === 'large' ? 'x'.repeat(2_000_001) : '{');
       } });
-    assert.equal(report.code, ['fetch', 'body'].includes(behavior) ? 'REQUEST_TIMEOUT' : behavior === 'large' ? 'RESPONSE_TOO_LARGE' : 'INVALID_RESPONSE_JSON');
-    assert.equal(calls, 2); assert.equal(report.observedCostUsd, null);
+      assert.equal(report.code, ['fetch', 'body', 'prefix'].includes(behavior) ? 'REQUEST_TIMEOUT' : behavior === 'large' ? 'RESPONSE_TOO_LARGE' : 'INVALID_RESPONSE_JSON');
+      assert.equal(calls, 2); assert.equal(report.observedCostUsd, null);
+      const saved = await m.f.manager.readArtifactForReview(report.items[0]!.responseArtifactId!);
+      assert.equal(saved.metadata.state, behavior === 'fetch' ? 'unavailable' : behavior === 'json' ? 'complete' : 'partial');
+      assert.equal(saved.bytes.length, behavior === 'large' ? 2_000_000 : behavior === 'prefix' ? 12 : behavior === 'json' ? 1 : 0);
+      if (behavior === 'prefix') assert.equal(saved.originalSha256, sha256(Buffer.from('partial-data')));
+    }, { config: batchConfig });
   }
 });
 
-test('CLI defaults offline and rejects unknown flags with safe JSON reports', async () => {
+test('missing storage key or unknown in-flight attempt blocks before metadata and cannot auto recover', async () => {
+  await withMock(async m => {
+    const missingKey = AuthorizationLedger.forRunner(m.f.db, undefined);
+    const report = await runEvaluation(config, [human], { ...m.options, authorization: { ...m.options.authorization!, ledger: missingKey } });
+    assert.equal(report.code, 'ARTIFACT_KEY_NOT_CONFIGURED'); assert.equal(m.calls.length, 0);
+    const reserved = await m.f.runner.reserve(m.batch.batchId, 'item-1', m.batch.plan);
+    await m.f.runner.beginDispatch(reserved.id, randomUUID());
+    const afterCrash = await runEvaluation(config, [human], m.options);
+    assert.equal(afterCrash.code, 'AUTHORIZATION_EFFECTIVE_HOLD'); assert.equal(m.calls.length, 0);
+    assert.equal(afterCrash.authorization?.modalities.text.consumedRequests, 1);
+  });
+});
+
+test('CLI remains offline by default and cannot chain review into live', async () => {
   const path = fileURLToPath(new URL('../evaluation/fixtures/synthetic-run.json', import.meta.url));
-  const dry = await runCli([path]);
-  assert.equal(dry.exitCode, 0); assert.equal((dry.report as any).mode, 'dry-run');
-  assert.equal((await runCli([])).exitCode, 2);
-  assert.equal((await runCli([path, '--unsafe'])).exitCode, 2);
+  assert.equal((await runCli([path])).exitCode, 0);
+  assert.equal((await runCli([])).exitCode, 2); assert.equal((await runCli([path, '--unsafe'])).exitCode, 2);
+  const legacyLive = await runCli([path, '--live']); assert.equal((legacyLive.report as any).code, 'AUTHORIZATION_REQUIRED');
+  assert.equal((await runCli([path, '--live', '--review-input', randomUUID()])).exitCode, 2);
 });
 
-test('planning sends only eligible facts and evaluates the diagnostic draft', async () => {
-  const id = '22222222-2222-4222-8222-222222222222';
-  const candidateId = '33333333-3333-4333-8333-333333333333';
-  const planFixture = { ...human, skill: 'plan-section', productName: 'Synthetic bottle', expectedFacts: [], expectedConflictAttributes: [],
-    facts: [{ ...output.facts[0], id, status: 'confirmed' },
-      { ...output.facts[0], id: candidateId, attribute: 'other', status: 'candidate' }] };
-  const plan = { chapters: [{ role: 'feature', purpose: '说明容量', factIds: [id] }],
-    section: { purpose: '验证容量信息', factIds: [id], missingInputs: ['产品图片'] } };
-  const response = good(); response.choices[0]!.message.content = JSON.stringify(plan);
-  const m = mock(response); const report = await runEvaluation(config, [planFixture], m.options);
-  assert.equal(report.status, 'needs_human_review');
-  const body = JSON.parse(m.calls[1]!.init!.body as string);
-  const input = JSON.parse(body.messages[1].content);
-  assert.equal(input.confirmedFacts.length, 1); assert.equal(input.confirmedFacts[0].id, id);
-  assert.ok(!JSON.stringify(input).includes(candidateId));
-});
-
-test('batch has exactly the requested number of calls and preserves zero versus unknown costs', async () => {
-  const response = good(); response.usage.cost = 0;
-  const m = mock(response);
-  const report = await runEvaluation({ ...config, maxRequests: 2 }, [human, human], m.options);
-  assert.equal(report.status, 'needs_human_review'); assert.equal(report.requestsAttempted, 2);
-  assert.equal(m.calls.length, 3); assert.equal(report.observedCostUsd, 0); assert.equal(report.items.length, 2);
+test('two requested items consume exactly two permits and retain observed zero', async () => {
+  const batchConfig = { ...config, maxRequests: 2 };
+  await withMock(async m => {
+    const report = await runEvaluation(batchConfig, [human, human], m.options);
+    assert.equal(report.status, 'needs_human_review'); assert.equal(report.requestsAttempted, 2);
+    assert.equal(m.calls.length, 3); assert.equal(report.observedCostUsd, 0); assert.equal(report.items.length, 2);
+    assert.equal(report.authorization?.modalities.text.consumedRequests, 2);
+  }, { config: batchConfig, fixtures: [human, human], response: good(config.modelId, 0) });
 });
