@@ -1,19 +1,56 @@
 import { randomUUID } from 'node:crypto';
-import type { Evidence, Project } from './contracts.js';
+import type { Evidence, Fact, Project } from './contracts.js';
 import { AppError } from './errors.js';
 import { LocalObjects } from './objects.js';
 import { requireProduction } from './production.js';
 import type { MaterialUsageInput, MaterialSourceImpact, MaterialProvenance, MaterialUsageDecision, MaterialReviewCenter } from './production-material-usage.js';
-import { evidenceIsAvailable, factSourceIsCurrent, materialLocatorText } from './material-source-gates.js';
+import { assertProjectFactPersistenceReadable, currentFactConflict, evidenceIsAvailable, factIntegrityIsValid, factSourceIsCurrent,
+  factSupersessionIsEffective, materialLocatorText, projectActiveFactIntegrityIsValid,
+  projectEvidenceCollectionIsValid, projectFactCollectionIsTraversable } from './material-source-gates.js';
 import { audit } from './store.js';
+import { invalidateStructuredFactSources, replacementEvidenceForStructuredSource, structuredSourceImpact,
+  structuredSourceReconfirmationBlockReason } from './fact-sources.js';
+import { prepareLegacyFactSourceReconfirmation } from './domain.js';
+import { createFactLifecycleBinding, factLifecycleBindingIsValid, structuredRiskSeverity,
+  type StructuredFactSource } from './production-fact-sources.js';
+
+const readableEvidence = (p: Project): Evidence[] => projectEvidenceCollectionIsValid(p) ? p.evidence : [];
+const traversableFacts = (p: Project): Fact[] => projectFactCollectionIsTraversable(p) ? p.facts : [];
+const emptySourceImpact = (evidenceIds: string[]): MaterialSourceImpact => ({
+  affectedEvidenceIds: evidenceIds, affectedFactIds: [], affectedCandidateIds: [],
+  reconfirmationRequiredFactIds: [], affectedSectionIds: [], affectedStoryboardIds: [],
+});
+function readSourceImpact(p: Project, evidenceIds: string[]): MaterialSourceImpact {
+  try { return evidenceSourceImpact(p, evidenceIds); }
+  catch { return emptySourceImpact(evidenceIds); }
+}
+function structuredSourcesForReview(fact: Fact): StructuredFactSource[] {
+  const structured = Reflect.get(fact, 'structured');
+  if (!structured || typeof structured !== 'object') return [];
+  const sources = Reflect.get(structured, 'sources');
+  if (!Array.isArray(sources)) return [];
+  return sources.filter((source): source is StructuredFactSource => !!source && typeof source === 'object'
+    && typeof Reflect.get(source, 'id') === 'string' && typeof Reflect.get(source, 'evidenceId') === 'string');
+}
+function assertMaterialUsageTraversal(p: Project): void {
+  assertProjectFactPersistenceReadable(p);
+  // Material usage traverses every structured source even when no existing projection changes.
+  structuredSourceImpact(p, []);
+}
+function materialUsageTraversalIsReadable(p: Project): boolean {
+  try { assertMaterialUsageTraversal(p); return true; }
+  catch { return false; }
+}
 
 /** Shared impact calculation; a future formal-baseline adapter can consume the same source set. */
 export function materialSourceImpact(p: Project, materialId: string, blockIds: string[]): MaterialSourceImpact {
-  return evidenceSourceImpact(p, p.evidence.filter(e => e.materialSource?.materialId === materialId
+  return readSourceImpact(p, readableEvidence(p).filter(e => e.materialSource?.materialId === materialId
     && blockIds.includes(e.materialSource.blockId)).map(e => e.id));
 }
 function evidenceSourceImpact(p: Project, evidenceIds: string[]): MaterialSourceImpact {
-  const facts = p.facts.filter(f => evidenceIds.includes(f.evidenceId));
+  const structured = structuredSourceImpact(p, evidenceIds);
+  const structuredFactIds = new Set(structured.map(item => item.factId));
+  const facts = p.facts.filter(f => evidenceIds.includes(f.evidenceId) || structuredFactIds.has(f.id));
   const affectedFactIds = facts.map(f => f.id);
   const storyboards = [...(p.storyboard ? [p.storyboard] : []), ...(p.storyboardCandidates ?? [])];
   return { affectedEvidenceIds: evidenceIds, affectedFactIds,
@@ -21,7 +58,7 @@ function evidenceSourceImpact(p: Project, evidenceIds: string[]): MaterialSource
     reconfirmationRequiredFactIds: facts.filter(f => f.status === 'confirmed' && f.locked).map(f => f.id),
     affectedSectionIds: p.sections.filter(s => s.factIds.some(id => affectedFactIds.includes(id))).map(s => s.id),
     affectedStoryboardIds: [...new Set(storyboards.filter(b => b.chapters.some(c => c.factIds.some(id => affectedFactIds.includes(id))))
-      .flatMap(b => b.id ? [b.id] : []))] };
+      .flatMap(b => b.id ? [b.id] : []))], ...(structured.length ? { affectedStructuredSources: structured } : {}) };
 }
 function selection(p: Project, materialId: string, input: MaterialUsageInput) {
   const material = requireProduction(p).materials?.find(item => item.id === materialId);
@@ -44,9 +81,11 @@ function selection(p: Project, materialId: string, input: MaterialUsageInput) {
   return { material, decisions, changed: decisions.filter(item => item.previous?.usage !== item.usage) };
 }
 export function materialUsageIsUnchanged(p: Project, materialId: string, input: MaterialUsageInput): boolean {
+  assertMaterialUsageTraversal(p);
   return selection(p, materialId, input).changed.length === 0;
 }
 export async function reviewMaterialUsage(p: Project, materialId: string, input: MaterialUsageInput, actor: string, objects: LocalObjects) {
+  assertMaterialUsageTraversal(p);
   const { material, changed } = selection(p, materialId, input);
   if (!changed.length) return;
   // All choices are validated before writes. Original integrity is checked before deriving any new projection.
@@ -84,10 +123,15 @@ export async function reviewMaterialUsage(p: Project, materialId: string, input:
     decision.changes.push({ blockId: block.id, locator: structuredClone(block.locator), previousUsage: previous?.usage ?? null,
       ...(previous ? { previousProjectionId: previous.projectionId } : {}), usage: item.usage, projectionId: item.id });
   }
+  invalidateStructuredFactSources(p, impact.affectedEvidenceIds, withdrawn);
   for (const fact of p.facts) {
+    if (fact.structured) continue;
     if (!impact.affectedFactIds.includes(fact.id) || !['candidate', 'confirmed'].includes(fact.status)) continue;
+    const lifecycleWasValid = factLifecycleBindingIsValid(fact);
     fact.sourceReview = { ...withdrawn, evidenceId: fact.evidenceId,
       status: fact.status === 'confirmed' ? 'reconfirmation_required' : 'invalidated' };
+    if (lifecycleWasValid)
+      fact.lifecycleBinding = createFactLifecycleBinding(fact, withdrawn.actor, withdrawn.reason, fact.status, withdrawn.at);
   }
   for (const section of p.sections) if (impact.affectedSectionIds.includes(section.id)) section.freshness = 'stale';
   // Legacy storyboards can have no id; still mark their actual dependencies stale.
@@ -98,36 +142,97 @@ export async function reviewMaterialUsage(p: Project, materialId: string, input:
   audit(p, 'material.usage.decided', actor, { materialId, decisionId, usageVersion: version, reason: input.reason, impact });
 }
 export function replacementEvidence(p: Project, evidence: Evidence, quote: string): Evidence | undefined {
+  if (!projectEvidenceCollectionIsValid(p) || !evidence || typeof evidence !== 'object' || typeof quote !== 'string') return;
   const source = evidence.materialSource;
-  if (!source) return;
+  if (!source || typeof source !== 'object') return;
   return p.evidence.find(item => item.id !== evidence.id && item.materialSource?.materialId === source.materialId
     && item.materialSource.blockId === source.blockId && evidenceIsAvailable(p, item) && item.text.includes(quote));
 }
 export function materialReviewCenter(p: Project): MaterialReviewCenter {
   const production = requireProduction(p);
   const tasks: MaterialReviewCenter['tasks'] = [];
-  for (const material of production.materials ?? []) {
-    if (material.parse.runStatus !== 'succeeded' || material.parse.queueStatus !== 'done') continue;
-    const blockIds = material.blocks.filter(block => !material.usageReview?.current[block.id]).map(block => block.id);
-    if (blockIds.length) tasks.push({ id: `material-usage:${material.id}`, type: 'material_usage', status: 'pending', materialId: material.id, blockIds });
-    for (const [blockId, current] of Object.entries(material.usageReview?.current ?? {})) {
-      const evidence = p.evidence.find(item => item.id === current.projectionId);
-      if (current.extraction?.status === 'extraction_needed' && evidence && evidenceIsAvailable(p, evidence))
-        tasks.push({ id: `fact-extraction:${current.projectionId}`, type: 'fact_extraction', status: 'extraction_needed',
-          materialId: material.id, blockId, evidenceId: current.projectionId, usageDecisionId: current.decisionId, usageVersion: current.version });
+  const activeIntegrityInvalid = !projectActiveFactIntegrityIsValid(p);
+  const evidence = readableEvidence(p);
+  const facts = traversableFacts(p);
+  if (materialUsageTraversalIsReadable(p)) {
+    for (const material of production.materials ?? []) {
+      if (material.parse.runStatus !== 'succeeded' || material.parse.queueStatus !== 'done') continue;
+      const blockIds = material.blocks.filter(block => !material.usageReview?.current[block.id]).map(block => block.id);
+      if (blockIds.length) tasks.push({ id: `material-usage:${material.id}`, type: 'material_usage', status: 'pending', materialId: material.id, blockIds });
+      for (const [blockId, current] of Object.entries(material.usageReview?.current ?? {})) {
+        const sourceEvidence = evidence.find(item => item.id === current.projectionId);
+        if (current.extraction?.status === 'extraction_needed' && sourceEvidence && evidenceIsAvailable(p, sourceEvidence))
+          tasks.push({ id: `fact-extraction:${current.projectionId}`, type: 'fact_extraction', status: 'extraction_needed',
+            materialId: material.id, blockId, evidenceId: current.projectionId, usageDecisionId: current.decisionId, usageVersion: current.version });
+      }
     }
   }
-  for (const fact of p.facts) {
-    const evidence = p.evidence.find(item => item.id === fact.evidenceId);
-    if (fact.status === 'candidate' && factSourceIsCurrent(p, fact)) tasks.push({ id: `fact-review:${fact.id}`,
-      type: 'fact_review', status: 'pending', factId: fact.id, evidenceId: fact.evidenceId,
-      ...(evidence?.materialSource ? { materialId: evidence.materialSource.materialId } : {}) });
-    if (fact.status !== 'confirmed' || !fact.locked || fact.sourceReview?.status !== 'reconfirmation_required' || !evidence?.materialSource) continue;
-    const replacement = replacementEvidence(p, evidence, fact.quote);
-    const affected = evidenceSourceImpact(p, [evidence.id]);
-    tasks.push({ id: `fact-source-reconfirmation:${fact.id}`, type: 'fact_source_reconfirmation', status: replacement ? 'ready' : 'blocked',
-      factId: fact.id, evidenceId: evidence.id, materialId: evidence.materialSource.materialId, blockId: evidence.materialSource.blockId,
+  for (const fact of facts) {
+    if (factSupersessionIsEffective(p, fact)) continue;
+    const factEvidence = evidence.find(item => item.id === fact.evidenceId);
+    if (fact.structured) {
+      if (fact.status === 'candidate') {
+        const integrityValid = factIntegrityIsValid(p, fact);
+        const conflict = integrityValid && factSourceIsCurrent(p, fact) && currentFactConflict(p, fact);
+        const blockedReason = activeIntegrityInvalid ? 'INVALID_FACT_BINDING' as const
+          : conflict ? 'UNRESOLVED_FACT_CONFLICT' as const
+          : structuredRiskSeverity(fact.structured) === 'blocker' ? 'BLOCKING_FACT_RISK' as const : undefined;
+        if (!integrityValid || factSourceIsCurrent(p, fact)) tasks.push({ id: `fact-review:${fact.id}`,
+          type: 'fact_review', status: blockedReason ? 'blocked' : 'pending', factId: fact.id, evidenceId: fact.evidenceId,
+          sourceIds: structuredSourcesForReview(fact).map(source => source.id),
+          ...(blockedReason ? { blockedReason } : {}),
+          ...(factEvidence?.materialSource ? { materialId: factEvidence.materialSource.materialId } : {}) });
+      }
+      if (fact.status !== 'confirmed' || !fact.locked) continue;
+      for (const source of structuredSourcesForReview(fact)) {
+        if (source.review?.status !== 'reconfirmation_required') continue;
+        const oldEvidence = evidence.find(item => item.id === source.evidenceId);
+        if (!oldEvidence?.materialSource) continue;
+        const replacement = replacementEvidenceForStructuredSource(p, source);
+        const blockedReason = activeIntegrityInvalid ? 'INVALID_FACT_BINDING' as const
+          : !replacement ? 'REPLACEMENT_EVIDENCE_REQUIRED' as const
+          : structuredSourceReconfirmationBlockReason(p, fact, source, replacement);
+        const affected = readSourceImpact(p, [source.evidenceId]);
+        tasks.push({ id: `fact-source-reconfirmation:${fact.id}:${source.id}`, type: 'fact_source_reconfirmation',
+          status: blockedReason ? 'blocked' : 'ready', factId: fact.id, sourceId: source.id,
+          evidenceId: source.evidenceId, materialId: oldEvidence.materialSource.materialId,
+          blockId: oldEvidence.materialSource.blockId, ...(replacement ? { replacementEvidenceId: replacement.id } : {}),
+          ...(blockedReason ? { blockedReason } : {}),
+          affectedSectionIds: affected.affectedSectionIds.filter(id => p.sections.find(s => s.id === id)?.factIds.includes(fact.id)),
+          affectedStoryboardIds: affected.affectedStoryboardIds.filter(id => [...(p.storyboard ? [p.storyboard] : []), ...(p.storyboardCandidates ?? [])]
+            .some(b => b.id === id && b.chapters.some(c => c.factIds.includes(fact.id)))) });
+      }
+      continue;
+    }
+    if (fact.status === 'candidate' && (!factIntegrityIsValid(p, fact) || factSourceIsCurrent(p, fact))) {
+      const conflict = factIntegrityIsValid(p, fact) && currentFactConflict(p, fact);
+      const blockedReason = activeIntegrityInvalid ? 'INVALID_FACT_BINDING' as const
+        : conflict ? 'UNRESOLVED_FACT_CONFLICT' as const : undefined;
+      tasks.push({ id: `fact-review:${fact.id}`,
+      type: 'fact_review', status: blockedReason ? 'blocked' : 'pending', factId: fact.id, evidenceId: fact.evidenceId,
+      ...(blockedReason ? { blockedReason } : {}),
+      ...(factEvidence?.materialSource ? { materialId: factEvidence.materialSource.materialId } : {}) });
+    }
+    if (fact.status !== 'confirmed' || !fact.locked || fact.sourceReview?.status !== 'reconfirmation_required' || !factEvidence?.materialSource) continue;
+    const replacement = replacementEvidence(p, factEvidence, fact.quote);
+    let blockedReason: 'REPLACEMENT_EVIDENCE_REQUIRED' | 'INVALID_FACT_BINDING' | 'UNRESOLVED_FACT_CONFLICT' | undefined;
+    if (activeIntegrityInvalid) blockedReason = 'INVALID_FACT_BINDING';
+    else if (!replacement) blockedReason = 'REPLACEMENT_EVIDENCE_REQUIRED';
+    else {
+      try {
+        prepareLegacyFactSourceReconfirmation(p, fact.id, replacement.id,
+          'Validate source reconfirmation readiness', 'material-review-center');
+      }
+      catch (error) {
+        blockedReason = error instanceof AppError && error.code === 'UNRESOLVED_FACT_CONFLICT'
+          ? 'UNRESOLVED_FACT_CONFLICT' : 'INVALID_FACT_BINDING';
+      }
+    }
+    const affected = readSourceImpact(p, [factEvidence.id]);
+    tasks.push({ id: `fact-source-reconfirmation:${fact.id}`, type: 'fact_source_reconfirmation', status: blockedReason ? 'blocked' : 'ready',
+      factId: fact.id, evidenceId: factEvidence.id, materialId: factEvidence.materialSource.materialId, blockId: factEvidence.materialSource.blockId,
       ...(replacement ? { replacementEvidenceId: replacement.id } : {}),
+      ...(blockedReason ? { blockedReason } : {}),
       affectedSectionIds: affected.affectedSectionIds.filter(id => p.sections.find(s => s.id === id)?.factIds.includes(fact.id)),
       affectedStoryboardIds: affected.affectedStoryboardIds.filter(id => [...(p.storyboard ? [p.storyboard] : []), ...(p.storyboardCandidates ?? [])]
         .some(b => b.id === id && b.chapters.some(c => c.factIds.includes(fact.id)))) });

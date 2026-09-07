@@ -16,6 +16,9 @@ import { registerMaterialUsageRoutes } from './material-usage-routes.js';
 import { materialUsageSchema, factSourceReconfirmSchema } from './production-material-usage.js';
 import { registerStartupRoutes } from './startup-routes.js';
 import { STARTUP_CONTRACT_VERSION, startupCheckSchema, startupExecutionCapability, startupScopeRefreshSchema, startupStartSchema, type StartupExecutionConfig } from './production-startup.js';
+import { registerFactSourceRoutes } from './fact-source-routes.js';
+import { FACT_SOURCES_CONTRACT_VERSION, structuredFactCandidateSchema, structuredFactConfirmSchema, structuredFactSourceReconfirmSchema } from './production-fact-sources.js';
+import { assertProjectEvidenceCollectionValid } from './material-source-gates.js';
 
 const projectParams = z.object({ id: z.string().uuid() });
 const factParams = projectParams.extend({ factId: z.string().uuid(), action: z.enum(['confirm', 'reject', 'retract']) });
@@ -45,9 +48,12 @@ export function buildApp(store: Store, objects: LocalObjects, options: { token: 
   app.get('/api/contracts', async () => ({ version: CONTRACT_VERSION,
     productionVersion: PRODUCTION_CONTRACT_VERSION,
     startupVersion: STARTUP_CONTRACT_VERSION,
+    factSourcesVersion: FACT_SOURCES_CONTRACT_VERSION,
     requests: Object.fromEntries(Object.entries({ startupCheck: startupCheckSchema, startupStart: startupStartSchema, startupContinueExtraction: writeSchema.strict(), startupScopeRefresh: startupScopeRefreshSchema,
       productionRuleCheck: ruleCheckSchema, materialUsage: materialUsageSchema, factSourceReconfirm: factSourceReconfirmSchema, materialUpload: materialUploadSchema, materialParseRetry: writeSchema.strict(), productionContextDraft: contextWriteSchema, productionContextActivate: writeSchema.strict(), productionInitialize: writeSchema.strict(), create: createSchema, identity: identitySchema, evidence: evidenceSchema,
       factReview: reasonSchema, factCandidate: candidateSchema, identityCorrection: identityCorrectionSchema,
+      structuredFactCandidate: structuredFactCandidateSchema, structuredFactConfirm: structuredFactConfirmSchema,
+      structuredFactSourceReconfirm: structuredFactSourceReconfirmSchema,
       storyboardEdit: storyboardEditSchema, sectionEdit: sectionEditSchema, candidateApply: reasonSchema, sectionSelect: reasonSchema,
       run: runSchema, write: writeSchema.strict() }).map(([name, schema]) => [name, z.toJSONSchema(schema)])),
     skillOutputs: { 'extract-facts': z.toJSONSchema(extractionSchema), 'plan-section': z.toJSONSchema(planSchema) },
@@ -62,6 +68,7 @@ export function buildApp(store: Store, objects: LocalObjects, options: { token: 
   registerMaterialRoutes(app, store, objects, options.actor);
   registerProductionRuleRoutes(app, store);
   registerMaterialUsageRoutes(app, store, objects, options.actor);
+  registerFactSourceRoutes(app, store, options.actor);
   registerStartupRoutes(app, store, options.actor, productionCatalog, startupExecution);
   app.get('/api/production/catalog', async () => ({ contractVersion: PRODUCTION_CONTRACT_VERSION, ...productionCatalog }));
   app.post('/api/projects/:id/production/context/draft', async request => {
@@ -138,6 +145,7 @@ export function buildApp(store: Store, objects: LocalObjects, options: { token: 
     const { id } = projectParams.parse(request.params);
     const body = evidenceSchema.parse(request.body);
     return store.command(id, body, 'evidence.added', options.actor, async p => {
+      assertProjectEvidenceCollectionValid(p!);
       if (p!.evidence.filter(e => !e.materialSource).length >= 10) throw new AppError('EVIDENCE_LIMIT', 409);
       const artifact = await objects.put(body.text);
       p!.evidence.push({ id: randomUUID(), documentName: body.documentName, locator: body.locator, text: body.text,

@@ -3,8 +3,13 @@ import { z } from 'zod';
 import { CONTRACT_VERSION, draftState, type Fact, type Project, type Skill, type AgentRun, type Plan, type Storyboard, type Section, extractionSchema, planSchema, candidateSchema } from './contracts.js';
 import { AppError } from './errors.js';
 import { audit } from './store.js';
-import { availableConfirmedFacts, availableEvidence, evidenceIsAvailable, factSourceIsCurrent, recordMaterialExtraction } from './material-source-gates.js';
+import { assertProjectFactCollectionTraversable, assertProjectFactPersistenceReadable,
+  availableConfirmedFacts, availableEvidence, currentFactConflict, evidenceIsAvailable, factGovernanceHasBlockingIssue,
+  factIntegrityIsValid, factSourceIsCurrent, factSupersessionIsEffective, projectActiveFactIntegrityIsValid,
+  recordMaterialExtraction } from './material-source-gates.js';
 import { validateStartupRun } from './startup-scope.js';
+import { createFactLifecycleBinding, createLegacyFactBinding, createLegacyFactCandidateBinding, rejectedFactRequiringReconsideration,
+  structuredRiskSeverity } from './production-fact-sources.js';
 
 export function createProject(name: string): Project {
   return { id: randomUUID(), name, version: 1, revision: 1, inputRevision: 1, currentSectionId: null, contractVersion: CONTRACT_VERSION,
@@ -12,47 +17,56 @@ export function createProject(name: string): Project {
 }
 const key = (s: string) => s.normalize('NFKC').trim().toLocaleLowerCase();
 function conflicts(p: Project, f: Fact) {
-  return factSourceIsCurrent(p, f) && p.facts.some(other => other.id !== f.id && ['candidate', 'confirmed'].includes(other.status) && factSourceIsCurrent(p, other)
-    && ((key(other.attribute) === key(f.attribute) && key(other.value) !== key(f.value))
-      || (other.correctsFactId === f.id || f.correctsFactId === other.id)));
+  return !!currentFactConflict(p, f);
 }
 export function refreshConflicts(p: Project) {
-  for (const f of p.facts) f.issueSeverity = ['candidate', 'confirmed'].includes(f.status) && conflicts(p, f) ? 'blocker' : 'none';
+  assertProjectFactCollectionTraversable(p);
+  for (const f of p.facts) f.issueSeverity = !['candidate', 'confirmed'].includes(f.status) || factSupersessionIsEffective(p, f) ? 'none'
+    : !factSourceIsCurrent(p, f) || conflicts(p, f) ? 'blocker' : f.structured ? structuredRiskSeverity(f.structured) : 'none';
   for (const s of p.sections) s.issueSeverity = s.factIds.some(id => {
-    const fact = p.facts.find(f => f.id === id);
-    return !fact || fact.issueSeverity === 'blocker' || !factSourceIsCurrent(p, fact);
+    return !availableConfirmedFacts(p).some(fact => fact.id === id);
   }) ? 'blocker' : 'none';
 }
 export function reviewFact(p: Project, factId: string, action: 'confirm' | 'reject' | 'retract', actor: string, reason: string) {
+  assertProjectFactCollectionTraversable(p);
   const fact = p.facts.find(f => f.id === factId);
   if (!fact) throw new AppError('FACT_NOT_FOUND', 404);
   if (action === 'confirm') {
+    if (fact.structured) throw new AppError('STRUCTURED_FACT_CONFIRM_REQUIRED', 409);
     if (fact.status !== 'candidate') throw new AppError('FACT_NOT_CANDIDATE', 409);
+    if (!projectActiveFactIntegrityIsValid(p)) throw new AppError('INVALID_FACT_BINDING', 409);
     if (!factSourceIsCurrent(p, fact)) throw new AppError('INVALID_EVIDENCE', 409);
     if (conflicts(p, fact)) throw new AppError('UNRESOLVED_FACT_CONFLICT', 409);
-    fact.status = 'confirmed'; fact.locked = true;
-    fact.confirmedBy = actor; fact.confirmedAt = new Date().toISOString();
+    const at = new Date().toISOString(); fact.status = 'confirmed'; fact.locked = true;
+    fact.confirmedBy = actor; fact.confirmedAt = at;
+    fact.legacyBinding = createLegacyFactBinding(fact, p.evidence.find(e => e.id === fact.evidenceId)!);
+    fact.lifecycleBinding = createFactLifecycleBinding(fact, actor, reason, 'candidate', at);
   } else if (action === 'reject') {
     if (fact.status !== 'candidate') throw new AppError('FACT_NOT_CANDIDATE', 409);
+    // Explicit rejection is the migration/quarantine path for an old or invalid active candidate.
     fact.status = 'rejected';
+    fact.lifecycleBinding = createFactLifecycleBinding(fact, actor, reason, 'candidate', undefined, true);
   } else {
     if (fact.status !== 'confirmed') throw new AppError('FACT_NOT_CONFIRMED', 409);
+    if (factSupersessionIsEffective(p, fact)) throw new AppError('FACT_SUPERSEDED', 409);
+    // Explicit retraction can quarantine an old or invalid active confirmation without silently blessing it.
     fact.status = 'retracted'; fact.locked = false;
+    fact.lifecycleBinding = createFactLifecycleBinding(fact, actor, reason, 'confirmed', undefined, true);
     for (const s of p.sections) if (s.factIds.includes(factId)) s.freshness = 'stale';
     if (p.storyboard?.chapters.some(c => c.factIds.includes(factId))) p.storyboard.freshness = 'stale';
     for (const b of p.storyboardCandidates ?? []) if (b.chapters.some(c => c.factIds.includes(factId))) b.freshness = 'stale';
   }
   if (action !== 'reject') p.version++;
-  refreshConflicts(p);
   audit(p, `fact.${action}`, actor, { factId, reason, evidenceId: fact.evidenceId });
+  refreshConflicts(p);
 }
 export function checkSkillInputs(p: Project, skill: Skill, run?: AgentRun) {
   const selected = run ? validateStartupRun(p, run) : undefined;
   if (skill === 'extract-facts' && !(selected ?? availableEvidence(p)).length) throw new AppError('EVIDENCE_REQUIRED', 409);
   if (skill === 'plan-section') {
     if (!p.identity) throw new AppError('CONFIRMED_PRODUCT_IDENTITY_REQUIRED', 409);
+    if (factGovernanceHasBlockingIssue(p)) throw new AppError('UNRESOLVED_FACT_CONFLICT', 409);
     if (!availableConfirmedFacts(p).some(f => f.role === 'core')) throw new AppError('CONFIRMED_CORE_FACT_REQUIRED', 409);
-    if (p.facts.some(f => f.issueSeverity === 'blocker' && factSourceIsCurrent(p, f))) throw new AppError('UNRESOLVED_FACT_CONFLICT', 409);
   }
 }
 export function enqueue(p: Project, skill: Skill, actor: string) {
@@ -76,18 +90,22 @@ export function applyOutput(p: Project, run: AgentRun, raw: unknown) {
   if (run.contextVersion !== p.version || inputChanged) throw new AppError('STALE_INPUT', 409);
   if (run.skill === 'extract-facts') {
     checkSkillInputs(p, run.skill, run);
+    if (!projectActiveFactIntegrityIsValid(p)) throw new AppError('INVALID_FACT_BINDING', 409);
     const selected = validateStartupRun(p, run) ?? availableEvidence(p);
     const output = extractionSchema.parse(raw);
     const facts = output.facts.map(f => {
       const evidence = selected.find(e => e.id === f.evidenceId);
       const start = evidence?.text.indexOf(f.quote) ?? -1;
       if (!evidence || !evidenceIsAvailable(p, evidence) || start < 0) throw new AppError('INVALID_EVIDENCE_REFERENCE');
-      return { ...f, id: randomUUID(), start, end: start + f.quote.length, sourceRunId: run.id,
-        status: 'candidate' as const, locked: false, issueSeverity: 'none' as const };
+      const fact: Fact = { ...f, id: randomUUID(), start, end: start + f.quote.length, sourceRunId: run.id,
+        status: 'candidate', locked: false, issueSeverity: 'none' };
+      fact.legacyCandidateBinding = createLegacyFactCandidateBinding(fact);
+      fact.lifecycleBinding = createFactLifecycleBinding(fact, run.requestedBy, 'Accepted bounded extraction candidate', null);
+      return fact;
     });
     // Re-extraction cannot resurrect rejected values or mutate previously confirmed facts.
     for (const fact of facts) if (!p.facts.some(f => key(f.attribute) === key(fact.attribute) && key(f.value) === key(fact.value)
-      && (f.evidenceId === fact.evidenceId || factSourceIsCurrent(p, f)))) p.facts.push(fact);
+      && (['rejected', 'retracted'].includes(f.status) || f.evidenceId === fact.evidenceId || factSourceIsCurrent(p, f)))) p.facts.push(fact);
     refreshConflicts(p);
     recordMaterialExtraction(p, selected.map(e => e.id), run.requestedBy, run.id);
   } else {
@@ -114,7 +132,7 @@ export function preflight(p: Project) {
   if (!p.identity) issues.push('CONFIRMED_PRODUCT_IDENTITY_REQUIRED');
   const current = selectedSection(p);
   if (!current) issues.push(p.sections.length ? 'SECTION_SELECTION_REQUIRED' : 'SECTION_DRAFT_REQUIRED');
-  if (p.facts.some(f => f.issueSeverity === 'blocker' && factSourceIsCurrent(p, f))) issues.push('UNRESOLVED_FACT_CONFLICT');
+  if (factGovernanceHasBlockingIssue(p)) issues.push('UNRESOLVED_FACT_CONFLICT');
   if (!p.storyboard) issues.push('CURRENT_STORYBOARD_REQUIRED');
   if (p.storyboard?.freshness === 'stale') issues.push('STALE_STORYBOARD');
   for (const s of current ? [current] : []) {
@@ -122,8 +140,8 @@ export function preflight(p: Project) {
     if (!sectionBelongsToStoryboard(p, s)) issues.push(`SECTION_OUTSIDE_STORYBOARD:${s.id}`);
     if (s.missingInputs.length) issues.push(`MISSING_INPUTS:${s.id}`);
     for (const id of s.factIds) {
-      const f = p.facts.find(fact => fact.id === id && fact.status === 'confirmed');
-      if (!f || !f.locked || !factSourceIsCurrent(p, f)) issues.push(`INVALID_FACT_EVIDENCE:${id}`);
+      const f = availableConfirmedFacts(p).find(fact => fact.id === id);
+      if (!f) issues.push(`INVALID_FACT_EVIDENCE:${id}`);
     }
   }
   p.qa = { kind: 'preflight', checkedVersion: p.version, checkedRevision: p.revision,
@@ -143,27 +161,44 @@ function sectionBelongsToStoryboard(p: Project, section: Section) {
   return section.sourceRunId !== 'human' && section.sourceRunId === storyboard.sourceRunId;
 }
 export function addCandidate(p: Project, input: z.infer<typeof candidateSchema>, actor: string) {
+  assertProjectFactPersistenceReadable(p);
+  if (!projectActiveFactIntegrityIsValid(p)) throw new AppError('INVALID_FACT_BINDING', 409);
   if (input.correctsFactId && !p.facts.some(f => f.id === input.correctsFactId)) throw new AppError('FACT_NOT_FOUND', 404);
   const evidence = p.evidence.find(e => e.id === input.evidenceId && evidenceIsAvailable(p, e));
   const start = evidence?.text.indexOf(input.quote) ?? -1;
   if (!evidence || start < 0) throw new AppError('INVALID_EVIDENCE_REFERENCE', 409);
-  p.facts.push({ id: randomUUID(), attribute: input.attribute, role: input.role, value: input.value,
+  const fact: Fact = { id: randomUUID(), attribute: input.attribute, role: input.role, value: input.value,
     evidenceId: input.evidenceId, quote: input.quote, start, end: start + input.quote.length,
     sourceRunId: 'human', createdBy: actor, reason: input.reason, correctsFactId: input.correctsFactId,
-    status: 'candidate', locked: false, issueSeverity: 'none' });
+    status: 'candidate', locked: false, issueSeverity: 'none' };
+  const rejected = rejectedFactRequiringReconsideration(p.facts, fact);
+  if (rejected && input.correctsFactId !== rejected.id)
+    throw new AppError('REJECTED_FACT_RECONSIDERATION_REQUIRED', 409, { factId: rejected.id });
+  fact.legacyCandidateBinding = createLegacyFactCandidateBinding(fact);
+  fact.lifecycleBinding = createFactLifecycleBinding(fact, actor, input.reason, null);
+  p.facts.push(fact);
   refreshConflicts(p);
   recordMaterialExtraction(p, [input.evidenceId], actor);
   audit(p, 'fact.candidate_saved', actor, { factId: p.facts.at(-1)!.id, correctsFactId: input.correctsFactId ?? null, reason: input.reason });
 }
 export function factSourceReconfirmIsUnchanged(p: Project, factId: string, evidenceId: string): boolean {
+  if (!projectActiveFactIntegrityIsValid(p)) return false;
   const fact = p.facts.find(f => f.id === factId);
-  return !!fact && fact.status === 'confirmed' && fact.locked && fact.evidenceId === evidenceId && factSourceIsCurrent(p, fact)
+  return !!fact && fact.status === 'confirmed' && fact.locked
+    && fact.evidenceId === evidenceId && factSourceIsCurrent(p, fact)
     && fact.sourceReconfirmations?.at(-1)?.evidenceId === evidenceId;
 }
-export function reconfirmFactSource(p: Project, factId: string, evidenceId: string, reason: string, actor: string) {
+function uniqueQuoteStart(text: string, quote: string): number | undefined {
+  const first = text.indexOf(quote);
+  if (first < 0 || text.indexOf(quote, first + 1) >= 0) return undefined;
+  return first;
+}
+export function prepareLegacyFactSourceReconfirmation(p: Project, factId: string, evidenceId: string,
+  reason: string, actor: string, at = new Date().toISOString()): Fact {
+  if (!projectActiveFactIntegrityIsValid(p)) throw new AppError('INVALID_FACT_BINDING', 409);
   const fact = p.facts.find(f => f.id === factId);
   if (!fact) throw new AppError('FACT_NOT_FOUND', 404);
-  if (factSourceReconfirmIsUnchanged(p, factId, evidenceId)) return;
+  if (fact.structured) throw new AppError('INVALID_FACT_BINDING', 409);
   if (fact.status !== 'confirmed' || !fact.locked || fact.sourceReview?.status !== 'reconfirmation_required')
     throw new AppError('SOURCE_RECONFIRMATION_NOT_REQUIRED', 409);
   const previous = p.evidence.find(e => e.id === fact.evidenceId);
@@ -173,19 +208,31 @@ export function reconfirmFactSource(p: Project, factId: string, evidenceId: stri
     || source.materialId !== previous.materialSource.materialId || source.blockId !== previous.materialSource.blockId
     || source.sourceSha256 !== previous.materialSource.sourceSha256 || evidence.id === previous.id)
     throw new AppError('INVALID_RECONFIRMATION_SOURCE', 409);
-  const start = evidence.text.indexOf(fact.quote);
-  if (start < 0) throw new AppError('INVALID_RECONFIRMATION_SOURCE', 409);
-  const next = { ...fact, evidenceId, start, end: start + fact.quote.length };
-  delete next.sourceReview;
-  if (conflicts(p, next)) throw new AppError('UNRESOLVED_FACT_CONFLICT', 409);
-  const at = new Date().toISOString();
-  (fact.sourceReconfirmations ??= []).push({ previousEvidenceId: fact.evidenceId, evidenceId, actor, at, reason,
+  const start = uniqueQuoteStart(evidence.text, fact.quote);
+  if (start === undefined) throw new AppError('INVALID_RECONFIRMATION_SOURCE', 409);
+  const candidate = structuredClone(fact);
+  (candidate.sourceReconfirmations ??= []).push({ previousEvidenceId: fact.evidenceId, evidenceId, actor, at, reason,
     decisionId: source.usageDecisionId, usageVersion: source.usageVersion });
-  fact.evidenceId = evidenceId; fact.start = next.start; fact.end = next.end; delete fact.sourceReview;
+  candidate.evidenceId = evidenceId; candidate.start = start; candidate.end = start + candidate.quote.length;
+  delete candidate.sourceReview;
+  candidate.lifecycleBinding = createFactLifecycleBinding(candidate, actor, reason, candidate.status, at);
+  if (!factIntegrityIsValid(p, candidate)) throw new AppError('INVALID_FACT_BINDING', 409);
+  if (currentFactConflict(p, candidate)) throw new AppError('UNRESOLVED_FACT_CONFLICT', 409);
+  return candidate;
+}
+export function reconfirmFactSource(p: Project, factId: string, evidenceId: string, reason: string, actor: string) {
+  if (!projectActiveFactIntegrityIsValid(p)) throw new AppError('INVALID_FACT_BINDING', 409);
+  const fact = p.facts.find(f => f.id === factId);
+  if (!fact) throw new AppError('FACT_NOT_FOUND', 404);
+  if (factSourceReconfirmIsUnchanged(p, factId, evidenceId)) return;
+  const previousEvidenceId = fact.evidenceId;
+  const next = prepareLegacyFactSourceReconfirmation(p, factId, evidenceId, reason, actor);
+  p.facts[p.facts.indexOf(fact)] = next;
   p.version++;
   refreshConflicts(p);
-  audit(p, 'fact.source_reconfirmed', actor, { factId, previousEvidenceId: previous.id, evidenceId,
-    decisionId: source.usageDecisionId, usageVersion: source.usageVersion, reason });
+  const reconfirmation = next.sourceReconfirmations!.at(-1)!;
+  audit(p, 'fact.source_reconfirmed', actor, { factId, previousEvidenceId, evidenceId,
+    decisionId: reconfirmation.decisionId, usageVersion: reconfirmation.usageVersion, reason });
 }
 export function correctIdentity(p: Project, productName: string, reason: string, actor: string) {
   if (!p.identity) throw new AppError('CONFIRMED_PRODUCT_IDENTITY_REQUIRED', 409);

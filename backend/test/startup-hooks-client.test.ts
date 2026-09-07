@@ -77,6 +77,8 @@ async function harness(panel?: ComponentType<{ session: ProjectSession; context:
   const unmount = async () => { if (instance) await act(async () => { instance!.unmount(); instance = undefined; }); };
   const connect = async () => { await act(async () => { get().session.setToken(f.headers.authorization.slice(7)); }); await settle(() => !!get().session.catalog || !!get().session.catalogError, 'catalog fetched'); };
   const fill = async () => {
+    await settle(() => !get().session.catalogLoading && get().session.scopedCatalog?.some(rule =>
+      rule.id === scopedRule.id && rule.version === scopedRule.version) === true, 'fresh scoped catalog fetched');
     const form = contextForm(scopedContext, 'scoped-rules.1');
     await act(async () => {
       for (const field of ['productName', 'category', 'stage', 'introduction', 'internalCode', 'commercialIntent', 'widthPx', 'format'] as const) get().context.setField(field, form[field]);

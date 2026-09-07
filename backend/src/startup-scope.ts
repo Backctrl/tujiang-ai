@@ -42,7 +42,7 @@ export function scopeSourceError(p: Project, scope: StartupSourceScope): string 
     if (!material || startupHash(startupMaterialRef(material)) !== startupHash(ref)) return 'STARTUP_SOURCE_CHANGED';
   }
   for (const ref of scope.manualEvidence) {
-    const evidence = p.evidence.find(item => item.id === ref.id);
+    const evidence = availableEvidence(p).find(item => item.id === ref.id);
     if (!evidence || evidence.materialSource || startupHash(startupEvidenceRef(evidence)) !== startupHash(ref)) return 'STARTUP_SOURCE_CHANGED';
   }
 }
