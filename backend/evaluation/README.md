@@ -1,6 +1,6 @@
 # 阶段 A 离线模型评测
 
-本工具只读取本地 JSON，不调用 OpenRouter、不读取 API Key、不产生模型费用。它复用生产 `extractionSchema`、`planSchema`、`checkSkillInputs` 和 `applyOutput`，不替代真实产品验收。
+离线评测入口只读取本地 JSON，不调用 OpenRouter、不读取 API Key、不产生模型费用。它复用生产 `extractionSchema`、`planSchema`、`checkSkillInputs` 和 `applyOutput`，不替代真实产品验收。后述 live runner 另受 [M0 授权账本](AUTHORIZATION-LEDGER.md) 与 [管理操作说明](AUTHORIZATION-OPERATIONS.md) 约束。
 
 在 `backend` 目录运行：
 
@@ -46,15 +46,16 @@ npm run evaluate:runner -- evaluation/fixtures/synthetic-run.json
 
 1. 在独立配置中指定完整模型 ID、精确 provider endpoint tag、请求次数、输入与输出 token 上限、总费用估计门和超时。
 2. 提供 `human-curated` 样本并设置 `acceptEstimatedBudget=true`，表示理解本地估算不等于最终计费硬上限。标记本身不证明样本已经人工核准。
-3. 由操作者在进程环境中配置 `TUJIANG_EVALUATION_LIVE=1` 和 `OPENROUTER_API_KEY`，命令显式追加 `--live`。CLI 不加载 `.env`，不接受命令行 Key。
+3. 管理入口在同一个 PostgreSQL 账本登记固定授权，准备不可变 batch，并由独立管理身份记录对精确 manifest 的已有人工决定。缺少 input-review 或仅声明 `human-curated` 均不能派发；runner 不能自行创建或复核批次。
+4. 由操作者配置账本 URL、材料密钥、`TUJIANG_EVALUATION_LIVE=1` 和 `OPENROUTER_API_KEY`，命令显式追加 `--live --batch <approved-batch-id>`。CLI 不加载 `.env`，不接受命令行 Key；详细环境项见管理操作说明。
 
-真实模式忽略本地能力快照，先通过官方 `/models/{author}/{slug}/endpoints` 查询当前能力。验证文本输入/输出、`response_format`、`structured_outputs`、`max_tokens`、上下文及输入/输出容量、端点 status 与模型 ID。使用 endpoint `tag` 路由；base slug 会匹配 variants，因此多个匹配项一律拒绝，操作者需选精确 tag。缺失或不合法价格/容量/能力均阻断。
+真实模式通过官方 `/models/{author}/{slug}/endpoints` 查询当前能力，并与已审阅快照的相关字段比对。验证文本输入/输出、`response_format`、`structured_outputs`、`max_tokens`、上下文及输入/输出容量、端点 status 与模型 ID。使用 endpoint `tag` 路由；base slug 会匹配 variants，因此多个匹配项一律拒绝。相关价格或能力改变需要重新复核，不能悄然换价执行。
 
-每批运行串行执行，预先验证全部样本。提取只发送 evidence；规划复用生产事实冲突重算与输入门，只发送身份和可用 confirmed facts。预期答案不进入请求。共享的 `buildStructuredRequest` 让生产与评测使用相同提示、过滤和 JSON Schema，runner 与正式 gateway 均使用单一 provider、禁止 fallback 和非流式约束；能力和传输规则共用 src/model-policy.ts。没有重试、自动切换模型或追加 generation 查询。
+所有 live 进程在同一授权下最多持有一个派发许可，预先验证全部样本。当前只接通事实提取；旧 `plan-section` 仅保留离线诊断，不算正式故事。预期答案不进入请求。共享的 `buildStructuredRequest` 让生产与提取评测使用相同提示、过滤和 JSON Schema。禁止 fallback、重试、自动换模型或追加 generation 查询；evaluation 使用有界原文传输器，生产 gateway 未接入本次累计账本。
 
 ## 预算的实际边界
 
-`maxRequests` 限制单次 runner 批次的模型 POST 次数（1–100）；元数据 GET 单独记为 `metadataRequests`，live 模式至多 1 次。不会跨进程或跨运行累计预算。每个请求设置 `max_tokens=maxOutputTokens`；超时覆盖连接、响应头和读取正文，正文最多 2 MB。客户端超时/取消不能保证服务商没有执行或计费。
+`maxRequests` 是批次上限，live 还必须满足固定授权的文本 12 次 / 图片 2 次和用途 3/3/2/2/2/2 配额。PostgreSQL 在进程、目录、批次和阶段之间累计次数与整数微美元估算，已派发不能退款；图片及其他阶段尚未实现 live 适配器。`requestsAttempted` 是本次入口取得的派发数，`authorization` 是累计账本；live 的 `observedCostUsd` 为授权内文本已知总额，存在未知用量时为 null。元数据 GET 单独记为 `metadataRequests`，本次至多 1 次，完成批次重放为 0。每个请求设置 `max_tokens=maxOutputTokens`；超时覆盖连接、响应头和读取正文，正文最多 2 MB。客户端取消不能保证服务商没有执行或计费。
 
 本地按 `maxInputTokens × pricing.prompt + maxOutputTokens × (pricing.completion + advertised internal_reasoning) + advertised request` 估算每次成本，再检查整批和每次调用前的剩余预算。端点价格为每 token/每 request 的美元单价，不能使用模型列表的最低报价替代。输入 token 使用请求 JSON 的 UTF-8 字节数加 1024 的保守启发式进行本地容量筛选，包含提示、schema 和 framing；没有模型 tokenizer，所以**不是严格 token 上界**。实际超限只可在响应后发现。
 
@@ -64,7 +65,7 @@ npm run evaluate:runner -- evaluation/fixtures/synthetic-run.json
 
 ## 脱敏与人工复核
 
-报告仅记录配置/输入/请求/输出/能力摘要、受控状态与错误码、预算及数值观测。不复制样本文本、预期答案、原始模型正文或服务商错误正文。fixture ID 不回显，request ID 只存 SHA256；`finishReason` 使用白名单。报告不保存 Authorization 或 Key。异常只返回固定错误码。需要人工语义复核原始输出时另行建立受控留存流程；本 runner 不把原始模型输出落盘。
+报告仅记录配置/输入/请求/输出/能力摘要、受控状态与错误码、预算及数值观测。不复制样本文本、预期答案、原始模型正文或服务商错误正文。fixture ID 不回显，request ID 只存 SHA256；`finishReason` 使用白名单。报告不保存 Authorization 或 Key。原始来源、输入、预期、请求、能力、响应、解析与人工恢复材料加密保存在账本，绑定内容及元信息摘要；HTTP 错误、非法 JSON 和已收到的部分正文也保留。人工复核通过单独的管理导出入口读取，当前 Key 在保存与导出前脱敏；使用步骤见管理操作说明。
 
 成功输出直接交给现有 `evaluate`；自动通过仍为 `needs_human_review`，所有路径 `businessAcceptance=false`。合成协议测试、人工整理的黄金样本和真实模型质量验证是三种不同证据，不能相互替代。此次交付没有真实模型成绩。
 

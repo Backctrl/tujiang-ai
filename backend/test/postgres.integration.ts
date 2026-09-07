@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import './authorization-postgres.integration.js';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { postgres, migrate, type Database } from '../src/database.js';
