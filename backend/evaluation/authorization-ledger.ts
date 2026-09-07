@@ -19,9 +19,10 @@ type AttemptRow = Row<{ id: string; batch_id: string; item_id: string; purpose: 
   estimated_micros: string | number; state: 'reserved' | 'dispatch_started' | 'finished' | 'cancelled'; owner_sha256: string | null;
   observation: Observation | null; cost_micros: string | number | null; outcome: string | null; error_code: string | null;
   unknown_usage: boolean; started_at: unknown | null; finished_at: unknown | null; reconciled_at: unknown | null;
-  capture_artifact_id: string | null; capture_latency_ms: number | null; parsed_artifact_id: string | null }>;
+  capture_artifact_id: string | null; capture_latency_ms: number | null; parsed_artifact_id: string | null; capabilities_artifact_id: string | null }>;
 type ArtifactRow = Row<{ id: string; batch_id: string | null; attempt_id: string | null; kind: string;
   sealed: SealedArtifact; source_sha256: string; metadata: Record<string, unknown> }>;
+type ArtifactTarget = Pick<ArtifactBinding, 'batchId' | 'attemptId' | 'kind'>;
 export interface AttemptView {
   id: string; batchId: string; itemId: string; purpose: Purpose; modality: Modality;
   state: AttemptRow['state']; outcome: string | null; code: string | null; estimatedCostUsd: number;
@@ -37,6 +38,7 @@ export interface AuthorizationStatus {
   contractVersion: 'authorization-ledger.1'; authorizationId: string; policySha256: string; revision: number;
   status: 'ready' | 'held' | 'closed'; declaredStatus: AuthorizationRow['status']; effectiveHold: boolean; holdReason: string | null;
   budgetEnforcement: 'local-estimate-not-billing-cap'; modalities: Record<Modality, BudgetView>;
+  artifactVerification: 'verified' | 'key-unavailable';
   purposes: Record<Purpose, { limit: number; consumed: number; reserved: number; remaining: number }>;
   batches: { id: string; purpose: Purpose; manifestSha256: string; status: BatchRow['status'] }[]; attempts: AttemptView[];
 }
@@ -59,13 +61,14 @@ const runnerInstances = new WeakSet<object>();
 const constructionAuthority = Symbol('evaluation-ledger-construction');
 function protectEnvironmentSecrets(cipher: ArtifactCipher | undefined) {
   if (!cipher) return;
-  const secrets = Object.entries(process.env).filter(([name]) => /(?:^|_)(?:API_KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)$/.test(name))
-    .map(([, value]) => value).filter((value): value is string => Boolean(value));
-  for (const name of ['TUJIANG_EVALUATION_ARTIFACT_KEY', 'TUJIANG_EVALUATION_DATABASE_URL', 'DATABASE_URL', 'TEST_DATABASE_URL', 'PGPASSWORD']) {
-    const value = process.env[name]; if (!value) continue;
-    secrets.push(value);
-    if (name.endsWith('DATABASE_URL')) {
-      try { const password = new URL(value).password; secrets.push(password, decodeURIComponent(password)); }
+  const secrets: string[] = [];
+  for (const [name, value] of Object.entries(process.env)) {
+    if (!value) continue;
+    const credential = /(?:^|_)(?:KEY|APIKEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH|AUTHORIZATION)(?:_|$)|(?:APIKEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?)$/i.test(name);
+    if (credential) secrets.push(value);
+    if (/DATABASE_URL$/i.test(name)) {
+      secrets.push(value);
+      try { const url = new URL(value); secrets.push(url.toString(), url.password, decodeURIComponent(url.password)); }
       catch { /* Invalid connection strings are rejected by the database entry point; never print them. */ }
     }
   }
@@ -174,48 +177,73 @@ export class AuthorizationLedger {
     z.number().int().positive().parse(command.expectedRevision); reasonSchema.parse(command.reason);
     if (auth.revision !== command.expectedRevision) fail('LEDGER_REVISION_CONFLICT');
   }
-  private async storeArtifact(tx: Connection, auth: AuthorizationRow, binding: Omit<ArtifactBinding, 'authorizationId' | 'sourceSha256' | 'metadataSha256'>,
+  private async storeArtifact(tx: Connection, auth: AuthorizationRow, binding: ArtifactTarget,
     bytes: Uint8Array, metadata: Record<string, unknown>, sourceSha256 = sha256(bytes)): Promise<string> {
     this.assertKey(auth);
     const prior = await tx.query<ArtifactRow>(`SELECT * FROM evaluation_artifacts WHERE authorization_id=$1
       AND batch_id IS NOT DISTINCT FROM $2::uuid AND attempt_id IS NOT DISTINCT FROM $3::uuid AND kind=$4 AND source_sha256=$5 AND metadata=$6::jsonb`,
     [AUTHORIZATION_ID, binding.batchId, binding.attemptId, binding.kind, sourceSha256, JSON.stringify(metadata)]);
-    if (prior.rows[0]) return prior.rows[0].id;
+    if (prior.rows[0]) return (await this.artifact(tx, auth, prior.rows[0].id, binding)).row.id;
     const id = randomUUID();
-    const sealed = this.requireCipher().seal(bytes, { authorizationId: AUTHORIZATION_ID, ...binding,
+    const sealed = this.requireCipher().seal(bytes, { authorizationId: AUTHORIZATION_ID, artifactId: id, ...binding,
       sourceSha256, metadataSha256: objectSha256(metadata) });
     await tx.query(`INSERT INTO evaluation_artifacts(id,authorization_id,batch_id,attempt_id,kind,sealed,source_sha256,metadata,created_by)
       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [id, AUTHORIZATION_ID, binding.batchId, binding.attemptId, binding.kind,
       JSON.stringify(sealed), sourceSha256, JSON.stringify(metadata), this.actor]);
     return id;
   }
-  private async artifact(tx: Connection, auth: AuthorizationRow, id: string) {
+  private async artifact(tx: Connection, auth: AuthorizationRow, id: string, expected: ArtifactTarget | 'review-by-id') {
     this.assertKey(auth);
     const result = await tx.query<ArtifactRow>('SELECT * FROM evaluation_artifacts WHERE authorization_id=$1 AND id=$2', [AUTHORIZATION_ID, id]);
-    const row = result.rows[0]; if (!row) fail('ARTIFACT_NOT_FOUND');
-    const bytes = this.requireCipher().open(row.sealed, { authorizationId: AUTHORIZATION_ID,
-      batchId: row.batch_id, attemptId: row.attempt_id, kind: row.kind,
+    const row = result.rows[0]; if (!row) fail(expected === 'review-by-id' ? 'ARTIFACT_NOT_FOUND' : 'ARTIFACT_INTEGRITY_FAILED');
+    // Only explicit local review may choose an artifact by ID without a production reference.
+    const target = expected === 'review-by-id' ? { batchId: row.batch_id, attemptId: row.attempt_id, kind: row.kind } : expected;
+    const assertTarget = () => {
+      if (row.id !== id || row.batch_id !== target.batchId || row.attempt_id !== target.attemptId || row.kind !== target.kind) {
+        fail('ARTIFACT_INTEGRITY_FAILED');
+      }
+    };
+    assertTarget();
+    const bytes = this.requireCipher().open(row.sealed, { authorizationId: AUTHORIZATION_ID, artifactId: id, ...target,
       sourceSha256: row.source_sha256, metadataSha256: objectSha256(row.metadata) });
+    assertTarget();
     return { row, bytes };
   }
   private async payload(tx: Connection, auth: AuthorizationRow, batch: BatchRow): Promise<BatchPayload> {
-    const artifact = await this.artifact(tx, auth, batch.payload_artifact_id);
+    const artifact = await this.artifact(tx, auth, batch.payload_artifact_id, { batchId: batch.id, attemptId: null, kind: 'batch-input' });
     if (artifact.row.sealed.redacted || sha256(artifact.bytes) !== artifact.row.sealed.contentSha256) fail('SENSITIVE_INPUT_DETECTED');
-    let raw: unknown;
-    try { raw = JSON.parse(artifact.bytes.toString('utf8')); } catch { return fail('BATCH_INPUT_CHANGED'); }
-    const described = describeBatch(batch.id, raw);
+    let described: ReturnType<typeof describeBatch>;
+    try { described = describeBatch(batch.id, JSON.parse(artifact.bytes.toString('utf8'))); } catch { return fail('BATCH_INPUT_CHANGED'); }
     if (described.payload.sources.some(s => this.requireCipher().redact(Buffer.from(s.bytesBase64, 'base64')).redacted)) fail('SENSITIVE_INPUT_DETECTED');
     if (described.manifestSha256 !== batch.manifest_sha256 || objectSha256(batch.manifest) !== batch.manifest_sha256) fail('BATCH_INPUT_CHANGED');
     return described.payload;
   }
   private async assertInputReview(tx: Connection, batch: BatchRow) {
-    const rows = await tx.query<Row<{ id: string; manifest_sha256: string; decision: string; decision_receipt_sha256: string; decision_reference_sha256: string }>>(
+    const rows = await tx.query<Row<{ id: string; manifest_sha256: string; decision: string; decision_receipt_sha256: string; decision_reference_sha256: string;
+      reason_sha256: string; decision_artifact_id: string; reviewer: string; reviewer_credential_sha256: string }>>(
       'SELECT * FROM evaluation_input_reviews WHERE batch_id=$1', [batch.id]);
     const review = rows.rows[0];
     if (!review || review.decision !== 'approved' || review.manifest_sha256 !== batch.manifest_sha256 ||
-        !review.decision_receipt_sha256 || !review.decision_reference_sha256) fail('INPUT_REVIEW_REQUIRED');
+        !review.decision_receipt_sha256 || !review.decision_reference_sha256) {
+      fail(batch.status === 'approved' || batch.status === 'completed' ? 'ARTIFACT_INTEGRITY_FAILED' : 'INPUT_REVIEW_REQUIRED');
+    }
+    return review;
   }
-  private assertBatchRunnable(batch: BatchRow) { if (batch.status !== 'approved') fail('BATCH_NOT_RUNNABLE'); }
+  private async verifyInputReview(tx: Connection, auth: AuthorizationRow, batch: BatchRow) {
+    const review = await this.assertInputReview(tx, batch);
+    const artifact = await this.artifact(tx, auth, review.decision_artifact_id, { batchId: batch.id, attemptId: null, kind: 'input-review-decision' });
+    if (artifact.row.sealed.originalSha256 !== sha256(artifact.bytes)) fail('SENSITIVE_INPUT_DETECTED');
+    let decision: z.infer<typeof inputDecisionSchema>;
+    try { decision = inputDecisionSchema.parse(JSON.parse(artifact.bytes.toString('utf8'))); } catch { return fail('ARTIFACT_INTEGRITY_FAILED'); }
+    if (decision.decision !== review.decision || decision.decisionReceiptSha256 !== review.decision_receipt_sha256 ||
+        sha256(decision.reason) !== review.reason_sha256 || sha256(decision.decisionReference) !== review.decision_reference_sha256 ||
+        artifact.row.metadata.manifestSha256 !== batch.manifest_sha256 || artifact.row.metadata.reviewer !== review.reviewer ||
+        artifact.row.metadata.reviewerCredentialSha256 !== review.reviewer_credential_sha256) fail('ARTIFACT_INTEGRITY_FAILED');
+  }
+  private assertBatchRunnable(batch: BatchRow) {
+    if (batch.status === 'awaiting_input_review' || batch.status === 'rejected') fail('INPUT_REVIEW_REQUIRED');
+    if (batch.status !== 'approved') fail('BATCH_NOT_RUNNABLE');
+  }
   private async stopBatchForReviewFailure(tx: Connection, batch: BatchRow, code: BatchStopReason) {
     if (batch.status === 'stopped') return { batchId: batch.id, status: 'stopped' as const, changed: false };
     this.assertBatchRunnable(batch);
@@ -223,8 +251,8 @@ export class AuthorizationLedger {
     await this.event(tx, 'batch.review_invalidated', { batchId: batch.id, manifestSha256: batch.manifest_sha256, code });
     return { batchId: batch.id, status: 'stopped' as const, changed: true };
   }
-  private async withReviewFailureStop<T>(tx: Connection, batch: BatchRow, action: () => Promise<T>): Promise<ReviewOperation<T>> {
-    try { return { value: await action() }; }
+  private async withReviewFailureStop<T>(tx: Connection, auth: AuthorizationRow, batch: BatchRow, action: () => Promise<T>): Promise<ReviewOperation<T>> {
+    try { await this.verifyInputReview(tx, auth, batch); return { value: await action() }; }
     catch (error) {
       if (!runnerInstances.has(this) || batch.status !== 'approved' || !(error instanceof RunnerError)) throw error;
       const reason = batchStopReasonSchema.safeParse(error.code); if (!reason.success) throw error;
@@ -266,12 +294,13 @@ export class AuthorizationLedger {
       const prior = await tx.query<BatchRow>('SELECT * FROM evaluation_batches WHERE id=$1', [batchId]);
       if (prior.rows[0]) {
         if (prior.rows[0].manifest_sha256 !== described.manifestSha256) fail('BATCH_INPUT_CHANGED');
+        await this.payload(tx, auth, prior.rows[0]);
         return { batchId, manifest: prior.rows[0].manifest, manifestSha256: prior.rows[0].manifest_sha256, status: prior.rows[0].status };
       }
       const payloadArtifactId = await this.storeArtifact(tx, auth, { batchId, attemptId: null, kind: 'batch-input' },
         Buffer.from(canonical(described.payload)), {}, described.manifest.payloadSha256);
       // Credentials in an input invalidate its content binding instead of silently altering a reviewed request.
-      const saved = await this.artifact(tx, auth, payloadArtifactId);
+      const saved = await this.artifact(tx, auth, payloadArtifactId, { batchId, attemptId: null, kind: 'batch-input' });
       if (saved.row.sealed.redacted) fail('SENSITIVE_INPUT_DETECTED');
       for (const source of described.payload.sources) {
         await this.storeArtifact(tx, auth, { batchId, attemptId: null, kind: 'source' }, Buffer.from(source.bytesBase64, 'base64'), { sourceId: source.id });
@@ -296,10 +325,13 @@ export class AuthorizationLedger {
       const batch = await this.batch(tx, batchId);
       if (batch.manifest_sha256 !== manifestSha256) fail('BATCH_INPUT_CHANGED');
       const prior = await tx.query('SELECT id FROM evaluation_input_reviews WHERE batch_id=$1', [batchId]);
-      if (prior.rows.length) fail('INPUT_REVIEW_ALREADY_RECORDED');
+      if (batch.status !== 'awaiting_input_review' || prior.rows.length) fail('INPUT_REVIEW_ALREADY_RECORDED');
+      await this.payload(tx, auth, batch);
       const id = randomUUID();
+      const decisionBytes = Buffer.from(canonical(decision));
+      if (this.requireCipher().redact(decisionBytes).redacted) fail('SENSITIVE_INPUT_DETECTED');
       const decisionArtifactId = await this.storeArtifact(tx, auth, { batchId, attemptId: null, kind: 'input-review-decision' },
-        Buffer.from(canonical(decision)), {});
+        decisionBytes, { manifestSha256, reviewer: this.actor, reviewerCredentialSha256: this.#reviewerCredentialSha256 });
       await tx.query(`INSERT INTO evaluation_input_reviews(id,batch_id,manifest_sha256,decision,reviewer,reviewer_credential_sha256,reason_sha256,
         decision_reference_sha256,decision_receipt_sha256,decision_artifact_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
       [id, batchId, manifestSha256, decision.decision, this.actor, this.#reviewerCredentialSha256, sha256(decision.reason), sha256(decision.decisionReference),
@@ -312,12 +344,15 @@ export class AuthorizationLedger {
   }
   async reviewedBatch(batchId: string): Promise<ReviewedBatchSnapshot> {
     const result = await this.locked(async (tx, auth) => {
-      const batch = await this.batch(tx, batchId); await this.assertInputReview(tx, batch);
-      if (batch.status !== 'approved' && batch.status !== 'completed') fail('BATCH_NOT_RUNNABLE');
+      const batch = await this.batch(tx, batchId);
+      if (batch.status !== 'completed') this.assertBatchRunnable(batch);
       this.assertKey(auth);
       if (batch.status === 'approved') this.assertReady(auth, await this.attempts(tx));
-      return this.withReviewFailureStop(tx, batch, async () => ({ manifest: batch.manifest, manifestSha256: batch.manifest_sha256,
-        status: batch.status, payload: await this.payload(tx, auth, batch) }));
+      return this.withReviewFailureStop(tx, auth, batch, async () => {
+        for (const attempt of await this.attempts(tx)) await this.verifyAttemptArtifacts(tx, auth, attempt);
+        return { manifest: batch.manifest, manifestSha256: batch.manifest_sha256,
+          status: batch.status, payload: await this.payload(tx, auth, batch) };
+      });
     });
     const snapshot = reviewValue(result);
     if (snapshot.status === 'approved' && runnerInstances.has(this)) this.#approvedSnapshots.set(snapshot, { batchId, manifestSha256: snapshot.manifestSha256 });
@@ -329,7 +364,7 @@ export class AuthorizationLedger {
     const reason = batchStopReasonSchema.parse(reasonInput);
     return this.locked(async (tx, auth) => {
       this.assertKey(auth);
-      const batch = await this.batch(tx, binding.batchId); await this.assertInputReview(tx, batch);
+      const batch = await this.batch(tx, binding.batchId);
       if (batch.manifest_sha256 !== binding.manifestSha256) fail('BATCH_REVIEW_SNAPSHOT_MISMATCH');
       return this.stopBatchForReviewFailure(tx, batch, reason);
     });
@@ -339,10 +374,11 @@ export class AuthorizationLedger {
     const binding = this.#approvedSnapshots.get(snapshot); if (!binding) fail('BATCH_REVIEW_SNAPSHOT_REQUIRED');
     const result = await this.locked(async (tx, auth) => {
       const attempts = await this.attempts(tx); this.assertReady(auth, attempts); this.assertKey(auth);
-      const batch = await this.batch(tx, binding.batchId); await this.assertInputReview(tx, batch); this.assertBatchRunnable(batch);
+      const batch = await this.batch(tx, binding.batchId); this.assertBatchRunnable(batch);
       if (batch.manifest_sha256 !== binding.manifestSha256) fail('BATCH_REVIEW_SNAPSHOT_MISMATCH');
-      return this.withReviewFailureStop(tx, batch, async () => {
+      return this.withReviewFailureStop(tx, auth, batch, async () => {
         const payload = await this.payload(tx, auth, batch);
+        for (const attempt of attempts) await this.verifyAttemptArtifacts(tx, auth, attempt);
         const unreserved = payload.items.filter(item => !attempts.some(attempt => attempt.batch_id === batch.id &&
           attempt.item_id === item.id && attempt.state !== 'cancelled'));
         this.checkBudget(attempts, batch, unreserved.length * payload.reviewedEstimatedMicros, unreserved.length,
@@ -372,10 +408,11 @@ export class AuthorizationLedger {
   async reserve(batchId: string, itemId: string, plan: ReservationPlan): Promise<AttemptView> {
     const result = await this.locked(async (tx, auth) => {
       const attempts = await this.attempts(tx); this.assertReady(auth, attempts);
-      const batch = await this.batch(tx, batchId); await this.assertInputReview(tx, batch);
+      const batch = await this.batch(tx, batchId);
       this.assertBatchRunnable(batch); this.assertKey(auth);
-      return this.withReviewFailureStop(tx, batch, async () => {
+      return this.withReviewFailureStop(tx, auth, batch, async () => {
         const payload = await this.payload(tx, auth, batch);
+        for (const attempt of attempts) await this.verifyAttemptArtifacts(tx, auth, attempt);
         const item = batch.manifest.items.find(i => i.id === itemId); if (!item) fail('BATCH_ITEM_NOT_FOUND');
         if (plan.capabilityFingerprint !== batch.manifest.reviewedCapabilitySha256 || plan.estimatedMicros !== batch.manifest.reviewedEstimatedMicros ||
             plan.providerName !== batch.manifest.reviewedProviderName) fail('CAPABILITIES_CHANGED_REVIEW_REQUIRED');
@@ -385,15 +422,20 @@ export class AuthorizationLedger {
         const existing = attempts.find(a => a.batch_id === batchId && a.item_id === itemId);
         if (existing) {
           if (existing.plan_sha256 !== planSha256) fail('RESERVATION_CONFLICT');
+          await this.verifyAttemptArtifacts(tx, auth, existing);
           return view(existing);
         }
         this.checkBudget(attempts, batch, plan.estimatedMicros, 1, usdToMicros(payload.config.maxCostUsd));
         const id = randomUUID();
-        await this.storeArtifact(tx, auth, { batchId, attemptId: id, kind: 'capabilities' }, Buffer.from(canonical(plan.capabilities)), {}, capabilitiesSha256);
+        const reservation = this.reservationBinding(batch, { id, batch_id: batchId, item_id: itemId, purpose: batch.manifest.purpose,
+          modality: batch.manifest.modality, request_sha256: item.requestSha256, plan_sha256: planSha256,
+          capabilities_sha256: capabilitiesSha256, expected_provider_name: plan.providerName, estimated_micros: plan.estimatedMicros });
+        const capabilitiesArtifactId = await this.storeArtifact(tx, auth, { batchId, attemptId: id, kind: 'capabilities' },
+          Buffer.from(canonical(plan.capabilities)), { reservation }, capabilitiesSha256);
         await tx.query(`INSERT INTO evaluation_attempts(id,authorization_id,batch_id,item_id,purpose,modality,request_sha256,
-          plan_sha256,capabilities_sha256,expected_provider_name,estimated_micros,state) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'reserved')`,
+          plan_sha256,capabilities_sha256,expected_provider_name,estimated_micros,capabilities_artifact_id,state) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'reserved')`,
         [id, AUTHORIZATION_ID, batchId, itemId, batch.manifest.purpose, batch.manifest.modality, item.requestSha256,
-          planSha256, capabilitiesSha256, plan.providerName, plan.estimatedMicros]);
+          planSha256, capabilitiesSha256, plan.providerName, plan.estimatedMicros, capabilitiesArtifactId]);
         await this.event(tx, 'attempt.reserved', { attemptId: id, batchId, itemId, planSha256, estimatedMicros: plan.estimatedMicros });
         return view(await this.attempt(tx, id));
       });
@@ -405,13 +447,17 @@ export class AuthorizationLedger {
     const result = await this.locked<ReviewOperation<{ claimed: boolean; attempt: AttemptView; code?: string }>>(async (tx, auth) => {
       const attempt = await this.attempt(tx, attemptId);
       const attempts = await this.attempts(tx);
-      if (attempt.state !== 'reserved') return { value: { claimed: false, attempt: view(attempt),
-        ...(activeHold(attempts) ? { code: 'AUTHORIZATION_EFFECTIVE_HOLD' } : {}) } };
+      if (attempt.state !== 'reserved') {
+        await this.verifyAttemptArtifacts(tx, auth, attempt);
+        return { value: { claimed: false, attempt: view(attempt),
+          ...(activeHold(attempts) ? { code: 'AUTHORIZATION_EFFECTIVE_HOLD' } : {}) } };
+      }
       this.assertReady(auth, attempts);
-      const batch = await this.batch(tx, attempt.batch_id); await this.assertInputReview(tx, batch); this.assertBatchRunnable(batch);
+      const batch = await this.batch(tx, attempt.batch_id); this.assertBatchRunnable(batch);
       this.assertKey(auth);
-      return this.withReviewFailureStop(tx, batch, async () => {
+      return this.withReviewFailureStop(tx, auth, batch, async () => {
         const payload = await this.payload(tx, auth, batch);
+        for (const row of attempts) await this.verifyAttemptArtifacts(tx, auth, row);
         this.checkBudget(attempts, batch, 0, 0, usdToMicros(payload.config.maxCostUsd));
         await tx.query(`UPDATE evaluation_attempts SET state='dispatch_started',owner_sha256=$2,unknown_usage=true,started_at=now() WHERE id=$1`,
           [attemptId, sha256(ownerToken)]);
@@ -424,15 +470,18 @@ export class AuthorizationLedger {
 
   async recordPreflightCapture(batchId: string, capture: ResponseCapture) {
     if (capture.bytes.byteLength > 2_000_000) fail('RESPONSE_TOO_LARGE');
-    return this.locked(async (tx, auth) => {
-      const batch = await this.batch(tx, batchId); await this.assertInputReview(tx, batch); this.assertBatchRunnable(batch);
-      const metadata = validateCapturedMetadata({ state: capture.state, httpStatus: capture.httpStatus, latencyMs: capture.latencyMs,
-        errorCode: capture.errorCode, bodySha256: capture.state === 'unavailable' ? null : sha256(capture.bytes) }, capture.bytes.byteLength);
-      const artifactId = await this.storeArtifact(tx, auth, { batchId, attemptId: null, kind: 'preflight-response' }, capture.bytes,
-        metadata as unknown as Record<string, unknown>, objectSha256(metadata));
-      await this.event(tx, 'batch.preflight_captured', { batchId, artifactId });
-      return artifactId;
+    const result = await this.locked(async (tx, auth) => {
+      const batch = await this.batch(tx, batchId); this.assertBatchRunnable(batch);
+      return this.withReviewFailureStop(tx, auth, batch, async () => {
+        const metadata = validateCapturedMetadata({ state: capture.state, httpStatus: capture.httpStatus, latencyMs: capture.latencyMs,
+          errorCode: capture.errorCode, bodySha256: capture.state === 'unavailable' ? null : sha256(capture.bytes) }, capture.bytes.byteLength);
+        const artifactId = await this.storeArtifact(tx, auth, { batchId, attemptId: null, kind: 'preflight-response' }, capture.bytes,
+          metadata as unknown as Record<string, unknown>, objectSha256(metadata));
+        await this.event(tx, 'batch.preflight_captured', { batchId, artifactId });
+        return artifactId;
+      });
     });
+    return reviewValue(result);
   }
 
   async recordCapture(attemptId: string, ownerToken: string, capture: ResponseCapture): Promise<string> {
@@ -440,13 +489,14 @@ export class AuthorizationLedger {
     return this.locked(async (tx, auth) => {
       const attempt = await this.attempt(tx, attemptId);
       if (attempt.owner_sha256 !== sha256(ownerToken) || attempt.started_at === null) fail('DISPATCH_OWNER_MISMATCH');
+      await this.verifyAttemptArtifacts(tx, auth, attempt);
       const metadata: CapturedMetadata = { state: capture.state, httpStatus: capture.httpStatus,
         latencyMs: capture.latencyMs, errorCode: capture.errorCode,
         bodySha256: capture.state === 'unavailable' ? null : sha256(capture.bytes) };
       validateCapturedMetadata(metadata, capture.bytes.byteLength);
       const sourceSha = objectSha256({ ...metadata, latencyMs: 0 });
       if (attempt.capture_artifact_id) {
-        const prior = await this.artifact(tx, auth, attempt.capture_artifact_id);
+        const prior = await this.artifact(tx, auth, attempt.capture_artifact_id, { batchId: attempt.batch_id, attemptId, kind: 'response' });
         if (prior.row.source_sha256 !== sourceSha) fail('CAPTURE_CONFLICT');
         return prior.row.id;
       }
@@ -461,8 +511,9 @@ export class AuthorizationLedger {
     if (!attempt.capture_artifact_id) fail('RESPONSE_UNAVAILABLE');
     if (attempt.state !== 'dispatch_started') fail('ATTEMPT_ALREADY_FINISHED');
     const batch = await this.batch(tx, attempt.batch_id);
+    await this.verifyInputReview(tx, auth, batch);
     const payload = await this.payload(tx, auth, batch);
-    const captured = await this.artifact(tx, auth, attempt.capture_artifact_id);
+    const captured = await this.artifact(tx, auth, attempt.capture_artifact_id, { batchId: batch.id, attemptId: attempt.id, kind: 'response' });
     const inspected = inspectCapturedResponse(captured.bytes, captured.row.metadata as unknown as CapturedMetadata,
       { modelId: payload.config.modelId, providerName: attempt.expected_provider_name,
         maxInputTokens: payload.config.maxInputTokens, maxOutputTokens: payload.config.maxOutputTokens });
@@ -470,6 +521,7 @@ export class AuthorizationLedger {
     if (!code && !analysis) fail('LOCAL_ANALYSIS_REQUIRED');
     if (!code && !analysis?.automaticChecksPassed) code = 'EVALUATION_RULE_FAILED';
     const before = await this.attempts(tx);
+    for (const row of before) await this.verifyAttemptArtifacts(tx, auth, row);
     const others = before.filter(a => a.id !== attempt.id && a.state !== 'cancelled');
     const projected = (rows: AttemptRow[]) => rows.reduce((sum, a) => sum + amount(a.cost_micros) +
       (a.state === 'reserved' || a.state === 'dispatch_started' ? amount(a.estimated_micros) : 0), 0) + (inspected.costMicros ?? 0);
@@ -493,33 +545,76 @@ export class AuthorizationLedger {
       responseArtifactId: attempt.capture_artifact_id, parsedArtifactId, code, usageUnknown: inspected.usageUnknown, costMicros: inspected.costMicros });
     return view(await this.attempt(tx, attempt.id));
   }
+  private reservationBinding(batch: BatchRow, attempt: Pick<AttemptRow, 'id' | 'batch_id' | 'item_id' | 'purpose' | 'modality' |
+    'request_sha256' | 'plan_sha256' | 'capabilities_sha256' | 'expected_provider_name' | 'estimated_micros'>) {
+    const item = batch.manifest.items.find(item => item.id === attempt.item_id);
+    const planSha256 = objectSha256({ manifestSha256: batch.manifest_sha256, itemId: attempt.item_id,
+      capabilityFingerprint: batch.manifest.reviewedCapabilitySha256, estimatedMicros: batch.manifest.reviewedEstimatedMicros,
+      providerName: batch.manifest.reviewedProviderName });
+    if (!item || attempt.batch_id !== batch.id || attempt.purpose !== batch.manifest.purpose || attempt.modality !== batch.manifest.modality ||
+        attempt.request_sha256 !== item.requestSha256 || attempt.plan_sha256 !== planSha256 ||
+        amount(attempt.estimated_micros) !== batch.manifest.reviewedEstimatedMicros || attempt.expected_provider_name !== batch.manifest.reviewedProviderName) {
+      fail('ARTIFACT_INTEGRITY_FAILED');
+    }
+    return { attemptId: attempt.id, batchId: batch.id, itemId: item.id, manifestSha256: batch.manifest_sha256,
+      purpose: attempt.purpose, modality: attempt.modality, requestSha256: item.requestSha256, planSha256,
+      capabilitiesSha256: attempt.capabilities_sha256, capabilityFingerprint: batch.manifest.reviewedCapabilitySha256,
+      providerName: attempt.expected_provider_name, estimatedMicros: amount(attempt.estimated_micros) };
+  }
+  private async verifyAttemptArtifacts(tx: Connection, auth: AuthorizationRow, attempt: AttemptRow) {
+    const batch = await this.batch(tx, attempt.batch_id); await this.payload(tx, auth, batch);
+    const reservation = this.reservationBinding(batch, attempt);
+    if (!attempt.capabilities_artifact_id) fail('ARTIFACT_INTEGRITY_FAILED');
+    const capabilities = await this.artifact(tx, auth, attempt.capabilities_artifact_id,
+      { batchId: batch.id, attemptId: attempt.id, kind: 'capabilities' });
+    if (objectSha256(capabilities.row.metadata.reservation ?? null) !== objectSha256(reservation) ||
+        sha256(capabilities.bytes) !== attempt.capabilities_sha256 || capabilities.row.source_sha256 !== attempt.capabilities_sha256) fail('ARTIFACT_INTEGRITY_FAILED');
+    if (attempt.state === 'finished' && attempt.error_code !== 'MANUALLY_RECONCILED' && (!attempt.capture_artifact_id || !attempt.parsed_artifact_id)) {
+      fail('ARTIFACT_INTEGRITY_FAILED');
+    }
+    if (attempt.capture_artifact_id) await this.artifact(tx, auth, attempt.capture_artifact_id,
+      { batchId: attempt.batch_id, attemptId: attempt.id, kind: 'response' });
+    if (attempt.parsed_artifact_id) await this.artifact(tx, auth, attempt.parsed_artifact_id,
+      { batchId: attempt.batch_id, attemptId: attempt.id, kind: 'parsed-result' });
+  }
   async finish(attemptId: string, ownerToken: string, analysis: LocalAnalysis | undefined, command: LedgerCommand) {
-    return this.locked(async (tx, auth) => this.receipt(tx, command, { type: 'finish', attemptId, ownerSha256: sha256(ownerToken), analysis: analysis ?? null }, async () => {
+    return this.locked(async (tx, auth) => {
       const attempt = await this.attempt(tx, attemptId);
       if (attempt.owner_sha256 !== sha256(ownerToken)) fail('DISPATCH_OWNER_MISMATCH');
-      return this.settle(tx, auth, attempt, analysis, false);
-    }));
+      const batch = await this.batch(tx, attempt.batch_id);
+      await this.verifyInputReview(tx, auth, batch); await this.payload(tx, auth, batch);
+      await this.verifyAttemptArtifacts(tx, auth, attempt);
+      return this.receipt(tx, command, { type: 'finish', attemptId, ownerSha256: sha256(ownerToken), analysis: analysis ?? null }, async () => {
+        return this.settle(tx, auth, attempt, analysis, false);
+      });
+    });
   }
   async recoverCapture(attemptId: string, captureSha256: string, analysis: LocalAnalysis | undefined, command: ReviewedCommand) {
     this.requireManagement();
-    return this.locked(async (tx, auth) => this.receipt(tx, command, { type: 'recover-capture', attemptId, captureSha256,
-      analysis: analysis ?? null, expectedRevision: command.expectedRevision, reason: command.reason }, async () => {
-      this.checkRevision(auth, command); const attempt = await this.attempt(tx, attemptId);
+    return this.locked(async (tx, auth) => {
+      const attempt = await this.attempt(tx, attemptId); const batch = await this.batch(tx, attempt.batch_id);
+      await this.verifyInputReview(tx, auth, batch); await this.payload(tx, auth, batch);
+      await this.verifyAttemptArtifacts(tx, auth, attempt);
       if (!attempt.capture_artifact_id) fail('RESPONSE_UNAVAILABLE');
-      const artifact = await this.artifact(tx, auth, attempt.capture_artifact_id);
+      const artifact = await this.artifact(tx, auth, attempt.capture_artifact_id, { batchId: attempt.batch_id, attemptId, kind: 'response' });
       if (artifact.row.source_sha256 !== captureSha256) fail('CAPTURE_CONFLICT');
-      const result = await this.settle(tx, auth, attempt, analysis, true);
-      const decisionArtifactId = await this.storeArtifact(tx, auth, { batchId: attempt.batch_id, attemptId, kind: 'recovery-decision' },
-        Buffer.from(canonical({ captureSha256, ...command })), {});
-      await this.event(tx, 'attempt.recovery_reviewed', { attemptId, captureSha256, decisionArtifactId, reasonSha256: sha256(command.reason) });
-      return result;
-    }));
+      return this.receipt(tx, command, { type: 'recover-capture', attemptId, captureSha256,
+        analysis: analysis ?? null, expectedRevision: command.expectedRevision, reason: command.reason }, async () => {
+        this.checkRevision(auth, command);
+        const result = await this.settle(tx, auth, attempt, analysis, true);
+        const decisionArtifactId = await this.storeArtifact(tx, auth, { batchId: attempt.batch_id, attemptId, kind: 'recovery-decision' },
+          Buffer.from(canonical({ captureSha256, ...command })), {});
+        await this.event(tx, 'attempt.recovery_reviewed', { attemptId, captureSha256, decisionArtifactId, reasonSha256: sha256(command.reason) });
+        return result;
+      });
+    });
   }
   async cancelReservation(attemptId: string, command: ReviewedCommand) {
     this.requireManagement();
     return this.locked(async (tx, auth) => this.receipt(tx, command, { type: 'cancel-reservation', attemptId,
       expectedRevision: command.expectedRevision, reason: command.reason }, async () => {
       this.checkRevision(auth, command); const attempt = await this.attempt(tx, attemptId);
+      await this.verifyAttemptArtifacts(tx, auth, attempt);
       if (attempt.state !== 'reserved' || attempt.started_at !== null) fail('CANNOT_CANCEL_DISPATCHED');
       const decisionArtifactId = await this.storeArtifact(tx, auth, { batchId: attempt.batch_id, attemptId, kind: 'reservation-cancellation' },
         Buffer.from(canonical(command)), {});
@@ -541,6 +636,7 @@ export class AuthorizationLedger {
     return this.locked(async (tx, auth) => this.receipt(tx, command, { type: 'reconcile', attemptId, proofSha256: objectSha256(proof),
       expectedRevision: command.expectedRevision, reason: command.reason }, async () => {
       this.checkRevision(auth, command); const attempt = await this.attempt(tx, attemptId);
+      await this.verifyAttemptArtifacts(tx, auth, attempt);
       if (attempt.started_at === null || attempt.reconciled_at !== null || attempt.state === 'finished' && !attempt.unknown_usage) fail('RECONCILIATION_NOT_REQUIRED');
       const batch = await this.batch(tx, attempt.batch_id); const payload = await this.payload(tx, auth, batch);
       if (proof.requestSha256 !== attempt.request_sha256 || receipt.model !== payload.config.modelId ||
@@ -568,6 +664,7 @@ export class AuthorizationLedger {
       return this.receipt(tx, command, { type: 'release-hold', expectedRevision: command.expectedRevision, reason: command.reason }, async () => {
         this.checkRevision(auth, command);
         if (auth.status === 'closed') fail('AUTHORIZATION_CLOSED');
+        for (const attempt of attempts) await this.verifyAttemptArtifacts(tx, auth, attempt);
         for (const modality of ['text', 'image'] as const) {
           const selected = attempts.filter(a => a.modality === modality && a.state !== 'cancelled');
           const estimated = selected.reduce((sum, a) => sum + amount(a.estimated_micros), 0);
@@ -593,7 +690,10 @@ export class AuthorizationLedger {
     this.requireManagement();
     return this.locked(async (tx, auth) => {
       const attempt = await this.attempt(tx, attemptId); const batch = await this.batch(tx, attempt.batch_id);
-      const captured = attempt.capture_artifact_id ? await this.artifact(tx, auth, attempt.capture_artifact_id) : null;
+      await this.verifyInputReview(tx, auth, batch);
+      await this.verifyAttemptArtifacts(tx, auth, attempt);
+      const captured = attempt.capture_artifact_id ? await this.artifact(tx, auth, attempt.capture_artifact_id,
+        { batchId: attempt.batch_id, attemptId, kind: 'response' }) : null;
       return { attempt: view(attempt), payload: await this.payload(tx, auth, batch), manifest: batch.manifest,
         capture: captured ? { bytes: captured.bytes, metadata: captured.row.metadata as unknown as CapturedMetadata,
           sourceSha256: captured.row.source_sha256 } : null };
@@ -602,26 +702,35 @@ export class AuthorizationLedger {
   async readArtifactForReview(artifactId: string) {
     this.requireManagement();
     return this.locked(async (tx, auth) => {
-      const artifact = await this.artifact(tx, auth, artifactId);
+      const artifact = await this.artifact(tx, auth, artifactId, 'review-by-id');
       const contentSha256 = sha256(artifact.bytes);
-      const redacted = artifact.row.sealed.redacted || contentSha256 !== artifact.row.sealed.contentSha256;
+      const redacted = artifact.row.sealed.originalSha256 !== artifact.row.sealed.contentSha256 || contentSha256 !== artifact.row.sealed.contentSha256;
       await this.event(tx, 'artifact.read_for_review', { artifactId, contentSha256, redacted });
-      return { artifactId, kind: artifact.row.kind, bytes: artifact.bytes, metadata: artifact.row.metadata,
+      return { artifactId, authorizationId: AUTHORIZATION_ID, batchId: artifact.row.batch_id, attemptId: artifact.row.attempt_id,
+        kind: artifact.row.kind, bytes: artifact.bytes, metadata: artifact.row.metadata,
         contentSha256, originalSha256: artifact.row.sealed.originalSha256, redacted };
     });
   }
   async inputArtifactId(batchId: string) {
     this.requireManagement();
-    return this.locked(async tx => (await this.batch(tx, batchId)).payload_artifact_id);
+    return this.locked(async (tx, auth) => {
+      const batch = await this.batch(tx, batchId); await this.payload(tx, auth, batch); return batch.payload_artifact_id;
+    });
   }
   async listArtifacts(batchId?: string) {
     this.requireManagement(); if (batchId !== undefined) z.string().uuid().parse(batchId);
-    return this.locked(async tx => {
+    return this.locked(async (tx, auth) => {
       const rows = await tx.query<ArtifactRow>(`SELECT * FROM evaluation_artifacts WHERE authorization_id=$1${batchId ? ' AND batch_id=$2' : ''} ORDER BY created_at,id`,
         batchId ? [AUTHORIZATION_ID, batchId] : [AUTHORIZATION_ID]);
-      return rows.rows.map(row => ({ artifactId: row.id, batchId: row.batch_id, attemptId: row.attempt_id, kind: row.kind,
-        sourceSha256: row.source_sha256, contentSha256: row.sealed.contentSha256, byteLength: row.sealed.byteLength, redacted: row.sealed.redacted,
-        state: row.metadata.state ?? null }));
+      const verified = [];
+      for (const row of rows.rows) {
+        const artifact = await this.artifact(tx, auth, row.id, 'review-by-id'); const contentSha256 = sha256(artifact.bytes);
+        verified.push({ artifactId: row.id, batchId: row.batch_id, attemptId: row.attempt_id, kind: row.kind,
+          sourceSha256: row.source_sha256, contentSha256, byteLength: artifact.bytes.length,
+          redacted: row.sealed.originalSha256 !== row.sealed.contentSha256 || contentSha256 !== row.sealed.contentSha256,
+          state: row.metadata.state ?? null });
+      }
+      return verified;
     });
   }
   async status(): Promise<AuthorizationStatus> {
@@ -649,11 +758,17 @@ export class AuthorizationLedger {
         purposes[purpose] = { limit: PURPOSE_LIMITS[purpose], consumed, reserved, remaining: Math.max(0, PURPOSE_LIMITS[purpose] - consumed - reserved) };
       }
       const effectiveHold = activeHold(attempts);
+      const verifiedAttempts: AttemptView[] = [];
+      for (const attempt of attempts) {
+        if (this.cipher) {
+          await this.verifyAttemptArtifacts(tx, auth, attempt); verifiedAttempts.push(view(attempt));
+        } else verifiedAttempts.push({ ...view(attempt), responseArtifactId: null, parsedArtifactId: null });
+      }
       return { contractVersion: 'authorization-ledger.1', authorizationId: AUTHORIZATION_ID, policySha256: POLICY_SHA256,
         revision: auth.revision, status: auth.status === 'closed' ? 'closed' : effectiveHold ? 'held' : auth.status,
         declaredStatus: auth.status, effectiveHold, holdReason: effectiveHold ? 'ATTEMPT_UNRESOLVED' : auth.hold_reason,
-        budgetEnforcement: 'local-estimate-not-billing-cap', modalities, purposes,
-        batches: batches.map(b => ({ id: b.id, purpose: b.manifest.purpose, manifestSha256: b.manifest_sha256, status: b.status })), attempts: attempts.map(view) };
+        budgetEnforcement: 'local-estimate-not-billing-cap', artifactVerification: this.cipher ? 'verified' : 'key-unavailable', modalities, purposes,
+        batches: batches.map(b => ({ id: b.id, purpose: b.manifest.purpose, manifestSha256: b.manifest_sha256, status: b.status })), attempts: verifiedAttempts };
     });
   }
 }

@@ -52,5 +52,34 @@ export async function migrateAuthorizationLedger(db: Database) {
       fingerprint text NOT NULL, response jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now(),
       PRIMARY KEY(authorization_id,command_id)
     )`);
+    // References carry ownership and kind as well as an ID; valid ciphertext from another request is not interchangeable.
+    await tx.query(`CREATE UNIQUE INDEX IF NOT EXISTS evaluation_artifact_batch_identity ON evaluation_artifacts(authorization_id,batch_id,kind,id)`);
+    await tx.query(`CREATE UNIQUE INDEX IF NOT EXISTS evaluation_artifact_attempt_identity ON evaluation_artifacts(authorization_id,batch_id,attempt_id,kind,id)`);
+    await tx.query(`CREATE UNIQUE INDEX IF NOT EXISTS evaluation_artifact_review_identity ON evaluation_artifacts(batch_id,kind,id)`);
+    await tx.query(`ALTER TABLE evaluation_batches ADD COLUMN IF NOT EXISTS payload_artifact_kind text GENERATED ALWAYS AS ('batch-input'::text) STORED`);
+    await tx.query(`ALTER TABLE evaluation_attempts ADD COLUMN IF NOT EXISTS capture_artifact_kind text GENERATED ALWAYS AS ('response'::text) STORED`);
+    await tx.query(`ALTER TABLE evaluation_attempts ADD COLUMN IF NOT EXISTS parsed_artifact_kind text GENERATED ALWAYS AS ('parsed-result'::text) STORED`);
+    await tx.query(`ALTER TABLE evaluation_attempts ADD COLUMN IF NOT EXISTS capabilities_artifact_id uuid`);
+    await tx.query(`ALTER TABLE evaluation_attempts ADD COLUMN IF NOT EXISTS capabilities_artifact_kind text GENERATED ALWAYS AS ('capabilities'::text) STORED`);
+    await tx.query(`ALTER TABLE evaluation_input_reviews ADD COLUMN IF NOT EXISTS decision_artifact_kind text GENERATED ALWAYS AS ('input-review-decision'::text) STORED`);
+    const constraints = [
+      ['evaluation_artifacts', 'evaluation_artifact_scope_check', `CHECK (
+        (kind NOT IN ('batch-input','input-review-decision') OR (batch_id IS NOT NULL AND attempt_id IS NULL)) AND
+        (kind NOT IN ('response','parsed-result','capabilities') OR (batch_id IS NOT NULL AND attempt_id IS NOT NULL)))`],
+      ['evaluation_batches', 'evaluation_batch_payload_reference', `FOREIGN KEY(authorization_id,id,payload_artifact_kind,payload_artifact_id)
+        REFERENCES evaluation_artifacts(authorization_id,batch_id,kind,id) DEFERRABLE INITIALLY DEFERRED`],
+      ['evaluation_attempts', 'evaluation_attempt_capture_reference', `FOREIGN KEY(authorization_id,batch_id,id,capture_artifact_kind,capture_artifact_id)
+        REFERENCES evaluation_artifacts(authorization_id,batch_id,attempt_id,kind,id) DEFERRABLE INITIALLY DEFERRED`],
+      ['evaluation_attempts', 'evaluation_attempt_parsed_reference', `FOREIGN KEY(authorization_id,batch_id,id,parsed_artifact_kind,parsed_artifact_id)
+        REFERENCES evaluation_artifacts(authorization_id,batch_id,attempt_id,kind,id) DEFERRABLE INITIALLY DEFERRED`],
+      ['evaluation_attempts', 'evaluation_attempt_capabilities_reference', `FOREIGN KEY(authorization_id,batch_id,id,capabilities_artifact_kind,capabilities_artifact_id)
+        REFERENCES evaluation_artifacts(authorization_id,batch_id,attempt_id,kind,id) DEFERRABLE INITIALLY DEFERRED`],
+      ['evaluation_input_reviews', 'evaluation_input_review_reference', `FOREIGN KEY(batch_id,decision_artifact_kind,decision_artifact_id)
+        REFERENCES evaluation_artifacts(batch_id,kind,id) DEFERRABLE INITIALLY DEFERRED`],
+    ] as const;
+    for (const [table, name, definition] of constraints) {
+      const existing = await tx.query('SELECT 1 FROM pg_constraint WHERE conname=$1 AND conrelid=$2::regclass', [name, table]);
+      if (!existing.rows.length) await tx.query(`ALTER TABLE ${table} ADD CONSTRAINT ${name} ${definition}`);
+    }
   });
 }

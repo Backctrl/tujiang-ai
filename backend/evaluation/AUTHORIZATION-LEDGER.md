@@ -63,6 +63,8 @@
 - `evaluation_artifacts`：受控输入、请求、能力快照、响应、解析、usage 与错误材料。
 - `evaluation_events` / `evaluation_command_receipts`：追加的状态事件与带 fingerprint 的幂等回执。
 
+batch-input、input-review-decision、capabilities、response 与 parsed-result 引用带有归属和类型的复合外键。每个 attempt 持久引用自己的能力材料；该材料的认证 metadata 绑定 manifest SHA、attempt/item/request、purpose/modality、plan/capability 摘要、provider 和预留估算。读取、额度检查、派发与结算都验证这些字段，不能把 attempt 移到另一批次、修改用途或改 item 来重新取得原额度。能力材料缺失或旧行没有该认证引用时拒绝继续执行。外键延迟到事务提交检查，允许正常的材料和引用原子落库；已存在的坏引用使显式迁移失败，不自动修补。
+
 所有额度相关操作先锁定同一个授权行，再读写批次和请求。初始化迁移有独立事务锁。默认测试使用同一 SQL 契约的 PGlite；并发和崩溃语义必须另用真实 PostgreSQL、独立连接池及独立子进程验证。
 
 本次最多 14 个 POST，没有并行派发需求：**一个授权全局最多一个模型 POST 正在执行**。另一个进程可检查状态，但不能同时取得派发许可。这样一旦费用未知或失败停止，不会继续放行下一次请求；不会用进程内 mutex 代替数据库约束。
@@ -81,7 +83,7 @@
 
 派发许可不保存为可以重放使用的 `mayDispatch=true` 回执。同一命令重放只能查看状态，不能再次 POST。finish 可以安全重放；模型请求不能重放。所有网络调用都发生在事务之外，账本不宣称数据库和外部服务拥有分布式 exactly-once 事务。
 
-批次内串行执行。已取得精确 approved snapshot 后，存储的 adapter 不支持、输入/预期/来源/请求变化、敏感输入、metadata 传输或解析失败、能力/端点/价格/token/参数/隐式缓存/估算无效、能力相对复核内容变化，按固定错误码白名单幂等写入 `stopped` 和 `batch.review_invalidated` 事件。外层 stop 只接受本 runner 实例签发的 snapshot，不能用任意 batch ID 或自行拼装的对象触发。首次读取已批准 payload 或 reserve/beginDispatch 复核失败时，先在事务内确认 review、policy、key，再提交停止状态，最后向调用者抛原错误；不能因事务回滚丢失 stop。后续进程在读取 Key、GET、POST 前拒绝旧批次。重新运行需要新的输入复核批次，旧批次不能恢复为 approved。
+批次内串行执行。已取得精确 approved snapshot 后，存储的 adapter 不支持、输入/预期/来源/请求变化、敏感输入、材料完整性校验失败（`ARTIFACT_INTEGRITY_FAILED`）、metadata 传输或解析失败、能力/端点/价格/token/参数/隐式缓存/估算无效、能力相对复核内容变化，按固定错误码白名单幂等写入 `stopped` 和 `batch.review_invalidated` 事件。外层 stop 只接受本 runner 实例签发的 snapshot，不能用任意 batch ID 或自行拼装的对象触发。首次读取已批准 payload 或 reserve/beginDispatch 复核失败时，先在事务内确认 review、policy、key，再提交停止状态，最后向调用者抛原错误；不能因事务回滚丢失 stop。后续进程在读取 Key、GET、POST 前拒绝旧批次，即使恢复原材料也不能重启。重新运行需要新的输入复核批次，旧批次不能恢复为 approved。
 
 调用前的 schema/enable/auth/instance 失败、未批准/已停止/已完成批次、缺 Key、数据库或加密密钥不可用、持久化失败、全局 hold/policy 失败不触发该 stop。已知次数/用途/全局估算或本地预算不足时保持 approved，并由 availability 门保证 0 metadata/0 POST；门通过之后若另一进程抢占额度，最终 reserve 可以在一次 GET 后拒绝，但仍不会 POST。已派发响应的协议或规则失败停止批次；未知 usage、传输中断、无法确认的派发、错误路由或费用越界同时使授权进入 held，后续批次的 reserve/dispatch 也拒绝。不自动重试、换模型、换 provider、fallback 或追加 generation 查询。
 
@@ -102,9 +104,13 @@
 
 输入、人工预期、请求、能力快照、响应原文、结构化解析、usage 和错误材料分别有 artifact ID、类型、SHA、完整/部分/不可取得状态及来源 attempt。部分正文的 SHA 只表示已取得前缀，不伪装为完整响应 SHA。文本响应维持最多 2,000,000 bytes 的有限读取。
 
-原文采用数据库内 AES-256-GCM 加密保存，密钥只由本地进程环境读取，不进入数据库、仓库或报告；AAD 绑定授权、batch、attempt、材料类型、来源摘要与 metadata 摘要，HTTP 状态和完整性标记不能被单独替换。请求 Authorization/header 从不保存；管理和运行入口在构造账本前登记当前环境中已知的 API Key、token、secret、password、credential、材料密钥及数据库 URL/解码后的密码，加密器也自动保护自身密钥。输入含已知凭据时拒绝创建批次；输出回显凭据时先脱敏再留存，并记录发生脱敏和原文摘要，不能仍声称保存的是未变动的原始字节。
+原文采用数据库内 AES-256-GCM 加密保存，密钥只由本地进程环境读取，不进入数据库、仓库或报告。新材料格式为 `artifact.2`；AAD 绑定授权、材料 ID、batch、attempt、材料类型、来源/metadata 摘要、原文/副本摘要、`redacted` 与 `byteLength`。读取使用调用方预期的归属、类型和查询 ID 验证，合法密文也不能被跨 item、跨 batch、改名或换类型引用。旧 `artifact.1` 缺少认证的脱敏标记，明确拒绝读取，不静默升级或重新批准旧批次。
+
+请求 Authorization/header 从不保存；管理和运行入口在构造账本前按环境变量名分段识别 key、token、secret、password、credential 等凭据，包括 `AWS_SECRET_ACCESS_KEY`、`PRIVATE_KEY`、`SECRET_KEY`，以及任意 `DATABASE_URL` 后缀的完整值和编码/解码密码。保护覆盖 raw、base64、hex、URL 和 JSON 常见表示；加密器也自动保护自身密钥及其原始字节。普通数据库用户名不会单独当作秘密，合法文本中的 `postgres` 可以正常准备。输入含已知凭据时拒绝创建批次；输出回显凭据时先脱敏再留存，并记录发生脱敏和原文摘要，不能仍声称保存的是未变动的原始字节。
 
 普通 runner/stdout 报告只含状态、固定错误码、计数、费用、SHA 和材料 ID，不含输入正文、预期、原始输出、Key 或数据库 URL。原文通过显式本地审阅导出到受控目录，默认不打印，导出动作有审计；新管理进程也按当前已知敏感值检查旧材料，导出发生新的脱敏时更新副本摘要与 `redacted` 标记。创建导出目录前检查全部现有父目录，创建后复查并使用实际路径写入，拒绝 symlink/junction 跳转，同时允许 Windows 原生路径别名规范化。留存初始化或密钥不可用时，live 在 POST 前拒绝。
+
+list、inspect 与 export 都经过认证读取，并从认证摘要和实际副本字节推导长度、摘要及脱敏状态；被篡改的索引标记不能直接回显。输入导出另验 batch-input 和完整 manifest。input-review 的决定材料必须存在、属于同一 batch，且决定、原因/引用/receipt 摘要、reviewer 与凭据指纹全部一致；已批准行丢失或损坏先提交持久 stop。finish/recover 的回执重放也先验证当前材料引用。配置材料 Key 的 status 验证 attempt 材料后才给出引用，标记 `artifactVerification=verified`；没有 Key 时只提供未认证的账本汇总，标记 `key-unavailable` 并省略 response/parsed 引用。
 
 新 evaluation 传输器保留 HTTP 非 2xx 与非法 JSON 的有界原文，不改生产 `src/model-policy.ts` 的公开行为。HTTP 错误、截断、拒答、超时、路由不符、解析/规则失败均保存可取得材料；未知或无效 usage 继续为 null。
 

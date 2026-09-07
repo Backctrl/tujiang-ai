@@ -4,11 +4,12 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { postgres, type Database } from '../src/database.js';
-import { ArtifactCipher } from '../evaluation/authorization-artifacts.js';
+import { ArtifactCipher, type SealedArtifact } from '../evaluation/authorization-artifacts.js';
 import { migrateAuthorizationLedger } from '../evaluation/authorization-database.js';
 import { AuthorizationLedger } from '../evaluation/authorization-ledger.js';
 import { AUTHORIZATION_POLICY, POLICY_SHA256 } from '../evaluation/authorization-contract.js';
 import { runEvaluation } from '../evaluation/runner.js';
+import { integrityCases } from './authorization-integrity-cases.js';
 import { artifactKey, authorizedCapabilities, authorizedConfig, consume, corePayload, humanFixture,
   managementLedger, prepared, preparedCore, reviewedCommand } from './authorization-helpers.js';
 
@@ -56,6 +57,14 @@ async function isolated(action: (context: { db: Database; peer: Database; runner
     try { if (created) await admin.query(`DROP SCHEMA "${schema}" CASCADE`); } finally { await admin.close(); }
   }
 }
+
+for (const scenario of integrityCases) test(`PostgreSQL evaluation: ${scenario.name}`, () => isolated(async f => {
+  await scenario.run({ ...f, verifyRestart: async batchId => {
+    const child = f.start({ mode: 'runner', batchId }); const result = await child.result;
+    assert.equal(result.code ?? result.report?.code, 'BATCH_NOT_RUNNABLE');
+    assert.equal(child.messages.filter(message => ['synthetic-metadata', 'synthetic-post'].includes(message.event)).length, 0);
+  } });
+}));
 
 test('PostgreSQL evaluation: concurrent initialization never overwrites policy or resets consumed state', () => isolated(async f => {
   const batch = await preparedCore(f.manager); await consume(f.runner, batch); const before = await f.manager.status();
@@ -197,4 +206,27 @@ test('PostgreSQL evaluation: pre-existing purpose saturation blocks another proc
   assert.equal(result.report?.metadataRequests, 0); assert.equal(result.report?.requestsAttempted, 0);
   assert.equal(child.messages.filter(message => ['synthetic-post', 'synthetic-metadata'].includes(message.event)).length, 0);
   assert.equal((await f.manager.status()).batches.find(row => row.id === batch.batchId)?.status, 'approved');
+}));
+
+test('PostgreSQL evaluation: ciphertext corruption stops before returning, and restoring bytes cannot re-enable a new process', () => isolated(async f => {
+  const batch = await prepared(f.manager); const artifactId = await f.manager.inputArtifactId(batch.batchId);
+  const original = (await f.db.query<{ sealed: SealedArtifact }>('SELECT sealed FROM evaluation_artifacts WHERE id=$1', [artifactId])).rows[0]!.sealed;
+  const bytes = Buffer.from(original.ciphertext, 'base64'); bytes[0] = bytes[0]! ^ 0xff;
+  await f.db.query('UPDATE evaluation_artifacts SET sealed=$2 WHERE id=$1',
+    [artifactId, JSON.stringify({ ...original, ciphertext: bytes.toString('base64') })]);
+  let accesses = 0; const forbidden = () => { accesses++; throw new Error('synthetic key/network access forbidden'); };
+  const failed = await runEvaluation(authorizedConfig, [humanFixture], { live: true,
+    authorization: { ledger: f.runner, batchId: batch.batchId, sources: batch.sources },
+    environmentEnabled: () => true, getApiKey: forbidden, request: forbidden });
+  assert.equal(failed.code, 'ARTIFACT_INTEGRITY_FAILED'); assert.equal(failed.metadataRequests, 0); assert.equal(failed.requestsAttempted, 0);
+  const row = await f.db.query<{ status: string }>('SELECT status FROM evaluation_batches WHERE id=$1', [batch.batchId]);
+  assert.equal(row.rows[0]!.status, 'stopped'); assert.equal(accesses, 0);
+  await f.db.query('UPDATE evaluation_artifacts SET sealed=$2 WHERE id=$1', [artifactId, JSON.stringify(original)]);
+  const restored = await f.manager.readArtifactForReview(artifactId); assert.equal(restored.contentSha256, original.contentSha256);
+  const child = f.start({ mode: 'runner', batchId: batch.batchId }); const repeat = await child.result;
+  assert.equal(repeat.code, 'BATCH_NOT_RUNNABLE');
+  assert.equal(child.messages.filter(message => ['synthetic-post', 'synthetic-metadata'].includes(message.event)).length, 0);
+  const events = await f.db.query<{ body: { code: string } }>("SELECT body FROM evaluation_events WHERE type='batch.review_invalidated'");
+  assert.equal(events.rows.length, 1); assert.equal(events.rows[0]!.body.code, 'ARTIFACT_INTEGRITY_FAILED');
+  assert.equal((await f.manager.status()).modalities.text.consumedRequests, 0);
 }));

@@ -12,18 +12,29 @@ import { artifactKey, capture, corePayload, goodResponse, preparedCore, withLedg
 
 async function withSecretEnvironment<T>(action: (secrets: string[]) => Promise<T>) {
   const password = `synthetic-db-password-/?@-${randomUUID()}`;
-  const url = `postgresql://synthetic:${encodeURIComponent(password)}@127.0.0.1:1/no-network`;
+  const username = `credential-user-${randomUUID()}`;
+  const url = `postgresql://${username}:${encodeURIComponent(password)}@127.0.0.1:1/no-network`;
   const values = {
     OPENROUTER_API_KEY: `synthetic-runtime-key-${randomUUID()}`,
     TUJIANG_EVALUATION_ARTIFACT_KEY: artifactKey,
     TUJIANG_EVALUATION_REVIEWER_CREDENTIAL: Buffer.alloc(32, 25).toString('base64'),
     TUJIANG_EVALUATION_REVIEWER_ID: 'synthetic-secret-review-operator',
     TUJIANG_EVALUATION_DATABASE_URL: url,
+    AWS_SECRET_ACCESS_KEY: `aws-synthetic-credential+/${randomUUID()}`,
+    PRIVATE_KEY: `-----BEGIN SYNTHETIC PRIVATE KEY-----\n${Buffer.from(randomUUID()).toString('base64')}\n-----END SYNTHETIC PRIVATE KEY-----`,
+    SECRET_KEY: Buffer.from(`synthetic-other-credential-${randomUUID()}`).toString('base64'),
+    OTHER_DATABASE_URL: `postgresql://postgres:${encodeURIComponent(`other-database-secret+/${randomUUID()}`)}@127.0.0.1:1/no-network`,
   };
   const prior = Object.keys(values).map(name => process.env[name]);
   Object.assign(process.env, values);
-  try { return await action([values.OPENROUTER_API_KEY, artifactKey, values.TUJIANG_EVALUATION_REVIEWER_CREDENTIAL,
-    url, new URL(url).password, password]); }
+  try {
+    const otherPassword = new URL(values.OTHER_DATABASE_URL).password;
+    const known = [values.OPENROUTER_API_KEY, artifactKey, values.TUJIANG_EVALUATION_REVIEWER_CREDENTIAL,
+      url, new URL(url).password, password, values.AWS_SECRET_ACCESS_KEY, values.PRIVATE_KEY, values.SECRET_KEY,
+      values.OTHER_DATABASE_URL, otherPassword, decodeURIComponent(otherPassword)];
+    return await action([...new Set(known.flatMap(value => [value, Buffer.from(value).toString('base64'),
+      Buffer.from(value).toString('hex'), encodeURIComponent(value)]))]);
+  }
   finally {
     Object.keys(values).forEach((name, index) => {
       if (prior[index] === undefined) delete process.env[name]; else process.env[name] = prior[index];
@@ -33,7 +44,7 @@ async function withSecretEnvironment<T>(action: (secrets: string[]) => Promise<T
 
 test('artifact cipher always protects its own textual and raw encryption key without changing unrelated binary bytes', () => {
   const cipher = new ArtifactCipher(artifactKey); const rawKey = Buffer.from(artifactKey, 'base64');
-  const binding: ArtifactBinding = { authorizationId: AUTHORIZATION_ID, batchId: null, attemptId: null,
+  const binding: ArtifactBinding = { authorizationId: AUTHORIZATION_ID, artifactId: randomUUID(), batchId: null, attemptId: null,
     kind: 'synthetic', sourceSha256: objectSha256({}), metadataSha256: objectSha256({}) };
   for (const secret of [Buffer.from(artifactKey), Buffer.from(rawKey.toString('hex')), rawKey]) {
     const bytes = Buffer.concat([Buffer.from('before:'), secret, Buffer.from(':after')]);
@@ -58,6 +69,8 @@ test('fresh management rejects every known environment secret and runner scrubs 
     }
     assert.deepEqual(await manager.status(), before);
     assert.equal((await f.db.query('SELECT id FROM evaluation_artifacts')).rows.length, 0);
+    const ordinary = corePayload(); ordinary.sources[0]!.bytesBase64 = Buffer.from('PostgreSQL uses postgres as a common role name.').toString('base64');
+    assert.equal((await manager.createBatch(randomUUID(), ordinary)).status, 'awaiting_input_review');
     const batch = await preparedCore(manager); const attempt = await runner.reserve(batch.batchId, 'item-1', batch.plan);
     const owner = randomUUID(); await runner.beginDispatch(attempt.id, owner);
     const raw = capture({ ...goodResponse(), echoes: secrets }); const artifactId = await runner.recordCapture(attempt.id, owner, raw);

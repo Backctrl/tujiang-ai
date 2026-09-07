@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { runEvaluation, type RunnerOptions } from '../evaluation/runner.js';
 import { runCli } from '../evaluation/runner-cli.js';
 import { AuthorizationLedger } from '../evaluation/authorization-ledger.js';
-import { ArtifactCipher } from '../evaluation/authorization-artifacts.js';
+import { ArtifactCipher, type SealedArtifact } from '../evaluation/authorization-artifacts.js';
 import { sha256 } from '../evaluation/authorization-contract.js';
 import { PURPOSE_LIMITS, type Purpose } from '../evaluation/authorization-contract.js';
 import { artifactKey, authorizedCapabilities as capabilities, authorizedConfig as config, goodResponse as good, humanFixture as human,
@@ -149,6 +149,27 @@ test('an approved batch containing an old runtime secret remains stopped after c
     assert.equal(stops.rows.length, 1); assert.ok(!JSON.stringify(stops.rows).includes(key));
   }, { fixtures: [input] });
 });
+
+test('tampered approved ciphertext commits a stop and restoring the artifact cannot enable a fresh runner', () => withMock(async m => {
+  const artifactId = await m.f.manager.inputArtifactId(m.batch.batchId);
+  const original = (await m.f.db.query<{ sealed: SealedArtifact }>('SELECT sealed FROM evaluation_artifacts WHERE id=$1', [artifactId])).rows[0]!.sealed;
+  const bytes = Buffer.from(original.ciphertext, 'base64'); bytes[0] = bytes[0]! ^ 0xff;
+  await m.f.db.query('UPDATE evaluation_artifacts SET sealed=$2 WHERE id=$1',
+    [artifactId, JSON.stringify({ ...original, ciphertext: bytes.toString('base64') })]);
+  let keys = 0; const options = { ...m.options, getApiKey: () => { keys++; return key; } };
+  const failed = await runEvaluation(config, [human], options);
+  assert.equal(failed.code, 'ARTIFACT_INTEGRITY_FAILED'); assert.equal(failed.metadataRequests, 0); assert.equal(failed.requestsAttempted, 0);
+  assert.equal((await m.f.manager.status()).batches[0]!.status, 'stopped');
+  const events = await m.f.db.query<{ body: { code: string } }>("SELECT body FROM evaluation_events WHERE type='batch.review_invalidated'");
+  assert.equal(events.rows.length, 1); assert.equal(events.rows[0]!.body.code, 'ARTIFACT_INTEGRITY_FAILED');
+  await m.f.db.query('UPDATE evaluation_artifacts SET sealed=$2 WHERE id=$1', [artifactId, JSON.stringify(original)]);
+  const restored = await m.f.manager.readArtifactForReview(artifactId); assert.equal(sha256(restored.bytes), original.contentSha256);
+  const peer = AuthorizationLedger.forRunner(m.f.db, new ArtifactCipher(artifactKey));
+  const repeat = await runEvaluation(config, [human], { ...options, authorization: { ...options.authorization!, ledger: peer } });
+  assert.equal(repeat.code, 'BATCH_NOT_RUNNABLE'); assert.equal(repeat.metadataRequests, 0); assert.equal(repeat.requestsAttempted, 0);
+  assert.equal(keys, 0); assert.equal(m.calls.length, 0); assert.equal((await peer.status()).batches[0]!.status, 'stopped');
+  assert.equal((await m.f.db.query("SELECT sequence FROM evaluation_events WHERE type='batch.review_invalidated'")).rows.length, 1);
+}));
 
 test('all metadata transport failures persistently stop the reviewed batch and the next run performs zero requests', async () => {
   const cases: [string, () => Promise<Response>][] = [
