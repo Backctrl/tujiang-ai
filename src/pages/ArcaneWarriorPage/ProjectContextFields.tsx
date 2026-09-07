@@ -17,14 +17,14 @@ function TextField({ context: c, field, label, maxLength = 200, placeholder, wid
 
 export function ContextControls({ context: c, session: s }: Props) {
   return <>
-    {!s.project ? <p className="integration-note wide">从项目入口新建或打开项目后，填写下方五项配置。</p> : !s.project.production ? <div className="wide inspector-block"><p>开始填写后，可保存产品、目标市场与图片尺寸。已有文字资料与事实审核继续保留。</p><Button tone="violet" disabled={!s.canWrite} onClick={c.initialize}>开始填写制作配置</Button></div> : !c.initialized ? <p className="integration-note wide" role="alert">当前制作配置版本与客户端不兼容，请更新后再编辑。</p> : <p className="integration-note wide">{c.activeVersion ? `${c.activeVersion.label} 已启用，版本内容已固定。` : '尚未启用制作配置。'}{c.readOnly ? ' 修改前先复制为本地草稿，再保存并启用新版本。' : ' 可以先保存未完成的草稿；启用前需要补齐信息与核验规则。'}</p>}
+    {!s.project?.production ? <p className="integration-note wide">先填写配置并选择原件，输入保留在本地。首次上传或点击下方创建按钮时，保存到同一个服务端项目。</p> : !c.initialized ? <p className="integration-note wide" role="alert">当前制作配置版本与客户端不兼容，请更新后再编辑。</p> : <p className="integration-note wide">{c.activeVersion ? `${c.activeVersion.label} 已启用，版本内容已固定。` : '尚未启用制作配置。'}{c.readOnly ? ' 修改前先复制为本地草稿，再保存并启用新版本。' : ' 可以先保存未完成的草稿；创建并提取前需要补齐信息与核验规则。'}</p>}
     {!!c.state?.versions.length && <>
       <label>复制已有配置<select value={String(c.selectedCopyVersion?.version ?? '')} disabled={!s.canWrite} onChange={e => c.setCopyVersion(e.target.value)}>{c.state.versions.map(version => <option key={version.version} value={version.version}>{version.label} · {version.context.productBrief.productName}{version.version === c.state?.activeVersion ? ' · 当前启用' : ''} · {modelLabel(ruleModel(version.rulePack))}</option>)}</select></label>
       <Button disabled={!c.canCopyVersion(c.selectedCopyVersion)} onClick={() => c.selectedCopyVersion && c.requestCopy(c.selectedCopyVersion)}>复制 {c.selectedCopyVersion?.label} 为本地草稿</Button>
     </>}
     {c.pendingCopy && <div className="wide inspector-block" role="alert"><b>{c.pendingCopy.kind === 'model' ? '切换规则类型前比较配置' : '替换正在编辑的配置'}</b><p>将载入 {c.pendingCopy.label}。当前输入按规则类型保留在本项目的本地备份中；服务端配置在明确保存前保持原样。</p>
       {c.pendingCopy.changes.length ? c.pendingCopy.changes.map((change, index) => <p key={index}>{change}</p>) : <p>字段内容相同。</p>}
-      <Button disabled={!s.canWrite} onClick={c.confirmCopy}>确认差异并载入</Button><Button onClick={c.cancelCopy}>保留当前输入</Button></div>}
+      <Button disabled={!(s.canEditSetup ?? s.canWrite)} onClick={c.confirmCopy}>确认差异并载入</Button><Button onClick={c.cancelCopy}>保留当前输入</Button></div>}
     {(c.migrationRequired || c.unsupported.length > 0) && <div className="wide inspector-block" role="alert"><b>旧版本地草稿需要转换</b><p>原输入完整保留。新增字段只取自这份草稿记录的原配置依据，不从当前服务端版本补入。</p>
       <details><summary>查看保留的旧草稿</summary><pre className="context-raw-draft">{c.migrationRaw}</pre></details>
       {c.unsupported.length ? <p>有当前表单无法表示的字段：{c.unsupported.join('、')}。请先保留原输入，再选择放弃旧草稿或使用已有版本。</p> : <Button disabled={!s.canWrite} onClick={c.migrateLocal}>已检查原输入，转换为当前表单</Button>}
@@ -73,7 +73,7 @@ export function TargetFields({ context: c, session: s }: Props) {
       const rule = matching.find(item => ruleKey(item) === e.target.value); c.setRule(rule?.id ?? '', rule?.version ?? '')
     }}><option value="">选择规则并带入目标与本地化配置</option>{matching.map(rule => <option key={ruleKey(rule)} value={ruleKey(rule)}>{isScopedRule(rule) ? rule.name : rule.id} · {rule.version} · {rule.target.country} / {rule.target.language} / {rule.target.currency} / {rule.target.unitSystem === 'metric' ? '公制' : '英制'}</option>)}</select></label></div>
     <p className="hint">选择规则后带入该目标的语言、货币和计量单位。平台、站点或内容类型变化后需要重新选择规则。</p>
-    <Button disabled={!s.project || !s.token.trim() || s.authExpired || s.catalogLoading} onClick={s.reloadCatalog}><RefreshCw size={14} />{s.catalogLoading ? '正在读取规则' : '重新读取平台规则'}</Button>
+    <Button disabled={!s.token.trim() || s.authExpired || s.catalogLoading} onClick={s.reloadCatalog}><RefreshCw size={14} />{s.catalogLoading ? '正在读取规则' : '重新读取平台规则'}</Button>
     {s.catalogError && <p role="alert" className="hint">{s.catalogError}</p>}
     {c.rules !== null && !available.length && <p className="hint">暂无此类已配置规则。可先保存草稿，补齐已核验规则后再启用。</p>}
     <details className="inspector-block" open={!!c.form.platform && !platforms.includes(c.form.platform)}><summary>未配置目标与原输入（仅作草稿）</summary><p className="integration-note">这里保留目录以外的目标和旧输入，不代表平台已支持。启用前必须明确选择相容的已核验组合。</p><div className="form-grid"><TextField context={c} field="platform" label="首发平台" /><TextField context={c} field="site" label="站点" />{scoped && <TextField context={c} field="contentType" label="内容类型" />}</div>{ref && !selected && <p>保留的规则引用：{ref.id} · {ref.version}，不在当前可选组合中。</p>}</details>

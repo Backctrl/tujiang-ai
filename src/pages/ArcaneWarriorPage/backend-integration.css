@@ -103,3 +103,10 @@
 .connected-workbench .review-block > p { font-size: 12px; line-height: 1.8; }
 .connected-workbench .review-block .source-card { min-height: 0; }
 .connected-workbench .review-source-text { white-space: pre-wrap; max-height: 280px; overflow: auto; }
+.connected-workbench .startup-findings { list-style:none; padding:0; margin:10px 0; display:grid; gap:8px; }
+.connected-workbench .startup-findings button { width:100%; border:1px solid var(--line); border-radius:8px; background:transparent; color:inherit; padding:10px; text-align:left; font:inherit; line-height:1.6; cursor:pointer; }
+.connected-workbench .startup-findings button span { display:block; font-size:11px; color:var(--ink-3); }
+.connected-workbench .startup-finding-group { margin:20px 0; font-size:12px; }
+.connected-workbench .startup-facts-panel { margin-top:16px; }
+.connected-workbench .startup-facts-panel ul { padding-left:18px; overflow-wrap:anywhere; }
+.connected-workbench .startup-scope-proposal { border-top:1px solid var(--line); padding-top:14px; margin-top:14px; }

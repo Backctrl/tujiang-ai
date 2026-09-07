@@ -81,6 +81,8 @@
     "@types/react-dom": "^19",
     "concurrently": "^9",
     "eslint": "^9",
+    "fake-indexeddb": "6.2.5",
+    "react-test-renderer": "19.2.7",
     "typescript": "~5.9",
     "vite": "^8"
   }

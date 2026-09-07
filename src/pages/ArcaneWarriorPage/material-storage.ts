@@ -109,7 +109,7 @@ class IndexedMaterialStorage implements MaterialIntakeStorage {
       const request = tx.objectStore('pending').get('active')
       request.onsuccess = () => result(request.result)
     })
-    return pending === undefined ? undefined : validateMaterialOperation(pending)
+    return pending === undefined || (pending as { kind?: string }).kind === 'setup' ? undefined : validateMaterialOperation(pending)
   }
   savePending(operation: MaterialOperation) {
     return this.writePending(operation)

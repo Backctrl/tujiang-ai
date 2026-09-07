@@ -17,8 +17,9 @@ export function useMaterialIntake(session: ProjectSession) {
   const [onlyEntryId, setOnlyEntryId] = useState<string | null>(null)
   const inFlight = useRef(false)
   const addingRef = useRef(false)
+  const startingRef = useRef(false)
   const claimed = useRef(new Set<string>())
-  const projectId = session.project?.id
+  const projectId = session.project?.id ?? session.draftScope
   const currentId = useRef(projectId)
   currentId.current = projectId
   const reload = () => setStorageVersion(value => value + 1)
@@ -41,7 +42,8 @@ export function useMaterialIntake(session: ProjectSession) {
   // A storage mutation can finish before the effect has reloaded its new entries.
   // Do not act on the previous list during that render, including an explicit single-file retry.
   const ready = loaded?.projectId === projectId && loaded?.version === storageVersion && !loading
-  const canSelect = session.canWrite && initialized && !adding && ready
+  const canSelect = (session.canEditSetup ?? session.canWrite) && !adding && ready
+  const canStart = (session.canPrepareSetup ?? session.canWrite) && ready && !adding
 
   const addFiles = async (files: File[], source: MaterialSource) => {
     if (!projectId || !canSelect || addingRef.current || !files.length) return
@@ -64,22 +66,28 @@ export function useMaterialIntake(session: ProjectSession) {
     } catch { failures.push('无法读取浏览器存储，本次选择的文件尚未加入队列，也未上传。') }
     finally { setSelectionErrors({ projectId, messages: failures }); addingRef.current = false; setAdding(false) }
   }
-  const start = () => {
-    if (!projectId || !session.canWrite || !ready || !initialized) return
-    setError(''); setOnlyEntryId(null); setRunningProject(projectId)
+  const start = async (entryId: string | null = null) => {
+    if (!projectId || !canStart || startingRef.current) return
+    startingRef.current = true
+    const scope = session.getCurrentScope?.()
+    try {
+      const next = session.ensureSetupProject ? await session.ensureSetupProject() : session.project
+      if (!next?.production || session.getCurrentScope?.() !== scope) return
+      setError(''); setOnlyEntryId(entryId); setRunningProject(next.id); reload()
+    } finally { startingRef.current = false }
   }
   const retryLocal = async (entry: MaterialLocalEntry) => {
-    if (!session.canWrite || !projectId || entry.projectId !== projectId || inFlight.current) return
+    if (!canStart || !projectId || entry.projectId !== projectId || inFlight.current) return
     try {
       // Re-read before requeueing; a late UI render must never recreate an already accepted entry.
       const current = (await materialIntakeStorage.list(projectId)).find(item => item.id === entry.id)
       if (!current || current.status === 'uploading' || current.status === 'uncertain') return
       await materialIntakeStorage.put({ ...current, status: 'waiting', message: undefined })
-      claimed.current.delete(entry.id); setError(''); setOnlyEntryId(entry.id); setRunningProject(projectId)
+      claimed.current.delete(entry.id); await start(entry.id)
     } catch { setError('未能更新本地队列，此文件没有重新发送。请检查浏览器存储后重试。') }
   }
   const remove = async (entry: MaterialLocalEntry) => {
-    if (!session.canWrite || entry.projectId !== projectId || inFlight.current || ['uploading', 'uncertain'].includes(entry.status)) return
+    if (!(session.canEditSetup ?? session.canWrite) || entry.projectId !== projectId || inFlight.current || ['uploading', 'uncertain'].includes(entry.status)) return
     try { await materialIntakeStorage.remove(entry.id); claimed.current.delete(entry.id) }
     catch { setError('未能移除本地文件，请检查浏览器存储后重试。') }
   }
@@ -114,7 +122,7 @@ export function useMaterialIntake(session: ProjectSession) {
     document.body.append(link); link.click(); link.remove()
     setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
-  return { entries: localEntries, materials, initialized, canSelect, adding, loading, error,
+  return { entries: localEntries, materials, initialized, canSelect, canStart, adding, loading, error,
     selectionErrors: selectionErrors && selectionErrors.projectId === projectId ? selectionErrors.messages : [], addFiles, start,
     retryLocal, remove, reload, running: runningProject === projectId && !!projectId, pause: () => setRunningProject(null), download }
 }

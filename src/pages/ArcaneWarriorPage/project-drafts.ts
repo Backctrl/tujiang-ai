@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 
 function comparableJson(value: unknown) {
   return JSON.stringify(value, (_key, nested: unknown) => {
@@ -19,19 +19,21 @@ export function readDraft<T>(projectId: string | undefined, field: string, fallb
 // The stage subtree is keyed by project ID. Persist synchronously before it can unmount.
 export function useProjectDraft<T>(projectId: string | undefined, field: string, fallback: T) {
   const [value, setValue] = useState<T>(() => readDraft(projectId, field, fallback))
-  const update = (next: T | ((previous: T) => T)) => setValue(previous => {
-    const resolved = typeof next === 'function' ? (next as (previous: T) => T)(previous) : next
+  const latest = useRef(value)
+  const update = (next: T | ((previous: T) => T)) => {
+    const resolved = typeof next === 'function' ? (next as (previous: T) => T)(latest.current) : next
     if (projectId) {
       try { localStorage.setItem(draftKey(projectId, field), JSON.stringify(resolved)) } catch { /* Editing remains available when storage is unavailable. */ }
     }
-    return resolved
-  })
-  return [value, update] as const
+    latest.current = resolved
+    setValue(resolved)
+  }
+  return [value, update, () => latest.current] as const
 }
 
-export function useReviewedDraft<T, B>(projectId: string | undefined, field: string, fallback: T, baseFor: (value: T) => B) {
+export function useReviewedDraft<T, B>(projectId: string | undefined, field: string, fallback: T, baseFor: (value: T) => B, restored?: { value: T; base: B | null; active: boolean }) {
   const legacy = readDraft<T | undefined>(projectId, field, undefined)
-  const [stored, store] = useProjectDraft<{ value: T; base: B | null; active: boolean }>(projectId, `${field}:reviewed`, {
+  const [stored, store, getStored] = useProjectDraft<{ value: T; base: B | null; active: boolean }>(projectId, `${field}:reviewed`, restored ?? {
     value: legacy === undefined ? fallback : legacy, base: null, active: legacy !== undefined && !sameJsonValue(legacy, fallback),
   })
   const currentBase = baseFor(stored.value)
@@ -44,5 +46,5 @@ export function useReviewedDraft<T, B>(projectId: string | undefined, field: str
   const replace = (prepared: { value: T; base: B | null }) => store({ ...prepared, active: true })
   const discard = () => store({ value: fallback, base: null, active: false })
   const acknowledge = () => store(previous => ({ ...previous, base: baseFor(previous.value) }))
-  return { value: stored.value, active: stored.active, setValue, prepareReplacement, replace, discard, acknowledge, needsReview, originalBase: stored.base, currentBase }
+  return { value: stored.value, active: stored.active, setValue, prepareReplacement, replace, discard, acknowledge, needsReview, originalBase: stored.base, currentBase, getStored }
 }

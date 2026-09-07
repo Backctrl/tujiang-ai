@@ -14,5 +14,6 @@ export function useProjectSnapshot(initial: Project | null = null) {
     setProject(next)
     return next
   }, [])
-  return { project, getLatestProject, receiveSnapshot }
+  const clearSnapshot = useCallback(() => { latestProject.current = null; setProject(null) }, [])
+  return { project, getLatestProject, receiveSnapshot, clearSnapshot }
 }
