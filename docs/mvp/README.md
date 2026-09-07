@@ -14,7 +14,7 @@
 | 0Q | Q | 进行中 | 工程验收矩阵已建立；AW FLEX 真实样本已读，预期事实与质量签收待补 | D1–D3 |
 | 1A | A | 已完成 | [PR #7](https://github.com/Backctrl/tujiang-ai/pull/7)；正式对象空底座、显式初始化、兼容与项目列表 | D4–D10 |
 | 1B | B | 已完成 | [PR #8](https://github.com/Backctrl/tujiang-ai/pull/8)；项目切换、SSE、草稿隔离和恢复；[M1 验收记录](verification/m1.md) | D4–D10 |
-| 2A1 | A | 已完成 | [PR #9](https://github.com/Backctrl/tujiang-ai/pull/9)；部分配置草稿、不可变上下文及跨项目规则版本；完整启动链仍依赖 2A3 | D11–D20 |
+| 2A1 | A | 已完成 | [PR #9](https://github.com/Backctrl/tujiang-ai/pull/9)；部分配置草稿、不可变上下文及跨项目规则版本；完整启动链后由 2A3 完成 | D11–D20 |
 | 2B1 | A | 已完成 | [PR #11](https://github.com/Backctrl/tujiang-ai/pull/11)；原件、确定性解析、定位与单文件恢复；[M2 分包记录](verification/m2.md) | D11–D20 |
 | 2B2 | A | 已完成 | [PR #14](https://github.com/Backctrl/tujiang-ai/pull/14)；用途纠正、来源追溯与重确认，114 项后端／13 项真实 PostgreSQL 及独立审查通过 | D11–D20 |
 | 2C | B | 已完成 | [PR #12](https://github.com/Backctrl/tujiang-ai/pull/12)、[#21](https://github.com/Backctrl/tujiang-ai/pull/21)、[#25](https://github.com/Backctrl/tujiang-ai/pull/25)；配置版本、连续五区、支持组合、真实上传与原子启动的整页恢复链通过独立审查、真实 PostgreSQL 与浏览器 | D11–D20 |
