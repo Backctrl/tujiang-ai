@@ -11,6 +11,7 @@ import { ManualEvidenceFields } from './ManualEvidenceFields'
 import { EvidenceDetails, ReconfirmationInspector, UsageInspector } from './MaterialReviewInspectors'
 import { CandidateInspector, FactInspector, type CandidateSelection } from './FactReviewInspectors'
 import { useMaterialReviews, type MaterialReviewsController } from './useMaterialReviews'
+import { StartupFactsPanel } from './StartupFactsPanel'
 import { emptyFactCandidate, evidenceAvailable, factSourceAvailable, factStatusLabels, reviewLabels, reviewTaskSource, reviewTypes } from './material-review'
 import { useProjectDraft } from './project-drafts'
 
@@ -82,9 +83,10 @@ export function MaterialFactsContent({ session: s, intake, onStage, reviews }: P
       </>}
       <div className="queue-summary"><span>{filter === 'facts' ? `显示 ${visibleFacts.length} 条事实` : reviews.current ? `显示 ${visibleTasks.length} 项 · R${reviews.center!.revision}` : '待处理数量尚未校准'}</span><b>{readyFacts.length} 条已确认且来源有效</b></div>
       <div className="inspector-block"><Button disabled={!s.canWrite} onClick={() => setSelection({ kind: 'candidate', scope: 'manual', initial: emptyFactCandidate })}>补充人工候选</Button>
-        <details><summary>模型提取与运行记录</summary><label><input type="checkbox" checked={s.runConsent} disabled={!s.canWrite} onChange={e => s.setRunConsent(e.target.checked)} />允许本项目的模型运行请求</label><p className="integration-note">显式提交后，从全部当前有效产品证据提取候选；参考内容与已撤回证据不会进入模型输入。</p>
-          <Button disabled={!s.canWrite || !s.runConsent || !availableSources.length || !project?.identity || activeRun || (!!project?.production && !reviews.current)} onClick={() => { if (project?.production && !reviews.isCurrent()) return; void s.write('runs', { skill: 'extract-facts' }, '事实提取已提交。') }}>从有效产品证据提取候选</Button>
-          {runs.map(run => <p key={run.id}>{run.id} · {run.queueStatus === 'queued' ? '排队中' : run.queueStatus === 'claimed' ? '执行中' : run.runStatus === 'succeeded' ? '已完成' : run.runStatus === 'failed' ? '失败' : run.runStatus}{run.errorCode && ` · ${run.errorCode}`}{run.runStatus === 'failed' && <Button disabled={!s.canWrite || !s.runConsent || activeRun} onClick={() => void s.write(`runs/${run.id}/retry`, {}, '提取重试已提交。')}>重试提取</Button>}</p>)}
+        <StartupFactsPanel session={s} onStage={onStage} />
+        <details><summary>模型提取与运行记录</summary>{!project?.production?.startup && <><label><input type="checkbox" checked={s.runConsent} disabled={!s.canWrite} onChange={e => s.setRunConsent(e.target.checked)} />允许本项目的模型运行请求</label><p className="integration-note">显式提交后，从全部当前有效产品证据提取候选；参考内容与已撤回证据不会进入模型输入。</p>
+          <Button disabled={!s.canWrite || !s.runConsent || !availableSources.length || !project?.identity || activeRun || (!!project?.production && !reviews.current)} onClick={() => { if (s.getLatestProject()?.production?.startup || project?.production && !reviews.isCurrent()) return; void s.write('runs', { skill: 'extract-facts' }, '事实提取已提交。') }}>从有效产品证据提取候选</Button></>}
+          {runs.map(run => <p key={run.id}>{run.id} · {run.queueStatus === 'queued' ? '排队中' : run.queueStatus === 'claimed' ? '执行中' : run.runStatus === 'succeeded' ? '已完成' : run.runStatus === 'failed' ? '失败' : run.runStatus}{run.errorCode && ` · ${run.errorCode}`}{run.runStatus === 'failed' && !project?.production?.startup && <Button disabled={!s.canWrite || !s.runConsent || activeRun} onClick={() => { if (!s.getLatestProject()?.production?.startup) void s.write(`runs/${run.id}/retry`, {}, '提取重试已提交。') }}>重试提取</Button>}</p>)}
         </details>
       </div>
     </section>

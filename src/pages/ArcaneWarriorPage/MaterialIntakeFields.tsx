@@ -18,7 +18,7 @@ export function MaterialUploadFields({ intake, session, surface }: Props & { sur
   const input = useRef<HTMLInputElement>(null)
   const urlInput = useRef<HTMLInputElement>(null)
   const id = useId()
-  const [source, setSource] = useProjectDraft(session.project?.id, `materialSource:${surface}`, emptyMaterialSource)
+  const [source, setSource] = useProjectDraft(session.draftScope ?? session.project?.id, `materialSource:${surface}`, emptyMaterialSource)
   const [errors, setErrors] = useState<Partial<Record<keyof MaterialSourceForm, string>>>({})
   const select = () => {
     const compiled = compileMaterialSource(source)
@@ -33,7 +33,7 @@ export function MaterialUploadFields({ intake, session, surface }: Props & { sur
     void intake.addFiles(files, compiled.source)
   }
   return <div className="material-upload">
-    {!intake.initialized && <p className="integration-note">请先在产品基础信息区开启制作配置，再上传原件。</p>}
+    {!intake.initialized && <p className="integration-note">可以先选择文件。点击上传时会准备本项目并接收原件。</p>}
     <details className="inspector-block"><summary>来源记录（用于接下来选择的文件）</summary><div className="form-grid">
       <label className="wide">资料来源<select value={source.kind} disabled={!intake.canSelect} onChange={e => setSource({ ...source, kind: e.target.value as MaterialSourceForm['kind'] })}><option value="local_upload">本地原件</option><option value="feishu_export">飞书导出</option></select></label>
       <label className="wide">原文链接{source.kind === 'feishu_export' ? '（必填）' : '（可选）'}<input ref={urlInput} type="url" maxLength={2000} value={source.url} disabled={!intake.canSelect} aria-invalid={!!errors.url} aria-describedby={errors.url ? `${id}-url-error` : undefined} onChange={e => setSource({ ...source, url: e.target.value })} placeholder="https://…" /></label>
@@ -54,14 +54,14 @@ export function MaterialUploadFields({ intake, session, surface }: Props & { sur
     {intake.selectionErrors.map((message, index) => <p role="alert" key={index}>{message}</p>)}
     {intake.error && <div role="alert"><p>{intake.error}</p><Button disabled={session.busy || intake.loading} onClick={intake.reload}>重新读取本地队列</Button></div>}
     {!!intake.entries.length && <>
-      <div className="connection-actions material-actions"><Button tone="violet" disabled={!session.canWrite || intake.loading || intake.running || !intake.entries.some(entry => entry.status === 'waiting')} onClick={intake.start}>开始上传等待的文件</Button>{intake.running && <Button onClick={intake.pause}>暂停后续文件</Button>}</div>
+      <div className="connection-actions material-actions"><Button tone="violet" disabled={!(intake.canStart ?? session.canWrite) || intake.loading || intake.running || !intake.entries.some(entry => entry.status === 'waiting')} onClick={() => void intake.start()}>开始上传等待的文件</Button>{intake.running && <Button onClick={intake.pause}>暂停后续文件</Button>}</div>
       <p className="hint">文件依次提交；格式拒绝只影响该份。只有后台解析进度变化时，每份最多自动同步一次再提交；其他版本冲突或结果未确认会暂停。</p>
       <div className={`material-list material-local-queue ${surface === 'setup' ? 'setup-source-list' : 'rail-list'}`}>{intake.entries.map(entry => {
         const active = session.materialActivity?.entryId === entry.id
         const pending = session.pending?.kind === 'material' && session.pending.operation.entryId === entry.id
         const label = active ? session.materialActivity?.phase === 'reading' ? '读取原件' : '上传中' : pending || ['uploading', 'uncertain'].includes(entry.status) ? '结果待核对' : entry.status === 'waiting' ? '等待上传' : entry.status === 'conflict' ? '版本冲突，等待复核' : '上传失败'
         const canRetry = !pending && !active && !['uploading', 'uncertain'].includes(entry.status)
-        return <div className="source-card material-card" key={entry.id}><FileText size={18} aria-hidden="true" /><div><b title={entry.fileName}>{entry.fileName}</b><span>{fileSize(entry.sizeBytes)} · 本地文件</span><span>{label}</span><details><summary>查看本次来源</summary><SourceLocation source={entry.source} /></details>{entry.message && <p role="alert">{entry.message}</p>}</div><div className="source-status"><StatusDot tone={entry.status === 'rejected' || entry.status === 'conflict' ? 'red' : 'muted'} />{entry.status === 'waiting' ? '保存在此浏览器，尚未上传' : label}</div>{canRetry && <div className="source-status material-actions"><Button disabled={!session.canWrite || intake.running} onClick={() => void intake.retryLocal(entry)}>{entry.status === 'waiting' ? '上传此文件' : '重试此文件'}</Button><Button disabled={!session.canWrite || intake.running} onClick={() => void intake.remove(entry)}>移除本地文件</Button></div>}</div>
+        return <div className="source-card material-card" key={entry.id}><FileText size={18} aria-hidden="true" /><div><b title={entry.fileName}>{entry.fileName}</b><span>{fileSize(entry.sizeBytes)} · 本地文件</span><span>{label}</span><details><summary>查看本次来源</summary><SourceLocation source={entry.source} /></details>{entry.message && <p role="alert">{entry.message}</p>}</div><div className="source-status"><StatusDot tone={entry.status === 'rejected' || entry.status === 'conflict' ? 'red' : 'muted'} />{entry.status === 'waiting' ? '保存在此浏览器，尚未上传' : label}</div>{canRetry && <div className="source-status material-actions"><Button disabled={!(intake.canStart ?? session.canWrite) || intake.running} onClick={() => void intake.retryLocal(entry)}>{entry.status === 'waiting' ? '上传此文件' : '重试此文件'}</Button><Button disabled={!(session.canEditSetup ?? session.canWrite) || intake.running} onClick={() => void intake.remove(entry)}>移除本地文件</Button></div>}</div>
       })}</div>
     </>}
   </div>

@@ -4,6 +4,8 @@ import type { RuleCatalog } from './rule-catalog.js'
 import type { MaterialReviewCenter } from '../../../backend/src/production-material-usage.js'
 import { contextFieldLabel, isRuleCatalog } from './project-context.js'
 import { isMaterialReviewCenter } from './material-review.js'
+import { isStartupCheck, isStartupRead, isStartupStatus, startupStatusMatchesProject, type StartupCheck, type StartupRead, type StartupStatus } from './startup-contract.js'
+import type { ContextDraft } from '../../../backend/src/production-context.js'
 export type { Project, Fact, Storyboard, Section } from '../../../backend/src/contracts.js'
 export type ProjectSummary = Pick<Project, 'id' | 'name' | 'version' | 'revision' | 'contractVersion'> & { updatedAt: string }
 export type PreparedProjectWrite = Readonly<{ projectId: string; suffix: string; body: string }>
@@ -33,6 +35,32 @@ function responseError(response: Response, data: { error?: { code?: string; fiel
 // Same-origin only: the reverse proxy owns the backend destination, never the browser token.
 export class StageAApi {
   constructor(private token: string, private request: typeof fetch = fetch) {}
+  async startupRequest(projectId: string, suffix = '', body?: string): Promise<unknown> {
+    let response: Response
+    try { response = await this.request(`/api/projects/${encodeURIComponent(projectId)}/production/startup${suffix ? `/${suffix}` : ''}`, {
+      method: body ? 'POST' : 'GET', headers: { Authorization: `Bearer ${this.token}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+      redirect: 'error', signal: AbortSignal.timeout(15000), ...(body ? { body } : {}),
+    }) } catch { throw new ApiError('CONNECTION_UNCERTAIN', 0) }
+    const data: unknown = await response.json().catch(() => { if (!response.ok) return {}; throw new ApiError('INVALID_STARTUP_RESPONSE', 502) })
+    if (!response.ok) throw responseError(response, (data ?? {}) as Parameters<typeof responseError>[1])
+    return data
+  }
+  async startupCheck(projectId: string, context: ContextDraft): Promise<StartupCheck> {
+    const data = await this.startupRequest(projectId, 'check', JSON.stringify({ context }))
+    if (!isStartupCheck(data) || data.projectId !== projectId) throw new ApiError('INVALID_STARTUP_RESPONSE', 502)
+    return data
+  }
+  async startup(projectId: string): Promise<StartupRead> {
+    const data = await this.startupRequest(projectId)
+    if (!isStartupRead(data) || data.projectId !== projectId) throw new ApiError('INVALID_STARTUP_RESPONSE', 502)
+    return data
+  }
+  async startupCommand(prepared: PreparedProjectWrite): Promise<{ project: Project; startup: StartupStatus }> {
+    const data = await this.startupRequest(prepared.projectId, prepared.suffix.replace('production/startup/', ''), prepared.body) as { project?: unknown; startup?: unknown }
+    if (!data || !isProjectResponse(data.project) || data.project.id !== prepared.projectId || !isStartupStatus(data.startup)
+      || !startupStatusMatchesProject(data.startup, data.project)) throw new ApiError('INVALID_STARTUP_RESPONSE', 502)
+    return { project: data.project, startup: data.startup }
+  }
   async materialReviews(projectId: string): Promise<MaterialReviewCenter> {
     let response: Response
     try {
@@ -86,9 +114,7 @@ export class StageAApi {
     if (!response.ok) {
       throw responseError(response, data)
     }
-    if (data.contractVersion !== 'stage-a.1' || typeof data.id !== 'string' || !Number.isInteger(data.revision) ||
-      !Number.isInteger(data.version) || !Array.isArray(data.facts) || !Array.isArray(data.evidence) ||
-      !Array.isArray(data.runs) || !Array.isArray(data.sections) || !Array.isArray(data.audit)) throw new ApiError('INVALID_RESPONSE', 502)
+    if (!isProjectResponse(data)) throw new ApiError('INVALID_RESPONSE', 502)
     return data as Project
   }
   get(id: string) { return this.send(`/projects/${encodeURIComponent(id)}`) }
@@ -101,6 +127,13 @@ export class StageAApi {
   executePrepared(prepared: PreparedProjectWrite) { return this.send(`/projects/${encodeURIComponent(prepared.projectId)}/${prepared.suffix}`, prepared.body) }
 }
 
+export function isProjectResponse(data: unknown): data is Project {
+  if (!data || typeof data !== 'object') return false
+  const value = data as Partial<Project>
+  return value.contractVersion === 'stage-a.1' && typeof value.id === 'string' && Number.isInteger(value.revision) && Number.isInteger(value.version)
+    && Array.isArray(value.facts) && Array.isArray(value.evidence) && Array.isArray(value.runs) && Array.isArray(value.sections) && Array.isArray(value.audit)
+}
+
 const messages: Record<string, string> = {
   UNAUTHORIZED: '连接凭据无效或已失效，请重新输入凭据。',
   INVALID_REQUEST: '有字段不符合接口要求，请检查输入。',
@@ -108,6 +141,12 @@ const messages: Record<string, string> = {
   REVISION_CONFLICT: '项目已被其他操作更新。请读取最新版本，复核差异后重新提交。',
   CONNECTION_UNCERTAIN: '连接中断，结果尚未确认。请读取最新项目核对；重试原请求会保留同一个操作编号。',
   INVALID_RESPONSE: '服务返回内容不符合阶段 A 契约，请检查 API 代理与后端版本。',
+  INVALID_STARTUP_RESPONSE: '启动检查或状态返回不完整，请重新读取并核对服务版本。',
+  INVALID_SETUP_RECOVERY: '项目启动恢复记录不完整，新的写入已暂停。请核对浏览器中的原请求。',
+  SETUP_INPUT_CHANGED: '本地配置或项目已变化，请重新检查后提交。',
+  SETUP_REQUEST_REJECTED: '原请求已被明确拒绝。读取最新状态并复核失败原因后，再明确重新提交。',
+  LOCAL_SETUP_REJECTION_SAVE_FAILED: '原请求已被拒绝，但浏览器未能保存拒绝标记。请恢复存储并读取最新状态后复核原请求。',
+  LOCAL_DRAFT_RECOVERY_CONFLICT: '本地输入与恢复记录的先后顺序不明确，请比较并选择要继续使用的输入。',
   INVALID_PRODUCTION_CATALOG: '平台规则目录暂不可用，请重新读取或联系维护人员核对。',
   PRODUCTION_NOT_INITIALIZED: '请先在项目设置明确开启制作配置，再保存草稿。',
   FILE_TOO_LARGE: '单个原件最多 10 MiB，请缩小文件后重新选择。',

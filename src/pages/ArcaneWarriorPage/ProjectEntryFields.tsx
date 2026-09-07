@@ -1,19 +1,18 @@
-import { useState } from 'react'
 import { useReviewedDraft } from './project-drafts'
 import type { ProjectSession } from './useProjectSession'
 import { Button } from './WorkbenchUI'
 
 /** Connection and legacy project controls stay outside the five business sections. */
 export function ProjectEntryFields({ session: s }: { session: ProjectSession }) {
-  const [name, setName] = useState('')
   const identityDraft = useReviewedDraft<string | null, { revision: number; name: string }>(s.project?.id, 'productName', null, () => ({ revision: s.project?.identityRevision ?? 0, name: s.project?.identity?.productName ?? '未确认' }))
   const identityValue = identityDraft.value ?? s.project?.identity?.productName ?? ''
-  return <details className="form-panel setup-project-entry" open={!s.project}><summary><b>项目入口</b> · {s.project?.name ?? '连接后新建或打开项目'}</summary>
-    <div className="form-grid setup-form-grid"><label className="wide">连接凭据<input type="password" autoComplete="off" disabled={s.busy || ((!!s.project || !!s.pending) && !s.authExpired && !s.recoveryNeedsCheck)} value={s.token} onChange={e => s.setToken(e.target.value)} placeholder="仅保存在当前页面内存" /></label>
+  return <details className="form-panel setup-project-entry" open={!s.project || !s.projectVerified}><summary><b>项目入口</b> · {s.project?.name ?? '本地新项目'}</summary>
+    <div className="form-grid setup-form-grid"><label className="wide">连接凭据<input type="password" autoComplete="off" disabled={s.busy} value={s.token} onChange={e => s.setToken(e.target.value)} placeholder="仅保存在当前页面内存" /></label>
+      {s.project && <><Button disabled={!s.token.trim() || s.busy} onClick={() => void s.refresh()}>读取当前项目</Button><p className="integration-note wide">{s.projectVerified ? '当前凭据已核验此项目。' : '输入凭据并读取当前项目后，可继续提交。凭据只保存在当前页面内存，刷新后需重新输入。'}</p></>}
       <Button disabled={!s.token.trim() || s.busy || !!s.pending} onClick={() => void s.listProjects()}>连接并读取项目列表</Button>
       <label className="wide">已有项目<select value={s.projects.some(p => p.id === s.project?.id) ? s.project?.id : ''} disabled={!s.canSwitch || !s.token.trim()} onChange={e => void s.selectProject(e.target.value)}><option value="">选择项目</option>{s.projects.map(p => <option key={p.id} value={p.id}>{p.name} · R{p.revision}</option>)}</select></label>
-      <label>新项目名称<input maxLength={150} value={name} disabled={!s.canSwitch} onChange={e => setName(e.target.value)} /></label><Button disabled={!s.token.trim() || !name.trim() || !s.canSwitch} onClick={() => void s.create(name)}>新建项目草稿</Button>
-      <p className="integration-note wide">新建后填写下方五项配置。切换项目保留各项目的本地草稿；未决请求或待复核冲突处理完成后才能切换。</p>
+      <Button disabled={!s.canSwitch} onClick={s.newLocalProject}>新建本地项目草稿</Button>
+      <p className="integration-note wide">填写下方五项配置，首次上传或创建并提取时保存项目。切换项目保留各自输入和文件队列；未决请求处理完成后才能切换。</p>
       <details className="wide"><summary>按项目 ID 打开（兼容入口）</summary><label>项目 ID<input value={s.projectId} disabled={!s.canSwitch} onChange={e => s.setProjectId(e.target.value)} /></label><Button disabled={!s.token.trim() || !s.projectId.trim() || !s.canSwitch} onClick={() => void s.selectProject(s.projectId.trim())}>打开项目</Button></details>
       <details className="wide"><summary>兼容身份设置 · {s.project?.identity?.productName ?? '待确认'}</summary><p className="integration-note">已有项目的文字事实提取身份在这里查看或明确纠正。产品基础信息不会自动覆盖已确认身份。</p><div className="form-grid">
         <label className="wide">事实提取用产品名称<input maxLength={150} disabled={!s.canWrite} value={identityValue} onChange={e => identityDraft.setValue(e.target.value)} /></label>

@@ -5,7 +5,10 @@ import type { ProjectSession } from './useProjectSession'
 import type { Evidence, Fact } from '../../../backend/src/contracts'
 import { Button, Chip, PanelTitle, StatusDot } from './WorkbenchUI'
 import { useProjectContext } from './useProjectContext'
-import { CanvasFields, ContextControls, ContextReadiness, LocaleFields, ProductBriefFields, TargetFields } from './ProjectContextFields'
+import { CanvasFields, ContextControls, LocaleFields, ProductBriefFields, TargetFields } from './ProjectContextFields'
+import { StartupReadiness } from './StartupReadiness'
+import { useProjectStartup } from './useProjectStartup'
+import type { StartupFinding } from './startup-contract'
 import { ProjectEntryFields } from './ProjectEntryFields'
 import { MaterialList, MaterialUploadFields } from './MaterialIntakeFields'
 import type { MaterialIntakeController } from './useMaterialIntake'
@@ -25,6 +28,11 @@ export function ProjectSetup({ session: s, onStage, intake }: Props) {
     container.scrollTo({ top: container.scrollTop + section.getBoundingClientRect().top - container.getBoundingClientRect().top, behavior: 'auto' })
     setActiveAnchor(index)
   }
+  const onFinding = (finding: StartupFinding) => {
+    if (finding.location.page === 'facts') { if (s.project?.production?.startup) onStage('facts'); else scrollTo(1); return }
+    scrollTo(({ 'product-info': 0, materials: 1, 'primary-target': 2, 'canvas-profile': 4, 'creation-confirmation': 0, 'pending-center': 1 })[finding.location.anchor])
+  }
+  const startup = useProjectStartup(s, context, () => onStage('facts'), onFinding)
   const trackScroll = () => {
     const container = main.current
     if (!container) return
@@ -53,8 +61,8 @@ export function ProjectSetup({ session: s, onStage, intake }: Props) {
       <div className="form-panel setup-section compact-section" id="setup-3"><PanelTitle eyebrow="04 / LOCALE" title="本地化配置" /><LocaleFields context={context} /></div>
       <div className="form-panel setup-section compact-section page-size" id="setup-4"><PanelTitle eyebrow="05 / CANVAS" title="页面尺寸" /><CanvasFields context={context} /></div>
     </section>
-    <aside className="inspector setup-check"><ContextReadiness context={context} session={s} /></aside>
-    <div className="stage-bottom setup-bottom"><Button disabled><ArrowLeft size={15} />返回项目列表</Button><span>配置需保存并启用 · 事实身份独立确认</span><Button tone="primary" disabled={!s.project} onClick={() => onStage('facts')}>进入产品事实 <ArrowRight size={15} /></Button></div>
+    <aside className="inspector setup-check"><StartupReadiness context={context} session={s} startup={startup} onFinding={onFinding} /></aside>
+    <div className="stage-bottom setup-bottom"><Button disabled><ArrowLeft size={15} />返回项目列表</Button><span>{startup.submitting ? '正在检查并保存项目启动' : '创建后在产品事实中审核资料与候选'}</span><Button tone="primary" disabled={!startup.canStart} onClick={() => void startup.start()}>创建项目并开始事实提取 <ArrowRight size={15} /></Button></div>
   </div>
 }
 

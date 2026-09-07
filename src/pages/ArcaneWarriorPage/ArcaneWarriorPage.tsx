@@ -5,6 +5,7 @@ import { BrandMark, Button, StatusDot } from './WorkbenchUI'
 import { useProjectSession } from './useProjectSession'
 import { useMaterialIntake } from './useMaterialIntake'
 import { ProjectSetup, FactsStage } from './ProjectFactsStages'
+import { SetupRequestReview } from './SetupRequestReview'
 import StoryStage from './StoryStage'
 import { ChapterStage, MarketStage, QaStage } from './DeliveryStages'
 import type { StageId } from './domain'
@@ -49,10 +50,12 @@ export default function ArcaneWarriorPage() {
         {session.recoveryError && <div role="alert"><p>{session.recoveryError}</p><Button disabled={session.busy || session.recoveryLoading} onClick={session.reloadMaterialRecovery}>重新读取恢复记录</Button></div>}
         {session.error && <p role="alert">{session.error}</p>}
         {session.notice && <p role="status">{session.notice}</p>}
-        {session.pending && !session.busy && <div className="connection-actions"><span>{session.recoveryNeedsCheck ? '已恢复未确认请求，请先读取服务端核对。' : '请求结果尚未确认，新的写入已暂停。'}</span><Button disabled={!project || !session.token.trim()} onClick={() => void session.refresh()}>读取最新项目核对</Button><Button disabled={!session.canRetry} onClick={() => void session.retry()}>使用原操作编号重试</Button></div>}
+        <SetupRequestReview session={session} />
+        {session.pending && !session.busy && <div className="connection-actions"><span>{session.recoveryNeedsCheck ? '已恢复未确认请求，请先读取服务端核对。' : '请求结果尚未确认，新的写入已暂停。'}</span><Button disabled={(!project && session.pending.kind !== 'setup') || !session.token.trim()} onClick={() => void session.refresh()}>读取最新项目核对</Button><Button disabled={!session.canRetry} onClick={() => void session.retry()}>使用原操作编号重试</Button>
+          {session.pending.kind === 'setup' && session.setupRejected && <Button disabled={session.recoveryNeedsCheck} onClick={() => void session.releaseSetupRequest()}>已复核失败原因，保留输入重新提交</Button>}</div>}
         {conflictBefore && <div><p>提交发生冲突，本地修改已保留。读取最新项目，核对错误与差异后恢复提交。</p><div className="connection-actions"><Button disabled={session.busy} onClick={() => void session.refresh()}>读取最新版本</Button><Button disabled={!session.canResolveConflict} onClick={session.resolveConflict}>已复核差异，恢复提交</Button></div><ul>{project && projectDifferences(conflictBefore, project).map((change, index) => <li key={index}>{change}</li>)}</ul><details><summary>查看原始快照</summary><div className="snapshot-comparison"><pre>{JSON.stringify(conflictBefore, null, 2)}</pre><pre>{JSON.stringify(project, null, 2)}</pre></div></details></div>}
       </div>}
-      <div className="stage-surfaces" key={project?.id ?? 'disconnected'}>{components.map((Component, i) => <div className="stage-surface" hidden={stageIndex !== i} key={stages[i].id} aria-label={stages[i].label}><Component session={session} intake={intake} onStage={setStage} /></div>)}</div>
+      <div className="stage-surfaces" key={`${session.draftScope}:${session.recoveryLoading ? 'loading' : 'ready'}`}>{components.map((Component, i) => <div className="stage-surface" hidden={stageIndex !== i} key={stages[i].id} aria-label={stages[i].label}><Component session={session} intake={intake} onStage={setStage} /></div>)}</div>
     </main>
     <footer className="actionbar">
       <Button onClick={() => setStage(stages[stageIndex - 1].id)} disabled={stageIndex === 0}><ArrowLeft size={16} />上一阶段</Button>
