@@ -50,6 +50,49 @@ async function persistedStop(f: Context, batch: Awaited<ReturnType<typeof prepar
 }
 
 export const integrityCases: { name: string; run: (f: Context) => Promise<void> }[] = [
+  { name: 'nested mixed JSON Unicode and ordinary escapes reject secret inputs and scrub fresh review exports while preserving a near miss', run: async f => {
+    const secret = `Synthetic-Quoted-Secret-${randomUUID()}-quote"-slash\\-line\n-tab\t`;
+    const mixed = (value: string) => Array.from(value, (character, i) => /["\\\n\t]/.test(character) || i % 2 === 0
+      ? JSON.stringify(character).slice(1, -1) : `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`).join('');
+    const escaped = [JSON.stringify(secret).slice(1, -1), mixed(secret)];
+    const nested = escaped.map(value => JSON.stringify(value).slice(1, -1)); const sensitive = [...escaped, ...nested];
+    escaped.forEach((value, index) => {
+      assert.equal(JSON.parse(`"${value}"`), secret); assert.equal(JSON.parse(`"${nested[index]}"`), value);
+    });
+    const nearMiss = `X${secret.slice(1)}`; const ordinary = [nearMiss, mixed(nearMiss), JSON.stringify(mixed(nearMiss)).slice(1, -1)];
+    const environmentName = 'TUJIANG_EVALUATION_NESTED_SECRET'; const prior = process.env[environmentName];
+    const priorFetch = globalThis.fetch; let network = 0;
+    process.env[environmentName] = secret; globalThis.fetch = async () => { network++; throw new Error('synthetic network forbidden'); };
+    try {
+      const manager = managementLedger(f.db); const runner = AuthorizationLedger.forRunner(f.db, new ArtifactCipher(artifactKey));
+      for (const value of sensitive) {
+        const payload = corePayload(); payload.sources[0]!.bytesBase64 = Buffer.from(value).toString('base64');
+        await assert.rejects(manager.createBatch(randomUUID(), payload), /SENSITIVE_INPUT_DETECTED/);
+      }
+      assert.equal((await f.db.query('SELECT 1 FROM evaluation_artifacts')).rows.length, 0);
+      const payload = corePayload(); payload.sources[0]!.bytesBase64 = Buffer.from(ordinary.join('\n')).toString('base64');
+      const batch = await preparedCore(manager, payload); const attempt = await runner.reserve(batch.batchId, 'item-1', batch.plan);
+      const owner = randomUUID(); await runner.beginDispatch(attempt.id, owner);
+      const ordinaryCapture = capture({ ordinary }).bytes;
+      const response = { ...capture(goodResponse()), bytes: Buffer.concat([
+        ...sensitive.flatMap(value => [Buffer.from(value), Buffer.from('\n')]), capture({ echoes: escaped }).bytes, ordinaryCapture,
+      ]) };
+      const artifactId = await runner.recordCapture(attempt.id, owner, response);
+      const reviewed = await managementLedger(f.db).readArtifactForReview(artifactId);
+      for (const value of sensitive) assert.equal(reviewed.bytes.includes(Buffer.from(value)), false);
+      assert.equal(reviewed.bytes.includes(ordinaryCapture), true); assert.equal(reviewed.redacted, true);
+      assert.equal(reviewed.originalSha256, sha256(response.bytes));
+      const directory = await mkdtemp(join(await realpath(tmpdir()), 'tujiang-nested-json-export-'));
+      try {
+        const exported = await exportArtifact(managementLedger(f.db), artifactId, directory);
+        assert.deepEqual(await readFile(join(directory, exported.files[0]!)), reviewed.bytes); assert.equal(exported.redacted, true);
+      } finally { await rm(directory, { recursive: true }); }
+      assert.equal(network, 0);
+    } finally {
+      globalThis.fetch = priorFetch;
+      if (prior === undefined) delete process.env[environmentName]; else process.env[environmentName] = prior;
+    }
+  } },
   { name: 'equivalent secret encodings reject inputs and scrub captures and exports without folding ordinary text case', run: async f => {
     const secret = `Synthetic-Codec-Secret-Łÿÿ🌱x-Case+/?-${randomUUID()}`;
     const raw = Buffer.from(secret); const base64 = raw.toString('base64'); const hex = raw.toString('hex');

@@ -25,13 +25,14 @@ function percentPattern(bytes: Uint8Array) {
 }
 function jsonPattern(value: string) {
   return Array.from(value, character => {
-    const raw = literalBytes(Buffer.from(character));
     // Support a JSON escape itself and that escape preserved inside one JSON string.
     const unicode = character.split('').map(unit =>
       `(?:\\x5c|\\x5c\\x5c)u${escapeHex(unit.charCodeAt(0).toString(16).padStart(4, '0'))}`).join('');
-    const quoted = literalBytes(Buffer.from(JSON.stringify(character).slice(1, -1)));
-    const alternatives = new Set([raw, unicode, quoted]);
-    if (character === '/') alternatives.add(literalBytes(Buffer.from('\\/')));
+    const forms = new Set([character, JSON.stringify(character).slice(1, -1)]);
+    if (character === '/') forms.add('\\/');
+    // Apply the same extra JSON layer to every ordinary escape, including quotes and control characters.
+    for (const form of [...forms]) forms.add(JSON.stringify(form).slice(1, -1));
+    const alternatives = new Set([...Array.from(forms, form => literalBytes(Buffer.from(form))), unicode]);
     return `(?:${[...alternatives].join('|')})`;
   }).join('');
 }
